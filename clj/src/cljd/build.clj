@@ -536,12 +536,16 @@
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
                       (daemon
-                        (while true
-                          (let [s (read-line)]
+                        ;; forwards terminal stdin (r/R/etc) to flutter. read-line
+                        ;; returns nil at EOF (non-interactive stdin, e.g. backgrounded
+                        ;; or socket-driven); writing nil NPE'd and killed this thread.
+                        (loop []
+                          (when-some [s (read-line)]
                             (locking flutter-stdin
                               (doto flutter-stdin
                                 (.write (case s "" "R" s))
-                                .flush)))))
+                                .flush))
+                            (recur))))
 
                       (daemon
                         (loop []
