@@ -435,7 +435,12 @@
               ; - flush (end of line is not part of the ouput and the output must be flushed)
               ; - multiline (end of line is not part of the ouput and the output should not
               ;   be flushed)
-              (re-matches #".*?flutter.*?: \[([^ )]+) ([^)]*)\)(?:([>/ ])(.*))?_" line)]
+              ;
+              ; The "flutter…: " prefix is OPTIONAL: on Android `flutter run` prefixes app
+              ; output with "I/flutter (pid): " (matched by .*?flutter.*?: ), but on web the
+              ; lines arrive BARE ("[id mode)…_"), so requiring the prefix left web REPL
+              ; output unrouted. The [id)…_ shape + sentinel keeps bare matching unambiguous.
+              (re-matches #"(?:.*?flutter.*?: )?\[([^ )]+) ([^)]*)\)(?:([>/ ])(.*))?_" line)]
     {:repltag repltag :mode mode :cont (or cont " ") :text (or text "")}))
 
 (defn compile-cli
