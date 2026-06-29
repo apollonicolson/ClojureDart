@@ -625,10 +625,15 @@
                                             state)
                                           :reloading
                                           (cond
-                                            (re-matches #"Reloaded .+ of .+ libraries in .+." line) :idle
+                                            ;; matches both "Reloaded N of M libraries in …"
+                                            ;; and the no-change "Reloaded 0 libraries in …".
+                                            ;; The old regex required "of M", so a no-change
+                                            ;; reload left the daemon stuck in :reloading and
+                                            ;; every later reload silently never fired.
+                                            (re-matches #"Reloaded .+ libraries in .+." line) :idle
                                             (= "Unimplemented handling of missing static target" line) :reload-failed)
                                           :reload-failed
-                                          (when (re-matches #"Reloaded .+ of .+ libraries in .+." line)
+                                          (when (re-matches #"Reloaded .+ libraries in .+." line)
                                             (newline)
                                             (println (bright "Hot reload failed, attempting hot restart!"))
                                             (locking flutter-stdin
