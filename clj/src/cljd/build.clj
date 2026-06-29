@@ -564,10 +564,15 @@
 
                               (= :restarting state)
                               (do
-                                (doseq [{:keys [restart! out]} (vals (dissoc @*repl-states :cnt))]
-                                  (binding [*out* out]
-                                    (println "\n\n;;;; App restarting. Abandon all state!\n"))
-                                  (restart!))
+                                (doseq [[tag {:keys [restart! out]}] (dissoc @*repl-states :cnt)]
+                                  ;; same hazard as the dispatch write: a closed client
+                                  ;; socket here threw and killed the daemon. Isolate it.
+                                  (try
+                                    (binding [*out* out]
+                                      (println "\n\n;;;; App restarting. Abandon all state!\n"))
+                                    (restart!)
+                                    (catch java.io.IOException _
+                                      (swap! *repl-states dissoc tag))))
                                 (recur :waiting-end-of-restart pending-reload))
 
                               :else
@@ -581,14 +586,22 @@
                                             is-ready-message)
                                   (if-some [{:keys [^java.io.Writer out ack!]}
                                             (@*repl-states repltag)]
-                                    (case mode
-                                      "!" (ack! text)
-                                      ("=" "o" "e")
-                                      (doto out
-                                        (.write text)
-                                        (cond->
-                                            (= cont " ") (doto (.write "\n"))
-                                            (not= cont ">") (doto .flush))))
+                                    ;; A disconnected REPL client leaves a closed
+                                    ;; socket writer; writing to it threw and killed
+                                    ;; the whole dispatch daemon (taking down output
+                                    ;; routing for every session). Isolate the failure:
+                                    ;; drop the dead session and keep the daemon alive.
+                                    (try
+                                      (case mode
+                                        "!" (ack! text)
+                                        ("=" "o" "e")
+                                        (doto out
+                                          (.write text)
+                                          (cond->
+                                              (= cont " ") (doto (.write "\n"))
+                                              (not= cont ">") (doto .flush))))
+                                      (catch java.io.IOException _
+                                        (swap! *repl-states dissoc repltag)))
                                     (println line)))
 
                                 (case kind
