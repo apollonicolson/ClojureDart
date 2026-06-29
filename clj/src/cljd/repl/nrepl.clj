@@ -44,13 +44,14 @@
                 (case (:kind r)
                   :reload (do (when (= 'ns (and (seq? form) (first form)))
                                 (reset! *current-ns (second form)))
-                              (send! {:value (str "#reloaded success=" (:success r)) :ns (name @*current-ns)}))
+                              (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
                   :eval   (if (:error r)
                             (send! {:err (str (:message r))})
                             (send! {:value (:value r) :ns (name @*current-ns)})))))
             (send! {:status ["done"]})
             (catch Throwable e
-              (send! {:err (str (.getMessage e)) :ex (str (class e)) :status ["done" "error"]}))))
+              (send! {:err (str (.getMessage e) " | " (pr-str (ex-data e)))
+                      :ex (str (class e)) :status ["done" "error"]}))))
         (send! {:status ["done" "error" "unknown-op"]})))))
 
 (defn start!
