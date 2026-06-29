@@ -8,6 +8,8 @@
 
 (ns cljd.build
   (:require [cljd.compiler :as compiler]
+            [cljd.repl.vmservice :as vmservice]
+            [cljd.repl.eval :as repl-eval]
             [clojure.edn :as edn]
             [clojure.tools.deps :as deps]
             [clojure.string :as str]
@@ -532,7 +534,8 @@
                         q (java.util.concurrent.SynchronousQueue.)
                         true-out *out*
                         trigger-reload #(.put q {:kind :reload})
-                        *repl-port (atom nil)]
+                        *repl-port (atom nil)
+                        vm-uri-p (promise)]   ; resolves with the app's VM-Service ws URI
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
                       (daemon
@@ -550,9 +553,38 @@
                       (daemon
                         (loop []
                           (when-some [line (some-> (.readLine flutter-stdout) smap-line)]
+                            ;; capture the app's VM-Service URI for the vmservice REPL path
+                            (when (and (not (realized? vm-uri-p))
+                                    (re-find #"Dart VM Service.*available at:" line))
+                              (when-some [[_ http] (re-find #"available at:\s*(http://\S+)" line)]
+                                (let [base (str/replace http #"^http" "ws")
+                                      base (if (str/ends-with? base "/") base (str base "/"))]
+                                  (deliver vm-uri-p (str base "ws")))))
                             (.put q {:kind :line :line line})
                             (recur)))
                         (.put q {:kind :eof}))
+
+                      ;; opt-in end-to-end self-test of the VM-Service eval path
+                      ;; (CLJD_VMREPL_SELFTEST=1). Runs in this bootstrapped compiler
+                      ;; process, so form->dart-expr resolves real symbols.
+                      (when (System/getenv "CLJD_VMREPL_SELFTEST")
+                        (daemon
+                          (when-some [uri (deref vm-uri-p 180000 nil)]
+                            (Thread/sleep 8000)   ; let the app render a frame / settle
+                            (try
+                              (let [client (vmservice/connect uri)
+                                    iso (vmservice/main-isolate-id client)]
+                                (binding [*out* true-out]
+                                  (println "\n[VMREPL self-test]" uri "isolate" iso)
+                                  (doseq [form ['(+ 6 7)
+                                                '(pr-str (vec (range 3)))
+                                                '(str "hi-" (* 7 8))]]
+                                    (println "  " (pr-str form) "=>"
+                                      (pr-str (repl-eval/eval-form client iso form {}))))
+                                  (vmservice/close client)))
+                              (catch Throwable e
+                                (binding [*out* true-out]
+                                  (println "[VMREPL self-test] error:" (.getMessage e))))))))
 
                       (daemon
                         (binding [*ansi* ansi]
