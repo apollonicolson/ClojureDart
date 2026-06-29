@@ -6,4 +6,5 @@
         org.slf4j/slf4j-simple {:mvn/version "1.7.36"}
         org.yaml/snakeyaml {:mvn/version "2.2"}
         org.clojuredart/java-host-lisp-reader {:mvn/version "1.11.1741"}
-        org.clojure/data.json {:mvn/version "2.5.0"}}}
+        org.clojure/data.json {:mvn/version "2.5.0"}
+        nrepl/nrepl {:mvn/version "1.3.1"}}}

@@ -10,6 +10,7 @@
   (:require [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vmservice]
             [cljd.repl.eval :as repl-eval]
+            [cljd.repl.nrepl :as repl-nrepl]
             [clojure.edn :as edn]
             [clojure.tools.deps :as deps]
             [clojure.string :as str]
@@ -567,9 +568,11 @@
                       ;; opt-in end-to-end self-test of the VM-Service eval path
                       ;; (CLJD_VMREPL_SELFTEST=1). Runs in this bootstrapped compiler
                       ;; process, so form->dart-expr resolves real symbols.
-                      (when (System/getenv "CLJD_VMREPL_SELFTEST")
-                        ;; capture the compiler context from THIS (compile-cli) thread;
-                        ;; dynamic bindings don't cross into the daemon thread.
+                      ;; VM-Service REPL: with CLJD_VMREPL, start an nREPL front backed
+                      ;; by evaluate/reloadSources; with CLJD_VMREPL_SELFTEST, just eval a
+                      ;; couple forms and print. Capture the compiler context here — dynamic
+                      ;; bindings don't cross into the daemon/nrepl threads.
+                      (when (or (System/getenv "CLJD_VMREPL") (System/getenv "CLJD_VMREPL_SELFTEST"))
                         (let [analyzer compiler/analyzer-info
                               dartv compiler/*dart-version*]
                           (daemon
@@ -584,20 +587,20 @@
                                 (try
                                   (let [client (vmservice/connect uri)
                                         iso (vmservice/main-isolate-id client)]
-                                    (println "\n[VMREPL self-test]" uri "isolate" iso)
-                                    (doseq [form ['(+ 6 7) '(pr-str (vec (range 3)))]]
-                                      (let [dart (try (compiler/form->dart-expr form)
-                                                      (catch Throwable e (str "COMPILE-ERR " (.getMessage e))))]
-                                        (println "  form" (pr-str form))
-                                        (println "    dart:" dart)
-                                        (println "    =>"
-                                          (pr-str (try (repl-eval/eval-form client iso form
-                                                         {:ns-lib-uri "cljd/core.dart"})
-                                                       (catch Throwable e
-                                                         {:err (.getMessage e) :data (ex-data e)}))))))
-                                    (vmservice/close client))
+                                    (when (System/getenv "CLJD_VMREPL_SELFTEST")
+                                      (println "\n[VMREPL self-test]" uri "isolate" iso)
+                                      (doseq [form ['(+ 6 7) '(pr-str (vec (range 3)))]]
+                                        (println "  " (pr-str form) "=>"
+                                          (pr-str (repl-eval/eval-form client iso form {:ns-lib-uri "cljd/core.dart"})))))
+                                    (if (System/getenv "CLJD_VMREPL")
+                                      (let [server (repl-nrepl/start!
+                                                     {:client client :iso-id iso :analyzer analyzer
+                                                      :dart-version dartv :*current-ns (atom 'cljd.core)
+                                                      :ns-lib-uri "cljd/core.dart" :port 0})]
+                                        (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)))
+                                      (vmservice/close client)))
                                   (catch Throwable e
-                                    (println "[VMREPL self-test] error:" (.getMessage e) (pr-str (ex-data e))))))))))
+                                    (println "[VMREPL] error:" (.getMessage e)))))))))
 
                       (daemon
                         (binding [*ansi* ansi]
