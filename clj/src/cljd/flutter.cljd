@@ -1209,7 +1209,11 @@
         (widgets/WidgetsBinding.instance.addPostFrameCallback
           (fn [_]
             (repl-impl/repl-exec))
-          .debugLabel "repl")))))
+          .debugLabel "repl")
+        ;; An idle app schedules no frame, so the post-frame callback above never
+        ;; fires and the REPL form never executes — the root cause of REPL evals
+        ;; "hanging" on a static UI. Force a frame so the callback always runs.
+        (widgets/WidgetsBinding.instance.scheduleFrame)))))
 
 (def ^:dynamic *-repl-control-* nil)
 
