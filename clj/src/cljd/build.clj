@@ -534,7 +534,8 @@
                         ansi *ansi*
                         q (java.util.concurrent.SynchronousQueue.)
                         true-out *out*
-                        trigger-reload #(.put q {:kind :reload})
+                        trigger-reload (fn ([] (.put q {:kind :reload}))
+                                         ([done] (.put q {:kind :reload :done done})))
                         *repl-port (atom nil)
                         vm-uri-p (promise)]   ; resolves with the app's VM-Service ws URI
                     ; Unimplemented handling of missing static target
@@ -589,14 +590,43 @@
                                         iso (vmservice/main-isolate-id client)]
                                     (when (System/getenv "CLJD_VMREPL_SELFTEST")
                                       (println "\n[VMREPL self-test]" uri "isolate" iso)
-                                      (doseq [form ['(+ 6 7) '(pr-str (vec (range 3)))]]
-                                        (println "  " (pr-str form) "=>"
-                                          (pr-str (repl-eval/eval-form client iso form {:ns-lib-uri "cljd/core.dart"})))))
+                                      (let [lib (vmservice/library-id client iso "cljd/core.dart")
+                                            try1 (fn [thunk] (try (thunk)
+                                                               (catch Throwable e
+                                                                 (println "    !!" (.getMessage e)
+                                                                   (pr-str (ex-data e))))))
+                                            raw (fn [label expr]
+                                                  (try1 #(let [r (vmservice/evaluate client iso lib expr)]
+                                                           (println "  RAW" label expr "=>"
+                                                             (:kind r) (:valueAsString r) (:message r)))))
+                                            ef  (fn [label form]
+                                                  (try1 #(do
+                                                           (println "  DART" label (pr-str form) "->"
+                                                             (compiler/form->dart-expr form))
+                                                           (println "  FORM" label "=>"
+                                                             (pr-str (repl-eval/eval-form client iso form
+                                                               {:ns-lib-uri "cljd/core.dart"
+                                                                :trigger-reload trigger-reload}))))))]
+                                        ;; (1) settle what `evaluate` accepts: arrow vs block IIFE
+                                        (raw "arrow" "(() => 1 + 2)()")
+                                        (raw "block" "(() { return 1 + 2; })()")
+                                        ;; (2) the keystone: form->dart-expr now wraps in an IIFE,
+                                        ;; so lifting literals (vec/map) should evaluate cleanly
+                                        (ef "expr"    '(+ 6 7))
+                                        (ef "fn-coll" '(pr-str (vec (range 3))))
+                                        (ef "vec-lit" [1 2 3])
+                                        (ef "map-lit" {:a 1 :b 2})
+                                        (ef "set-lit" #{:x :y})
+                                        (ef "nested"  {:nums [1 2 3] :pair {:a 1}})
+                                        ;; (3) reload path via Flutter's hot reload
+                                        (ef "defn"    '(defn kora-self-test-sq [n] (* n n)))
+                                        (raw "call-sq" "lcoc_core.kora_self_test_sq.$_invoke$1(7)")))
                                     (if (System/getenv "CLJD_VMREPL")
                                       (let [server (repl-nrepl/start!
                                                      {:client client :iso-id iso :analyzer analyzer
                                                       :dart-version dartv :*current-ns (atom 'cljd.core)
-                                                      :ns-lib-uri "cljd/core.dart" :port 0})]
+                                                      :ns-lib-uri "cljd/core.dart" :port 0
+                                                      :trigger-reload trigger-reload})]
                                         (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)))
                                       (vmservice/close client)))
                                   (catch Throwable e
@@ -604,7 +634,7 @@
 
                       (daemon
                         (binding [*ansi* ansi]
-                          (loop [state :idle pending-reload false]
+                          (loop [state :idle pending-reload false pending-done nil]
                             (cond
                               (and (= :idle state) pending-reload)
                               (do
@@ -612,7 +642,9 @@
                                   (doto flutter-stdin
                                     (.write "r")
                                     .flush))
-                                (recur :idle false))
+                                ;; keep pending-done armed: it is delivered when the
+                                ;; reload reports back as completed/failed below.
+                                (recur :idle false pending-done))
 
                               (= :restarting state)
                               (do
@@ -625,10 +657,10 @@
                                     (restart!)
                                     (catch java.io.IOException _
                                       (swap! *repl-states dissoc tag))))
-                                (recur :waiting-end-of-restart pending-reload))
+                                (recur :waiting-end-of-restart pending-reload pending-done))
 
                               :else
-                              (let [{:keys [kind line]} (.take q)
+                              (let [{:keys [kind line done]} (.take q)
                                     line (some-> line smap-line)
                                     {:keys [repltag mode cont text]} (some-> line parse-repl-line)
                                     is-ready-message (and (= repltag "*") (= mode "RDY"))]
@@ -657,8 +689,8 @@
                                     (println line)))
 
                                 (case kind
-                                  :reload (recur state true)
-                                  :eof nil
+                                  :reload (recur state true (or done pending-done))
+                                  :eof (do (some-> pending-done (deliver false)) nil)
                                   :line
                                   (let [line (.trim line)
                                         state'
@@ -690,7 +722,17 @@
                                                 .flush))
                                             :restarting)
                                           :waiting-end-of-restart
-                                          (when is-ready-message :idle))]
+                                          (when is-ready-message :idle))
+                                        ;; signal the reload waiter (eval-form's promise):
+                                        ;; a reload completed when we leave a reload state
+                                        ;; for :idle; it failed when it went :reload-failed.
+                                        reload-done? (and (not= state :idle)
+                                                          (= (or state' state) :idle))
+                                        reload-fail? (= state' :reload-failed)
+                                        _ (when (and pending-done (or reload-done? reload-fail?))
+                                            (deliver pending-done (boolean reload-done?)))
+                                        pending-done (if (and pending-done (or reload-done? reload-fail?))
+                                                       nil pending-done)]
                                     (when is-ready-message
                                       (when-some [port @*repl-port]
                                         (newline)
@@ -699,7 +741,7 @@
                                             (pos? (:restart-count @*compiler-state)) (str "still "))
                                           (title port))
                                         (newline)))
-                                    (recur (or state' state) pending-reload)))))))))
+                                    (recur (or state' state) pending-reload pending-done)))))))))
 
                     (let [^java.net.ServerSocket socket
                           (server/start-server {:port 0 :name "CLJD repl" :accept 'cljd.build/restartable-repl

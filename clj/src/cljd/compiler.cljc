@@ -5125,17 +5125,26 @@
    def/new-code forms go through reloadSources instead."
   ([form] (form->dart-expr form true))
   ([form pr-str?]
-   ;; Emit the form's value as a BARE Dart expression (expr-locus). VM-Service
-   ;; `evaluate` accepts only an expression — a statement-block closure
-   ;; `((){return x;})()` is rejected, so do NOT wrap in (fn* [] …). pr-str wrapping
-   ;; gives a flat printable String. Pure expressions (the common REPL case) emit
-   ;; cleanly; forms needing statement-lifting are not expression-evaluable and
-   ;; should route to the reload path instead.
+   ;; VM-Service `evaluate` accepts a single Dart EXPRESSION, not a statement list.
+   ;; Many cljd forms (collection literals [1 2 3]/{:a 1}, let, do …) statement-LIFT:
+   ;; they emit `final t1 = …; … ; value` — a statement sequence `evaluate` rejects.
+   ;; Emit the value with `return-locus` (lifted statements, then `return value;`)
+   ;; and wrap the whole block in a self-invoking closure `(() { … })()`. The lifted
+   ;; statements are legal inside the block, and the parenthesised lambda makes the
+   ;; whole thing one expression — the exact shape proven to evaluate cleanly.
+   ;; (cljd's own `(fn* [] …)` emit lacks the wrapping parens — `(){…}()` — which
+   ;; Dart's expression parser rejects with "Can't find '}'"; hence the manual wrap.)
+   ;; Collapse to ONE LINE: the VM-Service expression evaluator parses only the first
+   ;; line of the string, so any newline truncates it ("Can't find '}'"). Statement
+   ;; separators become "; " (valid Dart); `\n` inside Dart string literals is the
+   ;; two-char escape, not a real newline, so it is unaffected by this replace.
+   ;; pr-str wrapping (inside the closure) yields a flat printable String.
    ;; *locals-gen* is per-compile; the caller binds the runtime context
    ;; (*current-ns*, analyzer-info, *dart-version*, *hosted*).
    (let [body (if pr-str? (list 'cljd.core/pr-str form) form)]
      (binding [*locals-gen* {}]
-       (with-dart-str (write (emit body {}) expr-locus {}))))))
+       (-> (str "(() {" (with-dart-str (write (emit body {}) return-locus {})) "})()")
+           (.replace "\n" " "))))))
 
 (defn recompile-form
   [form recompile-count repltag]

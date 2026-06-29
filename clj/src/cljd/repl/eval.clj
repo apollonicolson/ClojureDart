@@ -36,14 +36,27 @@
    connected vmservice CLIENT to ISO-ID. `ns-lib-uri` selects the evaluate scope
    (defaults to the cljd.user library)."
   [client iso-id form
-   {:keys [recompile-count repltag ns-lib-uri]
-    :or   {recompile-count 0 repltag "repl" ns-lib-uri "cljd/user.dart"}}]
+   {:keys [recompile-count repltag ns-lib-uri trigger-reload reload-timeout-ms]
+    :or   {recompile-count 0 repltag "repl" ns-lib-uri "cljd/user.dart"
+           reload-timeout-ms 60000}}]
   (if (emits-new-toplevel? form)
-    ;; --- new code: compile into the app, then hot reload it in ---
+    ;; --- new code: write the .dart into the app, then hot reload it in ---
     (do
       (compiler/recompile-form form recompile-count repltag)
-      (let [report (vm/reload-sources client iso-id)]
-        {:kind :reload :success (boolean (:success report)) :report report}))
+      (if trigger-reload
+        ;; Drive Flutter's own hot reload ("r" -> frontend-server recompiles
+        ;; dart->kernel, THEN reloadSources). Raw VM-Service `reloadSources` alone
+        ;; fails for Flutter ("Error while starting Kernel isolate task") because the
+        ;; new .dart hasn't been compiled to kernel. `trigger-reload` takes a promise
+        ;; the build's reload daemon delivers true/false on completion.
+        (let [done (promise)
+              _    (trigger-reload done)
+              ok   (deref done reload-timeout-ms ::timeout)]
+          {:kind :reload :success (true? ok)
+           :report {:via :flutter-hot-reload :result ok}})
+        ;; fallback (no build daemon wired in): raw reloadSources
+        (let [report (vm/reload-sources client iso-id)]
+          {:kind :reload :success (boolean (:success report)) :report report})))
     ;; --- expression: compile to a Dart IIFE and evaluate for a clean value ---
     (let [dart (compiler/form->dart-expr form)
           lib  (vm/library-id client iso-id ns-lib-uri)

@@ -20,8 +20,8 @@
           (if (= f ::eof) acc (recur (conj acc f))))))))
 
 (defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri]
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload]
     :or {ns-lib-uri "cljd/core.dart"}}]
   (fn [{:keys [op transport id session code]}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
@@ -40,7 +40,8 @@
                   compiler/*current-ns* @*current-ns]
           (try
             (doseq [form (read-forms code)]
-              (let [r (repl-eval/eval-form client iso-id form {:ns-lib-uri ns-lib-uri})]
+              (let [r (repl-eval/eval-form client iso-id form
+                                           {:ns-lib-uri ns-lib-uri :trigger-reload trigger-reload})]
                 (case (:kind r)
                   :reload (do (when (= 'ns (and (seq? form) (first form)))
                                 (reset! *current-ns (second form)))
