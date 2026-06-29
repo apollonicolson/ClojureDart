@@ -568,23 +568,32 @@
                       ;; (CLJD_VMREPL_SELFTEST=1). Runs in this bootstrapped compiler
                       ;; process, so form->dart-expr resolves real symbols.
                       (when (System/getenv "CLJD_VMREPL_SELFTEST")
-                        (daemon
-                          (when-some [uri (deref vm-uri-p 180000 nil)]
-                            (Thread/sleep 8000)   ; let the app render a frame / settle
-                            (try
-                              (let [client (vmservice/connect uri)
-                                    iso (vmservice/main-isolate-id client)]
-                                (binding [*out* true-out]
-                                  (println "\n[VMREPL self-test]" uri "isolate" iso)
-                                  (doseq [form ['(+ 6 7)
-                                                '(pr-str (vec (range 3)))
-                                                '(str "hi-" (* 7 8))]]
-                                    (println "  " (pr-str form) "=>"
-                                      (pr-str (repl-eval/eval-form client iso form {}))))
-                                  (vmservice/close client)))
-                              (catch Throwable e
-                                (binding [*out* true-out]
-                                  (println "[VMREPL self-test] error:" (.getMessage e))))))))
+                        ;; capture the compiler context from THIS (compile-cli) thread;
+                        ;; dynamic bindings don't cross into the daemon thread.
+                        (let [analyzer compiler/analyzer-info
+                              dartv compiler/*dart-version*]
+                          (daemon
+                            (when-some [uri (deref vm-uri-p 180000 nil)]
+                              (Thread/sleep 8000)   ; let the app render a frame / settle
+                              (binding [*out* true-out
+                                        compiler/*hosted* true
+                                        compiler/*dart-version* dartv
+                                        compiler/analyzer-info analyzer
+                                        compiler/dynamic-warning compiler/on-dynamic-warn
+                                        compiler/*current-ns* 'cljd.core]
+                                (try
+                                  (let [client (vmservice/connect uri)
+                                        iso (vmservice/main-isolate-id client)]
+                                    (println "\n[VMREPL self-test]" uri "isolate" iso)
+                                    (doseq [form ['(+ 6 7)
+                                                  '(pr-str (vec (range 3)))
+                                                  '(str "hi-" (* 7 8))]]
+                                      (println "  " (pr-str form) "=>"
+                                        (pr-str (repl-eval/eval-form client iso form
+                                                  {:ns-lib-uri "cljd/core.dart"}))))
+                                    (vmservice/close client))
+                                  (catch Throwable e
+                                    (println "[VMREPL self-test] error:" (.getMessage e)))))))))
 
                       (daemon
                         (binding [*ansi* ansi]

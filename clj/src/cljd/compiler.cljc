@@ -5127,7 +5127,10 @@
   ([form pr-str?]
    (let [body (if pr-str? (list 'cljd.core/pr-str form) form)
          wrapped (list 'fn* [] body)]
-     (str "(" (with-dart-str (write (emit wrapped {}) expr-locus {})) ")()"))))
+     ;; *locals-gen* is per-compile (recompile-form binds it too). The caller must
+     ;; bind the runtime context (*current-ns*, analyzer-info, *dart-version*, *hosted*).
+     (binding [*locals-gen* {}]
+       (str "(" (with-dart-str (write (emit wrapped {}) expr-locus {})) ")()")))))
 
 (defn recompile-form
   [form recompile-count repltag]
