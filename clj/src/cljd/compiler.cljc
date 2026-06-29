@@ -5110,6 +5110,25 @@
           (reset! nses nses-before) ; avoid messy states
           (throw e))))))
 
+(defn form->dart-expr
+  "Compile a cljd FORM to a single Dart EXPRESSION string (an IIFE), suitable for
+   feeding to the Dart VM-Service `evaluate` against the current-ns library scope.
+
+   The form is wrapped `(fn* [] (cljd.core/pr-str FORM))` so the result is a flat
+   printable String (cljd's own printer) rather than an opaque object handle; the
+   closure also absorbs any statement-lifting, and `()`-calling it makes the whole
+   thing one expression.
+
+   MUST run in a bootstrapped compiler context — `nses` loaded (cljd.core compiled)
+   and `analyzer-info` bound — i.e. the same live context `recompile-form` runs in
+   (inside cljd.build). Returns the Dart string. Use for the EVAL half of the REPL;
+   def/new-code forms go through reloadSources instead."
+  ([form] (form->dart-expr form true))
+  ([form pr-str?]
+   (let [body (if pr-str? (list 'cljd.core/pr-str form) form)
+         wrapped (list 'fn* [] body)]
+     (str "(" (with-dart-str (write (emit wrapped {}) expr-locus {})) ")()"))))
+
 (defn recompile-form
   [form recompile-count repltag]
   (let [nses-before @nses]
