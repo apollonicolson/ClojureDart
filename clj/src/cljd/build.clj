@@ -585,15 +585,19 @@
                                   (let [client (vmservice/connect uri)
                                         iso (vmservice/main-isolate-id client)]
                                     (println "\n[VMREPL self-test]" uri "isolate" iso)
-                                    (doseq [form ['(+ 6 7)
-                                                  '(pr-str (vec (range 3)))
-                                                  '(str "hi-" (* 7 8))]]
-                                      (println "  " (pr-str form) "=>"
-                                        (pr-str (repl-eval/eval-form client iso form
-                                                  {:ns-lib-uri "cljd/core.dart"}))))
+                                    (doseq [form ['(+ 6 7) '(pr-str (vec (range 3)))]]
+                                      (let [dart (try (compiler/form->dart-expr form)
+                                                      (catch Throwable e (str "COMPILE-ERR " (.getMessage e))))]
+                                        (println "  form" (pr-str form))
+                                        (println "    dart:" dart)
+                                        (println "    =>"
+                                          (pr-str (try (repl-eval/eval-form client iso form
+                                                         {:ns-lib-uri "cljd/core.dart"})
+                                                       (catch Throwable e
+                                                         {:err (.getMessage e) :data (ex-data e)}))))))
                                     (vmservice/close client))
                                   (catch Throwable e
-                                    (println "[VMREPL self-test] error:" (.getMessage e)))))))))
+                                    (println "[VMREPL self-test] error:" (.getMessage e) (pr-str (ex-data e))))))))))
 
                       (daemon
                         (binding [*ansi* ansi]

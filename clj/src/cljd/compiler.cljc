@@ -5125,12 +5125,17 @@
    def/new-code forms go through reloadSources instead."
   ([form] (form->dart-expr form true))
   ([form pr-str?]
-   (let [body (if pr-str? (list 'cljd.core/pr-str form) form)
-         wrapped (list 'fn* [] body)]
-     ;; *locals-gen* is per-compile (recompile-form binds it too). The caller must
-     ;; bind the runtime context (*current-ns*, analyzer-info, *dart-version*, *hosted*).
+   ;; Emit the form's value as a BARE Dart expression (expr-locus). VM-Service
+   ;; `evaluate` accepts only an expression — a statement-block closure
+   ;; `((){return x;})()` is rejected, so do NOT wrap in (fn* [] …). pr-str wrapping
+   ;; gives a flat printable String. Pure expressions (the common REPL case) emit
+   ;; cleanly; forms needing statement-lifting are not expression-evaluable and
+   ;; should route to the reload path instead.
+   ;; *locals-gen* is per-compile; the caller binds the runtime context
+   ;; (*current-ns*, analyzer-info, *dart-version*, *hosted*).
+   (let [body (if pr-str? (list 'cljd.core/pr-str form) form)]
      (binding [*locals-gen* {}]
-       (str "(" (with-dart-str (write (emit wrapped {}) expr-locus {})) ")()")))))
+       (with-dart-str (write (emit body {}) expr-locus {}))))))
 
 (defn recompile-form
   [form recompile-count repltag]
