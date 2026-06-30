@@ -46,7 +46,8 @@ eval(code):
    `form-exec`/`repl-exec` remain candidates — but they're tangled into the same daemon,
    so removal means editing the working reload path + a full device re-validation, for
    cleanliness not function. Deferred deliberately; the old front is harmless dead weight.
-8. ⏳ **polish** — `pick!` via `evaluate(widget-obj,…)`, async Future-await, var-table redefine.
+8. 🟡 **polish** — async Future-await ✅ + ns-context ✅ + var-redef characterised (below).
+   `pick!` (widget inspection) still TODO.
 
 ## Error DX (`cljd.repl.errors`) — done 2026-06-30
 Turn raw Dart/compiler errors into JVM-Clojure-grade messages. PROVEN on device:
@@ -59,11 +60,30 @@ Turn raw Dart/compiler errors into JVM-Clojure-grade messages. PROVEN on device:
 - VM-Service rpc errors (bad generated Dart) → the Dart compiler `:details`, banner stripped.
 - consistency: errors now set `:status ["done" "error"]` + `:ex`.
 
-## Next DX gap — REPL namespace context
-The eval/compile context is pinned to `cljd.core`: `(require …)` and app-qualified symbols
-(`kora.data.temporal/after?`) fail with "Unknown symbol" because those nses aren't in the eval
-compile's analyzer view. Need `in-ns`/`ns`-aware eval so the REPL can work inside app namespaces
-(also unblocks device-verifying the user-frame demunger). Distinct from error formatting.
+## ns-context, async, var-redef — done/characterised 2026-06-30
+Upstream check first: `feat/repl` is a stale 2024 VM-Service spike (850 commits behind, bundled
+jars, no integrated REPL source). No upstream fix exists for any of these. So:
+
+- **ns-context** ✅ — nREPL now tracks `*current-ns*` and derives the `evaluate` target library
+  from it (`ns->lib-uri`), so a ns's own defs + required aliases resolve. `(in-ns 'x)` switches
+  context (no recompile) for any ns present in the compiler's `nses`; `(ns …)` goes via reload
+  then switches. PROVEN: `(in-ns 'kora.core)` works. Caveat: only nses actually in `@compiler/nses`
+  are reachable (e.g. `kora.navigation` wasn't) — a separate nses-coverage question, not the
+  mechanism. `(require …)` standalone still isn't a thing in cljd (put requires in the `ns` form).
+
+- **async Future-await** ✅ — the eval path is Future-aware (`form->dart-await-expr`): detect with
+  `(dart/is? v dart-async/Future)` (helper injected into cljd.core at REPL start, gated → "(await
+  on)"), schedule `.then`/`.catchError` into `cljd.core/+cljd-repl-fbox+`, return a sentinel, and
+  poll the box to the resolved value. PROVEN: `(Future.value 42)`→42, `(Future.delayed (Duration
+  .seconds 2) …)`→42 after ~2.2s, error futures → clean `#error` via catchError. Non-futures fall
+  straight through to pr-str (no overhead change in result). Top-level `(await …)` is still not
+  supported (needs an async IIFE); the supported pattern is "form returns a Future".
+
+- **var redefinition** — `defn` redefinition WORKS (`(defn f [] 1)`→1, redefine→2): Flutter hot
+  reload reloads function bodies. `def` of a **value** does NOT update (`(def x 1)`; `(def x 2)`;
+  `x`→still 1): Flutter preserves existing top-level static fields and doesn't re-run their
+  initializers on hot reload — only hot *restart* does (which wipes all state). Fundamental Flutter
+  constraint, not a cljd/REPL bug. Document; a future `:restart` REPL command could opt into it.
 
 ## Delete list (the simplification)
 `parse-repl-line`, the `[id mode)…_` protocol, `form-exec`/`repl-exec`/`ReplHackContrib`,

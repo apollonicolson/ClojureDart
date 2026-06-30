@@ -26,6 +26,25 @@
             (symbol? op) (contains? toplevel-ops (symbol (name op)))
             :else        false)))))
 
+(defn- poll-future
+  "Poll cljd.core/+cljd-repl-fbox+ until the scheduled Future resolved (the box holds
+   the pr-str'd value, or \"__CLJD_ERR__ …\"), or timeout. Returns an :eval result."
+  [client iso-id lib timeout-ms]
+  (let [deref-dart (compiler/form->dart-expr '(cljd.core/deref cljd.core/+cljd-repl-fbox+) false)
+        deadline   (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [r (vm/evaluate client iso-id lib deref-dart)
+            v (:valueAsString r)]
+        (cond
+          (= (:type r) "@Error")    {:kind :eval :error true :message (:message r) :ref r}
+          (or (nil? v) (= v "null"))
+          (if (< (System/currentTimeMillis) deadline)
+            (do (Thread/sleep 100) (recur))
+            {:kind :eval :error true :message "await timed out (Future did not complete)"})
+          (.startsWith ^String v "__CLJD_ERR__")
+          {:kind :eval :error true :message (subs v (min (count v) (count "__CLJD_ERR__ ")))}
+          :else {:kind :eval :value v :ref r})))))
+
 (defn eval-form
   "Evaluate FORM against the running app and return a result map.
 
@@ -36,9 +55,10 @@
    connected vmservice CLIENT to ISO-ID. `ns-lib-uri` selects the evaluate scope
    (defaults to the cljd.user library)."
   [client iso-id form
-   {:keys [recompile-count repltag ns-lib-uri trigger-reload reload-timeout-ms]
+   {:keys [recompile-count repltag ns-lib-uri trigger-reload reload-timeout-ms
+           await? await-timeout-ms]
     :or   {recompile-count 0 repltag "repl" ns-lib-uri "cljd/user.dart"
-           reload-timeout-ms 60000}}]
+           reload-timeout-ms 60000 await-timeout-ms 30000}}]
   (if (emits-new-toplevel? form)
     ;; --- new code: write the .dart into the app, then hot reload it in ---
     (do
@@ -58,9 +78,14 @@
         (let [report (vm/reload-sources client iso-id)]
           {:kind :reload :success (boolean (:success report)) :report report})))
     ;; --- expression: compile to a Dart IIFE and evaluate for a clean value ---
-    (let [dart (compiler/form->dart-expr form)
+    ;; with await?, a Future result is scheduled into the box + polled to its value.
+    (let [dart (if await? (compiler/form->dart-await-expr form) (compiler/form->dart-expr form))
           lib  (vm/library-id client iso-id ns-lib-uri)
           r    (vm/evaluate client iso-id lib dart)]
-      (if (= (:type r) "@Error")
+      (cond
+        (= (:type r) "@Error")
         {:kind :eval :error true :message (:message r) :ref r}
+        (and await? (= "__cljd_future_pending__" (:valueAsString r)))
+        (poll-future client iso-id lib await-timeout-ms)
+        :else
         {:kind :eval :value (:valueAsString r) :ref r}))))

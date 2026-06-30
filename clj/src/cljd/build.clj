@@ -623,12 +623,25 @@
                                         (ef "defn"    '(defn kora-self-test-sq [n] (* n n)))
                                         (raw "call-sq" "lcoc_core.kora_self_test_sq.$_invoke$1(7)")))
                                     (if (System/getenv "CLJD_VMREPL")
-                                      (let [server (repl-nrepl/start!
+                                      ;; inject Future helpers into cljd.core so the eval path can
+                                      ;; await Futures (box + dart/is? predicate). Gate :await? on it.
+                                      (let [await-ok
+                                            (try
+                                              (:success
+                                               (repl-eval/eval-form client iso
+                                                 '(do (def +cljd-repl-fbox+ (atom nil))
+                                                      (defn +cljd-repl-future? [x] (dart/is? x dart-async/Future)))
+                                                 {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
+                                              (catch Throwable e
+                                                (println "[VMREPL] async init failed:" (.getMessage e)) false))
+                                            server (repl-nrepl/start!
                                                      {:client client :iso-id iso :analyzer analyzer
                                                       :dart-version dartv :*current-ns (atom 'cljd.core)
                                                       :ns-lib-uri "cljd/core.dart" :port 0
-                                                      :trigger-reload trigger-reload})]
-                                        (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)))
+                                                      :trigger-reload trigger-reload
+                                                      :await? (boolean await-ok)})]
+                                        (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
+                                          (str "(await " (if await-ok "on" "off") ")")))
                                       (vmservice/close client)))
                                   (catch Throwable e
                                     (println "[VMREPL] error:" (.getMessage e)))))))))

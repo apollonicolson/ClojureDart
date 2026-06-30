@@ -5110,6 +5110,15 @@
           (reset! nses nses-before) ; avoid messy states
           (throw e))))))
 
+(defn dart-iife
+  "Compile BODY to a single-line self-invoking Dart closure `(() { … })()` — a single
+   expression suitable for VM-Service `evaluate`. See form->dart-expr for why the
+   parens and single-line collapse are required."
+  [body]
+  (binding [*locals-gen* {}]
+    (-> (str "(() {" (with-dart-str (write (emit body {}) return-locus {})) "})()")
+        (.replace "\n" " "))))
+
 (defn form->dart-expr
   "Compile a cljd FORM to a single Dart EXPRESSION string (an IIFE), suitable for
    feeding to the Dart VM-Service `evaluate` against the current-ns library scope.
@@ -5142,9 +5151,28 @@
    ;; *locals-gen* is per-compile; the caller binds the runtime context
    ;; (*current-ns*, analyzer-info, *dart-version*, *hosted*).
    (let [body (if pr-str? (list 'cljd.core/pr-str form) form)]
-     (binding [*locals-gen* {}]
-       (-> (str "(() {" (with-dart-str (write (emit body {}) return-locus {})) "})()")
-           (.replace "\n" " "))))))
+     (dart-iife body))))
+
+(defn form->dart-await-expr
+  "Like form->dart-expr, but Future-aware: if FORM's value is a Dart Future, schedule
+   its resolution into `cljd.core/+cljd-repl-fbox+` (an atom) and return the sentinel
+   \"__cljd_future_pending__\"; the caller then polls the box. Otherwise behaves like
+   form->dart-expr (returns the pr-str'd value). Requires the REPL future helpers
+   (`+cljd-repl-future?`, `+cljd-repl-fbox+`) to be injected into cljd.core first.
+   Built from plain quoted symbols (no syntax-quote) to avoid ns-qualifying the
+   special forms; cljd.core fns are fully qualified so they resolve in any *current-ns*."
+  [form]
+  (let [box 'cljd.core/+cljd-repl-fbox+
+        body (list 'let ['__v (list 'do form)]
+               (list 'if (list 'cljd.core/+cljd-repl-future? '__v)
+                 (list 'do
+                   (list 'cljd.core/reset! box nil)
+                   (list '-> '__v
+                     (list '.then      (list 'fn ['x] (list 'cljd.core/reset! box (list 'cljd.core/pr-str 'x))))
+                     (list '.catchError (list 'fn ['e] (list 'cljd.core/reset! box (list 'cljd.core/str "__CLJD_ERR__ " 'e)))))
+                   "__cljd_future_pending__")
+                 (list 'cljd.core/pr-str '__v)))]
+    (dart-iife body)))
 
 (defn recompile-form
   [form recompile-count repltag]

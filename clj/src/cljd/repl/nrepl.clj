@@ -20,9 +20,22 @@
         (let [f (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)]
           (if (= f ::eof) acc (recur (conj acc f))))))))
 
+(defn- ns->lib-uri
+  "cljd library uri suffix for a namespace, e.g. kora.data.temporal -> kora/data/temporal.dart.
+   `vm/library-id` matches by suffix, so the VM-Service `evaluate` runs in that ns's scope —
+   its own defs and its required aliases resolve."
+  [ns-sym]
+  (str (.replace (name ns-sym) "." "/") ".dart"))
+
+(defn- unwrap-quote [x]
+  (if (and (seq? x) (= 'quote (first x))) (second x) x))
+
+(defn- ns-exists? [ns-sym]
+  (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
+
 (defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload]
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await?}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await?]
     :or {ns-lib-uri "cljd/core.dart"}}]
   (fn [{:keys [op transport id session code]}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
@@ -45,21 +58,39 @@
                                  ;; strip Flutter's own per-line "flutter: " stdout prefix
                                  (send! {(if (= stream "Stderr") :err :out)
                                          (.replaceAll text "(?m)^flutter: " "")})))
-          (let [errored (volatile! false)]
+          (let [errored (volatile! false)
+                switch-ns! (fn [ns-sym]            ; keep atom + per-batch dynamic binding in sync
+                             (reset! *current-ns ns-sym)
+                             (set! compiler/*current-ns* ns-sym))]
             (try
               (doseq [form (read-forms code)]
-                (let [r (repl-eval/eval-form client iso-id form
-                                             {:ns-lib-uri ns-lib-uri :trigger-reload trigger-reload})]
-                  (case (:kind r)
-                    :reload (do (when (= 'ns (and (seq? form) (first form)))
-                                  (reset! *current-ns (second form)))
-                                (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
-                    :eval   (if (:error r)
-                              (do (vreset! errored true)
-                                  ;; runtime Dart exception: clean message + demunged user frames
-                                  (send! {:err (errors/format-runtime (:message r))
-                                          :ex "dart.runtime-exception"}))
-                              (send! {:value (:value r) :ns (name @*current-ns)})))))
+                (let [head (and (seq? form) (first form))]
+                  (cond
+                    ;; (in-ns 'x): switch the eval/compile context to an existing ns —
+                    ;; no recompile; its defs + required aliases become resolvable.
+                    (= 'in-ns head)
+                    (let [target (unwrap-quote (second form))]
+                      (if (ns-exists? target)
+                        (do (switch-ns! target)
+                            (send! {:value (str target) :ns (name target)}))
+                        (do (vreset! errored true)
+                            (send! {:err (str "No such namespace: " target
+                                              " (only namespaces compiled into the app are available)")
+                                    :ex "cljd.no-such-ns"}))))
+                    :else
+                    (let [r (repl-eval/eval-form client iso-id form
+                                                 {:ns-lib-uri (ns->lib-uri @*current-ns)
+                                                  :trigger-reload trigger-reload
+                                                  :await? await?})]
+                      (case (:kind r)
+                        :reload (do (when (= 'ns head) (switch-ns! (second form)))
+                                    (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
+                        :eval   (if (:error r)
+                                  (do (vreset! errored true)
+                                      ;; runtime Dart exception: clean message + demunged user frames
+                                      (send! {:err (errors/format-runtime (:message r))
+                                              :ex "dart.runtime-exception"}))
+                                  (send! {:value (:value r) :ns (name @*current-ns)})))))))
               (send! {:status (if @errored ["done" "error"] ["done"])})
               (catch Throwable e
                 ;; compile-time error from turning the form into Dart
