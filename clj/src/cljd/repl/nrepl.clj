@@ -8,7 +8,8 @@
             [nrepl.transport :as transport]
             [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vm]
-            [cljd.repl.eval :as repl-eval])
+            [cljd.repl.eval :as repl-eval]
+            [cljd.repl.errors :as errors])
   (:import [java.io PushbackReader StringReader]
            [java.util UUID]))
 
@@ -44,22 +45,27 @@
                                  ;; strip Flutter's own per-line "flutter: " stdout prefix
                                  (send! {(if (= stream "Stderr") :err :out)
                                          (.replaceAll text "(?m)^flutter: " "")})))
-          (try
-            (doseq [form (read-forms code)]
-              (let [r (repl-eval/eval-form client iso-id form
-                                           {:ns-lib-uri ns-lib-uri :trigger-reload trigger-reload})]
-                (case (:kind r)
-                  :reload (do (when (= 'ns (and (seq? form) (first form)))
-                                (reset! *current-ns (second form)))
-                              (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
-                  :eval   (if (:error r)
-                            (send! {:err (str (:message r))})
-                            (send! {:value (:value r) :ns (name @*current-ns)})))))
-            (send! {:status ["done"]})
-            (catch Throwable e
-              (send! {:err (str (.getMessage e) " | " (pr-str (ex-data e)))
-                      :ex (str (class e)) :status ["done" "error"]}))
-            (finally (vm/set-sink! client nil))))
+          (let [errored (volatile! false)]
+            (try
+              (doseq [form (read-forms code)]
+                (let [r (repl-eval/eval-form client iso-id form
+                                             {:ns-lib-uri ns-lib-uri :trigger-reload trigger-reload})]
+                  (case (:kind r)
+                    :reload (do (when (= 'ns (and (seq? form) (first form)))
+                                  (reset! *current-ns (second form)))
+                                (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
+                    :eval   (if (:error r)
+                              (do (vreset! errored true)
+                                  ;; runtime Dart exception: clean message + demunged user frames
+                                  (send! {:err (errors/format-runtime (:message r))
+                                          :ex "dart.runtime-exception"}))
+                              (send! {:value (:value r) :ns (name @*current-ns)})))))
+              (send! {:status (if @errored ["done" "error"] ["done"])})
+              (catch Throwable e
+                ;; compile-time error from turning the form into Dart
+                (send! {:err (errors/format-compile e)
+                        :ex (str (class e)) :status ["done" "error"]}))
+              (finally (vm/set-sink! client nil)))))
         (send! {:status ["done" "error" "unknown-op"]})))))
 
 (defn start!

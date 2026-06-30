@@ -48,6 +48,23 @@ eval(code):
    cleanliness not function. Deferred deliberately; the old front is harmless dead weight.
 8. ⏳ **polish** — `pick!` via `evaluate(widget-obj,…)`, async Future-await, var-table redefine.
 
+## Error DX (`cljd.repl.errors`) — done 2026-06-30
+Turn raw Dart/compiler errors into JVM-Clojure-grade messages. PROVEN on device:
+- runtime `@Error` → just the message (`(nth [] 99)` → "Invalid argument(s): No item 99 …"),
+  cljd.core / dart: / async-zone / `Eval`-IIFE stack frames dropped; user frames (app nses)
+  demunged to `ns/fn (path:line)` via the reverse of `compiler/char-map` (unit-tested).
+- compile error → cljd's real cause surfaced (`undefined-sym` → "Unknown symbol: undefined-sym"),
+  stripped of the "Error while compiling NO_SOURCE_PATH … / (no source location)" wrapper and the
+  raw `:cljd.compiler/emit-stack` map; offending form appended only when it adds info.
+- VM-Service rpc errors (bad generated Dart) → the Dart compiler `:details`, banner stripped.
+- consistency: errors now set `:status ["done" "error"]` + `:ex`.
+
+## Next DX gap — REPL namespace context
+The eval/compile context is pinned to `cljd.core`: `(require …)` and app-qualified symbols
+(`kora.data.temporal/after?`) fail with "Unknown symbol" because those nses aren't in the eval
+compile's analyzer view. Need `in-ns`/`ns`-aware eval so the REPL can work inside app namespaces
+(also unblocks device-verifying the user-frame demunger). Distinct from error formatting.
+
 ## Delete list (the simplification)
 `parse-repl-line`, the `[id mode)…_` protocol, `form-exec`/`repl-exec`/`ReplHackContrib`,
 the dispatch daemon + state machine + `Reloaded N libraries` regexes, `r`/`R` stdin
