@@ -41,7 +41,9 @@
           ;; forward the app's Stdout/Stderr WriteEvents to this eval's transport
           ;; while it runs (println output etc.), then detach the sink.
           (vm/set-sink! client (fn [stream text]
-                                 (send! {(if (= stream "Stderr") :err :out) text})))
+                                 ;; strip Flutter's own per-line "flutter: " stdout prefix
+                                 (send! {(if (= stream "Stderr") :err :out)
+                                         (.replaceAll text "(?m)^flutter: " "")})))
           (try
             (doseq [form (read-forms code)]
               (let [r (repl-eval/eval-form client iso-id form
