@@ -587,7 +587,8 @@
                                         compiler/*current-ns* 'cljd.core]
                                 (try
                                   (let [client (vmservice/connect uri)
-                                        iso (vmservice/main-isolate-id client)]
+                                        iso (vmservice/main-isolate-id client)
+                                        _ (vmservice/listen-streams! client)]
                                     (when (System/getenv "CLJD_VMREPL_SELFTEST")
                                       (println "\n[VMREPL self-test]" uri "isolate" iso)
                                       (let [lib (vmservice/library-id client iso "cljd/core.dart")

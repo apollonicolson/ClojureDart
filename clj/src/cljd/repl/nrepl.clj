@@ -38,6 +38,10 @@
                   compiler/analyzer-info analyzer
                   compiler/dynamic-warning compiler/on-dynamic-warn
                   compiler/*current-ns* @*current-ns]
+          ;; forward the app's Stdout/Stderr WriteEvents to this eval's transport
+          ;; while it runs (println output etc.), then detach the sink.
+          (vm/set-sink! client (fn [stream text]
+                                 (send! {(if (= stream "Stderr") :err :out) text})))
           (try
             (doseq [form (read-forms code)]
               (let [r (repl-eval/eval-form client iso-id form
@@ -52,7 +56,8 @@
             (send! {:status ["done"]})
             (catch Throwable e
               (send! {:err (str (.getMessage e) " | " (pr-str (ex-data e)))
-                      :ex (str (class e)) :status ["done" "error"]}))))
+                      :ex (str (class e)) :status ["done" "error"]}))
+            (finally (vm/set-sink! client nil))))
         (send! {:status ["done" "error" "unknown-op"]})))))
 
 (defn start!

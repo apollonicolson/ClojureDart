@@ -9,11 +9,15 @@
            [java.util.concurrent.atomic AtomicLong]))
 
 (defn connect
-  "Open a VM-Service websocket. Returns a client map {:ws :pending :idgen}."
+  "Open a VM-Service websocket. Returns a client map {:ws :pending :idgen :sink}.
+   `:sink` is an atom holding an optional fn (stream-id, text) called for each
+   Stdout/Stderr WriteEvent — used to forward app `println` output to the REPL."
   [ws-uri]
   (let [pending (atom {})                 ; request id -> promise
         idgen (AtomicLong. 0)
+        sink (atom nil)                   ; optional (fn [stream-id text]) for stream output
         buf (StringBuilder.)
+        decoder (java.util.Base64/getDecoder)
         listener
         (reify WebSocket$Listener
           (onOpen [_ ws] (.request ws 1))
@@ -24,16 +28,27 @@
                 (.setLength buf 0)
                 (try
                   (let [msg (json/read-str s :key-fn keyword)]
-                    (when-some [p (get @pending (:id msg))]
-                      (swap! pending dissoc (:id msg))
-                      (deliver p msg)))
-                  (catch Exception _ nil))))   ; ignore unparsable/stream frames
+                    (cond
+                      ;; response to a request
+                      (get @pending (:id msg))
+                      (let [p (get @pending (:id msg))]
+                        (swap! pending dissoc (:id msg))
+                        (deliver p msg))
+                      ;; async stream notification (Stdout/Stderr WriteEvent)
+                      (= "streamNotify" (:method msg))
+                      (let [{:keys [streamId event]} (:params msg)]
+                        (when (and (#{"Stdout" "Stderr"} streamId)
+                                   (= "WriteEvent" (:kind event))
+                                   (:bytes event))
+                          (when-some [f @sink]
+                            (f streamId (String. (.decode decoder ^String (:bytes event)) "UTF-8")))))))
+                  (catch Exception _ nil))))   ; ignore unparsable frames
             (.request ws 1)
             nil)
           (onError [_ _ err] (binding [*out* *err*] (println "[vmservice]" (.getMessage err)))))]
     {:ws (-> (HttpClient/newHttpClient) .newWebSocketBuilder
              (.buildAsync (URI/create ws-uri) listener) .join)
-     :pending pending :idgen idgen}))
+     :pending pending :idgen idgen :sink sink}))
 
 (defn rpc
   "Synchronous JSON-RPC call. Returns the :result map, or throws on error/timeout."
@@ -69,6 +84,20 @@
   "Hot-reload changed sources into the isolate. Returns a ReloadReport {:success …}."
   [client iso-id]
   (rpc client "reloadSources" {:isolateId iso-id}))
+
+(defn listen-streams!
+  "Subscribe to the isolate's Stdout/Stderr streams so WriteEvents reach `:sink`.
+   Flutter may already hold a subscription (error 103 \"Stream already subscribed\");
+   that is harmless and ignored."
+  [client]
+  (doseq [stream ["Stdout" "Stderr"]]
+    (try (rpc client "streamListen" {:streamId stream})
+         (catch Exception _ nil))))   ; 103 already-subscribed, etc.
+
+(defn set-sink!
+  "Set (or clear, with nil) the output sink fn (stream-id, text) on CLIENT."
+  [{:keys [sink]} f]
+  (reset! sink f))
 
 (defn close [{:keys [^WebSocket ws]}]
   (.sendClose ws WebSocket/NORMAL_CLOSURE "bye"))
