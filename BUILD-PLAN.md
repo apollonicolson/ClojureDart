@@ -46,8 +46,7 @@ eval(code):
    `form-exec`/`repl-exec` remain candidates — but they're tangled into the same daemon,
    so removal means editing the working reload path + a full device re-validation, for
    cleanliness not function. Deferred deliberately; the old front is harmless dead weight.
-8. 🟡 **polish** — async Future-await ✅ + ns-context ✅ + var-redef characterised (below).
-   `pick!` (widget inspection) still TODO.
+8. ✅ **polish** — async Future-await ✅, ns-context ✅, var-redef ✅, `pick!` ✅ (all below).
 
 ## Error DX (`cljd.repl.errors`) — done 2026-06-30
 Turn raw Dart/compiler errors into JVM-Clojure-grade messages. PROVEN on device:
@@ -98,3 +97,20 @@ forwarding, the `clojure.core.server` socket REPL. The 5 prior fixes are transit
 ## Lives in
 the cljd build JVM (has compiler+analyzer+nses); VM-service client + nREPL front added
 here. Upstreamable as `feat/repl` done right.
+
+## pick! — widget picker over the nREPL, PROVEN on a live device 2026-06-30
+The HUD picker + repl-point instrumentation already ship in any `kDebugMode` app whose
+root went through `f/run` (kora does). The existing `cljd.flutter.repl/pick!` isn't loaded
+and its callback needs the old socket-repl's `*-repl-control-*`, so we built an nREPL-native
+picker reusing the live machinery:
+- startup injects into cljd.flutter a `+cljd-repl-picked+` atom + `+cljd-repl-pick!` that arms
+  the HUD's `hud-enabled` hook with a callback storing the tapped widget's `:loc`
+  (`{:ns :line :column}`) + `:env-keys` into the atom. Gated → banner "(… pick on)".
+- nREPL recognises `(pick!)` / `(pick! false)` (toggle) and `(picked)` (report last pick AND
+  jump `*current-ns*` into the picked widget's ns).
+PROVEN on the physical Pixel: `(pick!)` → tap → `(picked)` returned the navigation widget's
+env (`selected-index`, `current-index`, …) at `kora.nav:182:5` and switched the REPL to kora.nav.
+Works with real touch or `adb shell input tap` — so YES, pick! works on live devices.
+Tier-3 TODO: resolve bare widget LOCALS (e.g. `selected-index`) to their live values in eval —
+needs binding the runtime env via VM-Service `evaluate`'s `scope` param (env-keys are reported
+so you know what's there; ns-level vars already resolve after the jump).

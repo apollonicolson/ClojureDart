@@ -34,8 +34,8 @@
   (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
 
 (defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await?}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await?]
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick?}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick?]
     :or {ns-lib-uri "cljd/core.dart"}}]
   (fn [{:keys [op transport id session code]}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
@@ -77,6 +77,32 @@
                             (send! {:err (str "No such namespace: " target
                                               " (only namespaces compiled into the app are available)")
                                     :ex "cljd.no-such-ns"}))))
+
+                    ;; (pick!) / (pick! false): toggle the on-device widget picker.
+                    (= 'pick! head)
+                    (if-not pick?
+                      (do (vreset! errored true)
+                          (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
+                                  :ex "cljd.no-picker"}))
+                      (let [on? (if (>= (count form) 2) (not (false? (second form))) true)
+                            r (repl-eval/eval-form client iso-id
+                                (list 'cljd.flutter/+cljd-repl-pick! on?)
+                                {:ns-lib-uri "cljd/flutter.dart"})]
+                        (send! {:value (:value r) :ns (name @*current-ns)})))
+
+                    ;; (picked): report the last picked widget and jump the REPL into its ns.
+                    (= 'picked head)
+                    (let [;; fetch the small :loc on its own — the full map's gensym env-keys
+                          ;; can defeat read-string, which would block the ns jump.
+                          loc-r (repl-eval/eval-form client iso-id
+                                  '(:ns (:loc (cljd.core/deref cljd.flutter/+cljd-repl-picked+)))
+                                  {:ns-lib-uri "cljd/flutter.dart"})
+                          target (try (read-string (:value loc-r)) (catch Throwable _ nil))
+                          full-r (repl-eval/eval-form client iso-id
+                                   '(cljd.core/deref cljd.flutter/+cljd-repl-picked+)
+                                   {:ns-lib-uri "cljd/flutter.dart"})]
+                      (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
+                      (send! {:value (:value full-r) :ns (name @*current-ns)}))
                     :else
                     (let [r (repl-eval/eval-form client iso-id form
                                                  {:ns-lib-uri (ns->lib-uri @*current-ns)

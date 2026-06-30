@@ -642,14 +642,39 @@
                                                  {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
                                               (catch Throwable e
                                                 (println "[VMREPL] async init failed:" (.getMessage e)) false))
+                                            ;; inject the widget-picker helper into cljd.flutter (where the
+                                            ;; HUD machinery resolves). Only works in a debug build whose
+                                            ;; root went through f/run (repl-hud + repl-points present).
+                                            pick-ok
+                                            (try
+                                              (:success
+                                               (binding [compiler/*current-ns* 'cljd.flutter]
+                                                 (repl-eval/eval-form client iso
+                                                   '(do
+                                                      (def +cljd-repl-picked+ (atom nil))
+                                                      (defn +cljd-repl-pick! [on?]
+                                                        (let [hud (-> (global-key :cljd.flutter/app-root) .-currentContext
+                                                                      (peek-of :cljd.flutter.repl-impl/hud-enabled))]
+                                                          (reset! hud
+                                                            (when on?
+                                                              (fn [state]
+                                                                (let [w (.-widget (.-context state))]
+                                                                  (reset! +cljd-repl-picked+
+                                                                    {:loc (.-source_loc w)
+                                                                     :env-keys (vec (keys ((.-get_envmap w))))})))))
+                                                          (if on? "picker ON — tap a widget on the device" "picker off"))))
+                                                   {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload})))
+                                              (catch Throwable e
+                                                (println "[VMREPL] pick init failed:" (.getMessage e)) false))
                                             server (repl-nrepl/start!
                                                      {:client client :iso-id iso :analyzer analyzer
                                                       :dart-version dartv :*current-ns (atom 'cljd.core)
                                                       :ns-lib-uri "cljd/core.dart" :port 0
                                                       :trigger-reload trigger-reload
-                                                      :await? (boolean await-ok)})]
+                                                      :await? (boolean await-ok)
+                                                      :pick? (boolean pick-ok)})]
                                         (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
-                                          (str "(await " (if await-ok "on" "off") ")")))
+                                          (str "(await " (if await-ok "on" "off") ", pick " (if pick-ok "on" "off") ")")))
                                       (vmservice/close client)))
                                   (catch Throwable e
                                     (println "[VMREPL] error:" (.getMessage e)))))))))
