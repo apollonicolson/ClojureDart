@@ -37,9 +37,15 @@ eval(code):
    PROVEN on device: `(println …)`/`(dotimes … println)` output arrives as `:out`,
    interleaved correctly with `:value`. (Lines carry Flutter's own `flutter: ` stdout
    prefix — strippable polish, left as honest passthrough for now.)
-7. ⏳ **delete** parse-repl-line / FormExec / repl-exec / dispatch daemon / reload regex
-   state-machine / socket text REPL. *Deferred: high-risk surgery on the live build;
-   the new path coexists with the old. Do only with a stable device to re-validate.*
+7. ⛔ **delete old machinery** — RE-SCOPED. The original list assumed the VM-Service
+   path would replace reload too. It doesn't: the new reload REUSES Flutter's hot-reload
+   daemon (`trigger-reload` → "r" → "Reloaded N libraries" state machine → done-promise),
+   which was the right call (don't reinvent Flutter reload). So the dispatch daemon +
+   reload state-machine + `r`/`R` stdin forwarding are now LOAD-BEARING, not deletable.
+   Only the legacy `clojure.core.server` socket REPL + `parse-repl-line` + in-app
+   `form-exec`/`repl-exec` remain candidates — but they're tangled into the same daemon,
+   so removal means editing the working reload path + a full device re-validation, for
+   cleanliness not function. Deferred deliberately; the old front is harmless dead weight.
 8. ⏳ **polish** — `pick!` via `evaluate(widget-obj,…)`, async Future-await, var-table redefine.
 
 ## Delete list (the simplification)
