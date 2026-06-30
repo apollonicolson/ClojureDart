@@ -5154,25 +5154,15 @@
      (dart-iife body))))
 
 (defn form->dart-await-expr
-  "Like form->dart-expr, but Future-aware: if FORM's value is a Dart Future, schedule
-   its resolution into `cljd.core/+cljd-repl-fbox+` (an atom) and return the sentinel
-   \"__cljd_future_pending__\"; the caller then polls the box. Otherwise behaves like
-   form->dart-expr (returns the pr-str'd value). Requires the REPL future helpers
-   (`+cljd-repl-future?`, `+cljd-repl-fbox+`) to be injected into cljd.core first.
-   Built from plain quoted symbols (no syntax-quote) to avoid ns-qualifying the
-   special forms; cljd.core fns are fully qualified so they resolve in any *current-ns*."
+  "Like form->dart-expr, but Future-aware: hands FORM's value to the injected helper
+   `cljd.core/+cljd-repl-handle`, which — if the value is a Future — schedules its
+   resolution into an atom and returns the sentinel \"__cljd_future_pending__\" (the
+   caller polls the box), else returns the pr-str'd value. FORM appears exactly ONCE
+   (as the helper arg): referencing it multiple times would let cljd inline the local
+   and re-emit any lifted statements (e.g. `set!`'s temp), breaking the Dart.
+   Requires `+cljd-repl-handle`/`+cljd-repl-fbox+` injected into cljd.core first."
   [form]
-  (let [box 'cljd.core/+cljd-repl-fbox+
-        body (list 'let ['__v (list 'do form)]
-               (list 'if (list 'cljd.core/+cljd-repl-future? '__v)
-                 (list 'do
-                   (list 'cljd.core/reset! box nil)
-                   (list '-> '__v
-                     (list '.then      (list 'fn ['x] (list 'cljd.core/reset! box (list 'cljd.core/pr-str 'x))))
-                     (list '.catchError (list 'fn ['e] (list 'cljd.core/reset! box (list 'cljd.core/str "__CLJD_ERR__ " 'e)))))
-                   "__cljd_future_pending__")
-                 (list 'cljd.core/pr-str '__v)))]
-    (dart-iife body)))
+  (dart-iife (list 'cljd.core/+cljd-repl-handle form)))
 
 (defn recompile-form
   [form recompile-count repltag]

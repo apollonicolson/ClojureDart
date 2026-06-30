@@ -45,6 +45,26 @@
           {:kind :eval :error true :message (subs v (min (count v) (count "__CLJD_ERR__ ")))}
           :else {:kind :eval :value v :ref r})))))
 
+(defn- eval-expression
+  "Compile EXPR to a Dart IIFE and `evaluate` it for a clean value. With await?, a
+   Future result is scheduled into the box and polled to its resolved value."
+  [client iso-id expr ns-lib-uri await? await-timeout-ms]
+  (let [dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
+        lib  (vm/library-id client iso-id ns-lib-uri)
+        r    (vm/evaluate client iso-id lib dart)]
+    (cond
+      (= (:type r) "@Error")
+      {:kind :eval :error true :message (:message r) :ref r}
+      (and await? (= "__cljd_future_pending__" (:valueAsString r)))
+      (poll-future client iso-id lib await-timeout-ms)
+      :else
+      {:kind :eval :value (:valueAsString r) :ref r})))
+
+(defn- existing-def?
+  "True if NAME already resolves to a global var (a :def) in the current ns."
+  [name]
+  (boolean (try (= :def (first (compiler/resolve-symbol name {}))) (catch Throwable _ false))))
+
 (defn eval-form
   "Evaluate FORM against the running app and return a result map.
 
@@ -59,8 +79,17 @@
            await? await-timeout-ms]
     :or   {recompile-count 0 repltag "repl" ns-lib-uri "cljd/user.dart"
            reload-timeout-ms 60000 await-timeout-ms 30000}}]
-  (if (emits-new-toplevel? form)
+  (cond
+    ;; --- redefinition of an existing value-var: instant set!, NO reload ---
+    ;; cljd vars are mutable `name$vN` statics; (set! name init) assigns the backing
+    ;; static directly. A plain (def name newval) reload wouldn't take — Flutter hot
+    ;; reload doesn't re-run a static initializer. New vars fall through to reload.
+    (and (seq? form) (= 'def (first form)) (= 3 (count form)) (existing-def? (second form)))
+    (eval-expression client iso-id (list 'set! (second form) (nth form 2))
+                     ns-lib-uri await? await-timeout-ms)
+
     ;; --- new code: write the .dart into the app, then hot reload it in ---
+    (emits-new-toplevel? form)
     (do
       (compiler/recompile-form form recompile-count repltag)
       (if trigger-reload
@@ -77,15 +106,7 @@
         ;; fallback (no build daemon wired in): raw reloadSources
         (let [report (vm/reload-sources client iso-id)]
           {:kind :reload :success (boolean (:success report)) :report report})))
-    ;; --- expression: compile to a Dart IIFE and evaluate for a clean value ---
-    ;; with await?, a Future result is scheduled into the box + polled to its value.
-    (let [dart (if await? (compiler/form->dart-await-expr form) (compiler/form->dart-expr form))
-          lib  (vm/library-id client iso-id ns-lib-uri)
-          r    (vm/evaluate client iso-id lib dart)]
-      (cond
-        (= (:type r) "@Error")
-        {:kind :eval :error true :message (:message r) :ref r}
-        (and await? (= "__cljd_future_pending__" (:valueAsString r)))
-        (poll-future client iso-id lib await-timeout-ms)
-        :else
-        {:kind :eval :value (:valueAsString r) :ref r}))))
+
+    ;; --- expression ---
+    :else
+    (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms)))

@@ -79,11 +79,16 @@ jars, no integrated REPL source). No upstream fix exists for any of these. So:
   straight through to pr-str (no overhead change in result). Top-level `(await …)` is still not
   supported (needs an async IIFE); the supported pattern is "form returns a Future".
 
-- **var redefinition** — `defn` redefinition WORKS (`(defn f [] 1)`→1, redefine→2): Flutter hot
-  reload reloads function bodies. `def` of a **value** does NOT update (`(def x 1)`; `(def x 2)`;
-  `x`→still 1): Flutter preserves existing top-level static fields and doesn't re-run their
-  initializers on hot reload — only hot *restart* does (which wipes all state). Fundamental Flutter
-  constraint, not a cljd/REPL bug. Document; a future `:restart` REPL command could opt into it.
+- **var redefinition** ✅ SOLVED. The codegen probe showed cljd vars are mutable `name$vN` statics
+  and `(set! name v)` compiles to a direct assignment. So eval-form now routes a `(def name init)`
+  whose name already resolves (`resolve-symbol` → `:def`) through `(set! name init)` — an INSTANT
+  evaluate, no reload. (A plain `def` reload wouldn't take: Flutter hot reload never re-runs an
+  existing static's initializer — only hot *restart* would, wiping state.) `defn` redefinition
+  already worked via reload (fn bodies reload); new vars still reload to create the static.
+  PROVEN: `(def vx 1)`→1; `(def vx 2)`→2; `(def vx (+ vx 100))`→102; `(set! vx 7)`→7 — all instant.
+  Also fixed an async-wrapper bug found here: `form->dart-await-expr` referenced the form's value
+  3× and cljd inlined the local, re-emitting `set!`'s lifted temp ("already declared"). Now it
+  passes the value ONCE to an injected `cljd.core/+cljd-repl-handle` helper.
 
 ## Delete list (the simplification)
 `parse-repl-line`, the `[id mode)…_` protocol, `form-exec`/`repl-exec`/`ReplHackContrib`,

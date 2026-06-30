@@ -629,8 +629,16 @@
                                             (try
                                               (:success
                                                (repl-eval/eval-form client iso
-                                                 '(do (def +cljd-repl-fbox+ (atom nil))
-                                                      (defn +cljd-repl-future? [x] (dart/is? x dart-async/Future)))
+                                                 '(do
+                                                    (def +cljd-repl-fbox+ (atom nil))
+                                                    (defn +cljd-repl-handle [v]
+                                                      (if (dart/is? v dart-async/Future)
+                                                        (do (reset! +cljd-repl-fbox+ nil)
+                                                            (-> v
+                                                                (.then (fn [x] (reset! +cljd-repl-fbox+ (pr-str x))))
+                                                                (.catchError (fn [e] (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
+                                                            "__cljd_future_pending__")
+                                                        (pr-str v))))
                                                  {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
                                               (catch Throwable e
                                                 (println "[VMREPL] async init failed:" (.getMessage e)) false))
