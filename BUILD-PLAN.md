@@ -32,10 +32,11 @@ eval(code):
    reloads and `(cube 4)`→64 (new fn live). Retires the external `tools/cljd-nrepl`.
    - reload path: drives Flutter's own hot reload (`trigger-reload` → "r" → frontend
      recompile → reloadSources) with a done-promise; raw `reloadSources` fails on Flutter.
-5. 🟡 **structured out/err** — IMPLEMENTED (vmservice `listen-streams!`/`:sink` decode
-   Stdout/Stderr WriteEvents; nREPL forwards to `:out`/`:err` during eval). `@Error`
-   already handled. **UNVERIFIED on device** — Pixel dropped off wifi-adb before the
-   `(println …)` round-trip test; needs one validation run when the device is back.
+5. ✅ **structured out/err** — vmservice `listen-streams!`/`:sink` decode Stdout/Stderr
+   WriteEvents; nREPL forwards to `:out`/`:err` during eval. `@Error` already handled.
+   PROVEN on device: `(println …)`/`(dotimes … println)` output arrives as `:out`,
+   interleaved correctly with `:value`. (Lines carry Flutter's own `flutter: ` stdout
+   prefix — strippable polish, left as honest passthrough for now.)
 7. ⏳ **delete** parse-repl-line / FormExec / repl-exec / dispatch daemon / reload regex
    state-machine / socket text REPL. *Deferred: high-risk surgery on the live build;
    the new path coexists with the old. Do only with a stable device to re-validate.*
