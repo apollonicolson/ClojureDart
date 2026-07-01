@@ -350,7 +350,29 @@ outside flutter_driver's finder scope); (3) pixel taps — fragile fallback.
   `repl-toolbar`); when armed, tapping a widget highlights it and prints its source-loc.
   (Full env-inspector panel is Phase 2b.) Callback needs `^ReplState`/`^ReplPointWidget` hints.
 
+## Iteration workflow — USE HOT RELOAD, don't rebuild (2026-07-01)
+Editing `flutter.cljd` (or any watched cljd source) while a `clojure -M:cljd flutter` is running
+triggers the live watcher: it recompiles just that ns and hot-reloads into the running app
+(~11s: "Compiling to Dart… You rock! → Performing hot reload → Reloaded N libraries"), NO
+rebuild, same nREPL port. PROVEN: changed the toolbar color, saw it live without relaunch.
+- Keep ONE flutter run alive; edit → auto hot-reload → screenshot to validate.
+- Full `clojure -M:cljd flutter` relaunches are only for new deftypes/structural changes that
+  can't hot-reload, or a genuinely fresh start. They also caused the `$vN` `lib/cljd-out`
+  corruption when overlapping (kill the old build first, via ProcessHandle).
+- Caveat: a hot-reload of cljd.flutter recompiles it and WIPES REPL-injected helpers
+  (`+cljd-repl-pick!` etc.) — the dependent-recompile fragility. Compiled-in tools (the toolbar)
+  survive; that's why the toolbar pick button beats the REPL `(pick!)` injection.
+
+## Toolbar hide (clean screenshots) — DONE 2026-07-01
+`(defonce +cljd-toolbar-hidden+ (atom false))`; toolbar renders `SizedBox.shrink` when true.
+`(reset! cljd.flutter/+cljd-toolbar-hidden+ true)` + reassemble hides it → clean app screenshot;
+`false` + reassemble shows it. (The `:watch` on the module atom doesn't auto-rebuild — needs the
+reassemble; minor. A :managed/global-notifier would fix the auto-refresh.)
+
 ## Remaining (overlay Phase 2 / Slice 4)
+- pick highlight: expose pick-arming as a REPL-controllable module atom so the picker (which
+  already draws magenta highlight rects) arms from both the toolbar button and the REPL, and is
+  robustly testable (the toolbar button is above MaterialApp → not flutter_driver-tappable).
 pick! button in the toolbar (needs REPL-injected `+cljd-repl-pick!` OR a self-contained arm),
 navigable value inspector, live probes, per-widget `toImage` previews. And Slice 2b
 (mount!/ancestors/bare-local). Default toolbar pos overlaps the search bar slightly (draggable).

@@ -1233,6 +1233,10 @@
   :extends (widgets/SingleChildRenderObjectWidget .child inner)
   (createRenderObject [_ _ctx] (NoDebugPaintRender)))
 
+;; Hide the dev toolbar (e.g. for a clean app screenshot). REPL-controllable:
+;; (reset! cljd.flutter/+cljd-toolbar-hidden+ true) hides it, false shows it.
+(defonce +cljd-toolbar-hidden+ (atom false))
+
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
    hook — the pick button arms/disarms it. Toggles show active state (green tint+highlight);
@@ -1255,8 +1259,11 @@
                                          .size 20.0)))))]
     (widget
       :managed [*pos (atom (widgets/Offset 16.0 90.0)) :dispose nil]
-      :watch [pos *pos]
-      (widgets/Padding
+      :watch [pos *pos
+              hidden +cljd-toolbar-hidden+]
+      (if hidden
+       (widgets/SizedBox.shrink)
+       (widgets/Padding
         .padding (widgets/EdgeInsets.only .left (.-dx ^widgets/Offset pos)
                                           .top (.-dy ^widgets/Offset pos))
         .child
@@ -1272,7 +1279,7 @@
             .child
             (widgets/Container
                 .decoration (widgets/BoxDecoration
-                              .color (widgets/Color 0xDD1E1E1E)
+                              .color (widgets/Color 0xF2101418)
                               .borderRadius (widgets/BorderRadius.circular 22.0))
                 .child
                 (widgets/Row
@@ -1305,7 +1312,7 @@
                                      (not rendering/debugPaintBaselinesEnabled))))
                    (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
                         (fn [] (set! rendering/debugPaintPointersEnabled
-                                     (not rendering/debugPaintPointersEnabled))))])))))))))
+                                     (not rendering/debugPaintPointersEnabled))))]))))))))))
 
 (defn repl-hud [child]
   (widget
