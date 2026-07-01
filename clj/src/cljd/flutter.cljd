@@ -1210,13 +1210,38 @@
 ;; to the rounded screen. Tunable; a platform channel would give the exact value.
 (def ^:private +screen-corner-radius+ 42.0)
 
+;; Suppress the global debug-paint flags for a subtree (the dev tools), so the tools
+;; don't debug-paint themselves. Restored after the frame, so the observed app — painted
+;; earlier this frame — keeps its guides while the toolbar shows none.
+(deftype ^:private NoDebugPaintRender []
+  :extends (rendering/RenderProxyBox)
+  (paint [this context offset]
+    (when (or rendering/debugPaintSizeEnabled rendering/debugRepaintRainbowEnabled)
+      (let [a rendering/debugPaintSizeEnabled
+            b rendering/debugRepaintRainbowEnabled]
+        (set! rendering/debugPaintSizeEnabled false)
+        (set! rendering/debugRepaintRainbowEnabled false)
+        (widgets/WidgetsBinding.instance.addPostFrameCallback
+          (fn [_]
+            (set! rendering/debugPaintSizeEnabled a)
+            (set! rendering/debugRepaintRainbowEnabled b)
+            nil))))
+    (.paint ^super this context offset)
+    nil))
+
+(deftype ^:private NoDebugPaint [^widgets/Widget inner]
+  :extends (widgets/SingleChildRenderObjectWidget .child inner)
+  (createRenderObject [_ _ctx] (NoDebugPaintRender)))
+
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). Positioned via Padding+Align (not
    Positioned — the widget macro wraps it, so it can't be a direct Stack child). Lives
    ABOVE MaterialApp, so it must carry its own Directionality for Material/Row/etc."
   []
-  (letfn [(btn [icon on-tap]
+  (letfn [(btn [k icon on-tap]
+            ;; keyed so headless tooling can tap ByValueKey (no pixel coordinates).
             (widgets/GestureDetector
+              .key (widgets/ValueKey k)
               .onTap (fn [] (on-tap) (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
               .child (widgets/Padding
                        .padding (widgets/EdgeInsets.all 10.0)
@@ -1231,19 +1256,14 @@
         (widgets/Align
           .alignment widgets/Alignment.topLeft
           .child
-          ;; above MaterialApp → carry our own Directionality; use Container+Icon
-          ;; (no Material/IconButton, which need Theme/MaterialLocalizations context).
-          (widgets/Directionality
+          ;; NoDebugPaint suppresses global debug-paint flags on this subtree so the tools
+          ;; don't frame themselves. Above MaterialApp → also carry our own Directionality
+          ;; (Material/IconButton need Theme/MaterialLocalizations context, so use Container+Icon).
+          (NoDebugPaint
+           (widgets/Directionality
             .textDirection widgets/TextDirection.ltr
             .child
-            (widgets/GestureDetector
-              .onPanUpdate
-              (fn [^widgets/DragUpdateDetails d]
-                (swap! *pos (fn [^widgets/Offset o]
-                              (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
-                                              (+ (.-dy o) (.-dy (.-delta d)))))))
-              .child
-              (widgets/Container
+            (widgets/Container
                 .decoration (widgets/BoxDecoration
                               .color (widgets/Color 0xDD1E1E1E)
                               .borderRadius (widgets/BorderRadius.circular 22.0))
@@ -1251,16 +1271,28 @@
                 (widgets/Row
                   .mainAxisSize widgets/MainAxisSize.min
                   .children
-                  [(widgets/Padding
-                     .padding (widgets/EdgeInsets.all 10.0)
-                     .child (widgets/Icon material/Icons.drag_indicator
-                              .color material/Colors.white54 .size 20.0))
-                   (btn material/Icons.grid_4x4
+                  [(widgets/GestureDetector
+                     .onPanUpdate
+                     (fn [^widgets/DragUpdateDetails d]
+                       (swap! *pos (fn [^widgets/Offset o]
+                                     (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
+                                                     (+ (.-dy o) (.-dy (.-delta d)))))))
+                     .child (widgets/Padding
+                              .padding (widgets/EdgeInsets.all 10.0)
+                              .child (widgets/Icon material/Icons.drag_indicator
+                                       .color material/Colors.white54 .size 20.0)))
+                   (btn "cljd-tb-paint" material/Icons.grid_4x4
                         (fn [] (set! rendering/debugPaintSizeEnabled
                                      (not rendering/debugPaintSizeEnabled))))
-                   (btn material/Icons.gradient
+                   (btn "cljd-tb-repaint" material/Icons.gradient
                         (fn [] (set! rendering/debugRepaintRainbowEnabled
-                                     (not rendering/debugRepaintRainbowEnabled))))])))))))))
+                                     (not rendering/debugRepaintRainbowEnabled))))
+                   (btn "cljd-tb-baseline" material/Icons.text_fields
+                        (fn [] (set! rendering/debugPaintBaselinesEnabled
+                                     (not rendering/debugPaintBaselinesEnabled))))
+                   (btn "cljd-tb-pointers" material/Icons.touch_app
+                        (fn [] (set! rendering/debugPaintPointersEnabled
+                                     (not rendering/debugPaintPointersEnabled))))])))))))))
 
 (defn repl-hud [child]
   (widget

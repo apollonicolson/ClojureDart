@@ -327,6 +327,21 @@ Non-obvious fixes found only by screenshotting (it compiled but didn't render):
 - the HUD is ABOVE `MaterialApp` → no Directionality/Theme; `Material`/`IconButton` throw
   "RenderBox not laid out". Use `Directionality` + `Container`/`GestureDetector`/`Icon` instead.
 
+## Toolbar hardening — DONE 2026-07-01 (screenshot-validated)
+- **Exclude the tools from observation**: `NoDebugPaint` (a `RenderProxyBox` subtype) wraps the
+  toolbar and, during its paint, sets `debugPaintSizeEnabled`/`debugRepaintRainbowEnabled` false,
+  restoring them post-frame — the observed app (painted earlier in the frame) keeps its guides
+  while the toolbar paints none. Proven: whole app shows layout guides, toolbar pill stays clean.
+- **Drag-fix**: only the drag handle carries `onPanUpdate` now (was the whole panel → the gesture
+  arena stole every tap as a pan, so buttons never fired and the panel drifted).
+- **Keyed buttons** (`ValueKey "cljd-tb-*"`) so headless tooling can tap ByValueKey.
+- **4 toggles**: layout guides, repaint rainbow, baselines, pointers.
+
+Interaction methods (answering "tap widgets directly, not locations"): (1) REPL eval the effect
+`(set! rendering/… )` — universal, no finder, reaches above-MaterialApp; (2) `flutter_driver` tap
+ByValueKey/ByText — works for *app* widgets (proven), but NOT the toolbar (it's above MaterialApp,
+outside flutter_driver's finder scope); (3) pixel taps — fragile fallback.
+
 ## Remaining (overlay Phase 2 / Slice 4)
 pick! button in the toolbar (needs REPL-injected `+cljd-repl-pick!` OR a self-contained arm),
 navigable value inspector, live probes, per-widget `toImage` previews. And Slice 2b
