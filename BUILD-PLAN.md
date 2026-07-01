@@ -296,6 +296,20 @@ that already work*. Proven on device: `(in-ns 'cljd.flutter)` then
 over `set!`+reassemble, not new capability. (Tree-dump via `dart:developer/log` needs the alias
 required in the eval ns — minor.)
 
+## Picker rounded-edge awareness — DONE 2026-07-01 (compile + picker validated; visual unverified)
+The picker highlight painter now `canvas.clipRRect`s to a rounded rect the size of the screen
+(`+screen-corner-radius+`, a tunable 42.0 constant — no stable Flutter corner-radius API; a
+platform channel / Android 12+ `WindowInsets.getRoundedCorner` would give the exact per-device
+value). Clipping the canvas (not the Listener) keeps full-screen hit-testing. Proven: app
+compiles, pick→tap→`(picked)` still captures (count *env=9). NOT verified: the visual curve —
+`adb screencap` returns black for the Flutter hardware surface, so overlay *appearance* needs a
+human looking at the device.
+
+## Constraint for the overlay UI (Slices 3–4)
+The Flutter-rendered surface is **not screen-capturable** (hardware-composited → black). So any
+visual UI (draggable panel, inspector) can be validated by me for *compiles + no crash + logic*,
+but its *appearance/UX* requires the user's eyes. Build the logic headless; confirm look with a human.
+
 ## Remaining
 - **Slice 2b** — bare-local resolution (`(with-picked …)` let-wrap over the reported env-keys),
   `mount!` (live widget hot-swap — riskiest), `ancestors` (widget diagnostic chain).

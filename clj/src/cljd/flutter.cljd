@@ -1206,6 +1206,10 @@
             (reset! nil))
           (reset! (:*active-state m) state))))))
 
+;; Approximate device screen corner radius (logical px) used to clip picker highlights
+;; to the rounded screen. Tunable; a platform channel would give the exact value.
+(def ^:private +screen-corner-radius+ 42.0)
+
 (defn repl-hud [child]
   (widget
     :managed [*hud-enabled (atom nil) :dispose nil
@@ -1268,6 +1272,15 @@
              (widgets/CustomPainter .repaint *rects)
              :no-meta true
              (paint [_ canvas size]
+               ;; clip highlight strokes to the screen's rounded corners so an edge
+               ;; widget's box follows the curve instead of a sharp corner masked by the
+               ;; hardware. Radius is a constant (no stable Flutter corner-radius API);
+               ;; a platform channel (Android 12+ WindowInsets.getRoundedCorner) would
+               ;; give the exact per-device value.
+               (.clipRRect canvas
+                 (widgets/RRect.fromRectAndRadius
+                   (widgets/Rect.fromLTWH 0.0 0.0 (.-width size) (.-height size))
+                   (widgets/Radius.circular +screen-corner-radius+)))
                (let [{:flds [hue] :as color} (widgets/HSVColor.fromColor (widgets/Color.fromRGBO 255 0 255 0.7))
                      paint (doto (widgets/Paint)
                              (.-style! widgets/PaintingStyle.stroke))
