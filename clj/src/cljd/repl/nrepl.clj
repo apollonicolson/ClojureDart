@@ -81,11 +81,10 @@
               compiler/analyzer-info analyzer
               compiler/dynamic-warning compiler/on-dynamic-warn
               compiler/*current-ns* 'cljd.flutter]
+      ;; just the swap! — repl-selections/repl-pick-highlight WATCH +cljd-picks+, so the
+      ;; on-device views rebuild reactively; no reassemble needed from the host.
       (repl-eval/eval-form client iso-id
         (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+ 'cljd.core/update idx 'cljd.core/assoc :cljd cljd)
-        {:ns-lib-uri "cljd/flutter.dart"})
-      (repl-eval/eval-form client iso-id
-        '(.reassembleApplication (widgets/WidgetsBinding.instance))
         {:ns-lib-uri "cljd/flutter.dart"}))))
 
 (defn make-handler

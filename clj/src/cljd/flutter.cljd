@@ -1253,15 +1253,11 @@
   [0xFF00E676 0xFF40C4FF 0xFFFFAB40 0xFFFF4081 0xFFB388FF 0xFFFFEB3B])
 (defn- pick-color [i] (widgets/Color (nth +pick-colors+ (mod i (count +pick-colors+)))))
 (defn- rect-key [^widgets/Rect r] [(.-left r) (.-top r) (.-right r) (.-bottom r)])
-(defn- nudge-rebuild!
-  "Post-frame reassemble — :watch on a module atom doesn't rebuild on external swap!."
-  []
-  (widgets/WidgetsBinding.instance.addPostFrameCallback
-    (fn [_] (.reassembleApplication (widgets/WidgetsBinding.instance)) nil))
-  nil)
+;; No nudge-rebuild!/reassemble: every view that shows picks WATCHES +cljd-picks+
+;; (repl-selections, repl-pick-highlight), so a swap! from anywhere — device toggle or
+;; host push — rebuilds them reactively via add-watch (see the Subscribable/Atom impl).
 (defn- remove-pick! [p]
-  (swap! +cljd-picks+ (fn [ps] (vec (remove #(= (rect-key (:rect %)) (rect-key (:rect p))) ps))))
-  (nudge-rebuild!))
+  (swap! +cljd-picks+ (fn [ps] (vec (remove #(= (rect-key (:rect %)) (rect-key (:rect p))) ps)))))
 
 (defn- short-src-path
   "file:///…/lib/cljd-out/kora/design/adaptive.dart → kora/design/adaptive.dart.
@@ -1300,32 +1296,6 @@
                 {:src (str (short-src-path file) ":" (subs j ls le)) :name nm}))))))
     (catch Object _ nil)))
 
-(defn- pick-label
-  "A RUNTIME disambiguator for loop-generated widgets (which all share one source line —
-   Dart's creation-location records where a widget is written, not per-instance). Climbs a
-   few levels to the enclosing item, then returns the longest short plain-text under it —
-   e.g. 'Word' for a nav tab whose icon glyph is what got hit. nil if nothing readable."
-  [^widgets/Element target]
-  (try
-    (let [texts (atom [])
-          root (loop [^widgets/Element el target n 0]
-                 (if (>= n 3)
-                   el
-                   (let [p (atom nil)]
-                     (.visitAncestorElements el (fn [a] (reset! p a) false))
-                     (if (nil? @p) el (recur @p (inc n))))))
-          collect (fn collect [^widgets/Element el depth]
-                    (when (< depth 8)
-                      (when (instance? widgets/RichText (.-widget el))
-                        (let [t (.toPlainText (.-text ^widgets/RichText (.-widget el)))]
-                          (when (and t (< 0 (.-length t) 40))
-                            (swap! texts conj t))))
-                      (.visitChildren el (fn [c] (collect c (inc depth)) nil))
-                      nil))]                 ; visitChildren returns void → keep collect Null
-      (collect root 0)
-      (->> @texts (sort-by (fn [^String s] (.-length s)) >) first))
-    (catch Object _ nil)))
-
 ;; The proper device<->host channels (VALIDATED, replacing handrolled ones):
 ;;  • ext.cljd.picks — a service extension the host calls (callServiceExtension) to read
 ;;    the picks as structured JSON. No `evaluate`, no compilation, no 128-char cap, one call
@@ -1352,7 +1322,6 @@
                     ",\"type\":" (jstr (:type p))
                     ",\"wloc\":" (jstr (:src (:wloc p)))
                     ",\"cljd\":" (jstr (:cljd p))
-                    ",\"label\":" (jstr (:label p))
                     ",\"scope\":" (jstr (str (:ns (:loc p)) ":" (:line (:loc p))))
                     "}"))
              @+cljd-picks+)))
@@ -1386,7 +1355,6 @@
                     (vec (remove #(= (rect-key (:rect %)) k) ps))
                     (conj ps {:loc (.-source_loc w)         ; enclosing repl-point scope (clean .cljd)
                               :wloc (pick-widget-loc target) ; per-widget source (cljd-out Dart line)
-                              :label (pick-label target)     ; runtime label — tells loop items apart
                               :type (str (.-runtimeType (.-widget target)))
                               :env ((.-get_envmap w))
                               :rect rect}))))]
@@ -1401,7 +1369,7 @@
                (convert/jsonDecode (str "{\"idx\":" (dec (count after)) ",\"src\":\"" src "\"}")))
              nil                        ; postEvent returns void → keep the try Null
              (catch Object _ nil))))
-    (nudge-rebuild!)))
+    nil))                               ; the swap! above rebuilds the watching views
 
 (defn- repl-selections-column
   "The picks list for the dev panel: a 'N picked' header (× clears all) then one row per
@@ -1420,7 +1388,7 @@
             .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
           (widgets/SizedBox .width 12.0)
           (widgets/GestureDetector
-            .onTap (fn [] (reset! +cljd-picks+ []) (nudge-rebuild!))
+            .onTap (fn [] (reset! +cljd-picks+ []) nil)
             .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
        (widgets/SizedBox .height 6.0)]
       (map-indexed
@@ -1443,10 +1411,8 @@
                    .mainAxisSize widgets/MainAxisSize.min
                    .crossAxisAlignment widgets/CrossAxisAlignment.start
                    .children
-                   ;; primary: type + runtime label (tells loop items apart) + resolved
-                   ;; .cljd (green) or Dart wloc fallback (white)
+                   ;; primary: type + resolved .cljd (green) or Dart wloc fallback (white)
                    [(widgets/Text (str (inc i) ". " (:type p)
-                                    (when-let [lbl (:label p)] (str " [" lbl "]"))
                                     (when-let [loc (or (:cljd p) (:src (:wloc p)))]
                                       (str "  ·  " loc)))
                       .overflow widgets/TextOverflow.ellipsis
@@ -1465,6 +1431,18 @@
                  .onTap (fn [] (remove-pick! p) nil)
                  .child (widgets/Icon material/Icons.close .color material/Colors.white38 .size 14.0))])))
         picks))))
+
+(defn- repl-selections
+  "The selections section of the panel: a self-contained widget that WATCHES +cljd-picks+,
+   so any pick change (device toggle or host push) rebuilds it reactively — no reassemble.
+   Renders nothing when there are no picks."
+  []
+  (widget
+    :watch [picks +cljd-picks+]
+    :when (seq picks)
+    (widgets/Padding
+      .padding (widgets/EdgeInsets.only .left 10.0 .right 10.0 .bottom 10.0)
+      .child (repl-selections-column picks))))
 
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
@@ -1492,17 +1470,19 @@
       :watch [pos *pos
               collapsed *collapsed
               hidden +cljd-toolbar-hidden+]
-      ;; picks: deref'd inline (not :watch) — reassemble from capture-pick!/auto-resolve
-      ;; drives the rebuild, matching how module atoms are handled elsewhere here.
-      :let [picks @+cljd-picks+
+      ;; logical screen size (no MediaQuery above MaterialApp — read the FlutterView).
+      :let [screen (try (let [v (.-implicitView (.-platformDispatcher (widgets/WidgetsBinding.instance)))
+                              dpr (.-devicePixelRatio v)
+                              s (.-physicalSize v)]
+                          [(/ (.-width s) dpr) (/ (.-height s) dpr)])
+                        (catch Object _ [400.0 800.0]))
             drag! (fn [^widgets/DragUpdateDetails d]
                     (swap! *pos (fn [^widgets/Offset o]
                                   (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
                                                   (+ (.-dy o) (.-dy (.-delta d)))))))
             ;; the drag handle: TAP toggles collapse/expand, DRAG moves. Used in both states.
             handle (widgets/GestureDetector
-                     .onTap (fn [] (swap! *collapsed not)
-                              (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
+                     .onTap (fn [] (swap! *collapsed not) nil)   ; :watch rebuilds; no reassemble
                      .onPanUpdate drag!
                      .child (widgets/Padding
                               .padding (widgets/EdgeInsets.all 10.0)
@@ -1514,12 +1494,18 @@
                                        .size 20.0)))]
       (if hidden
        (widgets/SizedBox.shrink)
-       (widgets/Padding
-        .padding (widgets/EdgeInsets.only .left (.-dx ^widgets/Offset pos)
-                                          .top (.-dy ^widgets/Offset pos))
-        .child
-        (widgets/Align
-          .alignment widgets/Alignment.topLeft
+       (widgets/Align
+         .alignment widgets/Alignment.topLeft
+         .child
+         ;; Transform.translate accepts ANY offset (negative / off-screen) with no assertion.
+         ;; EdgeInsets asserts non-negative insets, so dragging off-left red-screened — and
+         ;; the error-recovery rebuild duplicated the toolbar. This positions freely instead.
+         (widgets/Transform.translate
+          ;; clamp AT RENDER → any :pos (persisted, dragged, or set) is always on-screen,
+          ;; so the handle stays grabbable and a stale off-screen value self-heals.
+          .offset (widgets/Offset
+                    (.clamp (.-dx ^widgets/Offset pos) 0.0 (- (nth screen 0) 44.0))
+                    (.clamp (.-dy ^widgets/Offset pos) 0.0 (- (nth screen 1) 44.0)))
           .child
           ;; NoDebugPaint suppresses global debug-paint flags on this subtree so the tools
           ;; don't frame themselves. Above MaterialApp → also carry our own Directionality
@@ -1542,29 +1528,26 @@
                     .mainAxisSize widgets/MainAxisSize.min
                     .crossAxisAlignment widgets/CrossAxisAlignment.start
                     .children
-                    (into
-                      [(widgets/Row
-                         .mainAxisSize widgets/MainAxisSize.min
-                         .children
-                         [handle
-                          (btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
-                               (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
-                          (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
-                               (fn [] (set! rendering/debugPaintSizeEnabled
-                                            (not rendering/debugPaintSizeEnabled))))
-                          (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
-                               (fn [] (set! rendering/debugRepaintRainbowEnabled
-                                            (not rendering/debugRepaintRainbowEnabled))))
-                          (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
-                               (fn [] (set! rendering/debugPaintBaselinesEnabled
-                                            (not rendering/debugPaintBaselinesEnabled))))
-                          (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
-                               (fn [] (set! rendering/debugPaintPointersEnabled
-                                            (not rendering/debugPaintPointersEnabled))))])]
-                      (when (seq picks)
-                        [(widgets/Padding
-                           .padding (widgets/EdgeInsets.only .left 10.0 .right 10.0 .bottom 10.0)
-                           .child (repl-selections-column picks))])))))))))))))
+                    [(widgets/Row
+                       .mainAxisSize widgets/MainAxisSize.min
+                       .children
+                       [handle
+                        (btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
+                             (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
+                        (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
+                             (fn [] (set! rendering/debugPaintSizeEnabled
+                                          (not rendering/debugPaintSizeEnabled))))
+                        (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
+                             (fn [] (set! rendering/debugRepaintRainbowEnabled
+                                          (not rendering/debugRepaintRainbowEnabled))))
+                        (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
+                             (fn [] (set! rendering/debugPaintBaselinesEnabled
+                                          (not rendering/debugPaintBaselinesEnabled))))
+                        (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
+                             (fn [] (set! rendering/debugPaintPointersEnabled
+                                          (not rendering/debugPaintPointersEnabled))))])
+                     ;; self-watching → rebuilds on any pick change, no reassemble
+                     (repl-selections)])))))))))))
 
 (defn- fmt-val
   "Render an env value for the inspector: deref atoms to show the live value."
