@@ -108,8 +108,11 @@
     :or {ns-lib-uri "cljd/core.dart"}}]
   ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
   ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
-  (let [*eval-sink (atom nil)]
+  (let [*eval-sink (atom nil)
+        *pick-events (atom [])]                 ; PROBE: structured cljd.pick events from postEvent
    (install-pick-resolver! client iso-id dart-version analyzer *eval-sink)
+   (vm/set-event-sink! client (fn [kind data]
+                                (when (= kind "cljd.pick") (swap! *pick-events conj data))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -254,6 +257,29 @@
                       (when (some :cljd rows)
                         (eval1 '(.reassembleApplication (widgets/WidgetsBinding.instance))))
                       (send! {:value (pr-str rows) :ns (name @*current-ns)}))
+
+                    ;; (vmprobe): validate the richer VM-Service channels — (1) call a
+                    ;; service extension for structured data, (2) getObject a large device
+                    ;; value with NO 128-char truncation, (3) confirm postEvent events landed.
+                    (= 'vmprobe head)
+                    (let [ping (try (vm/call-ext client iso-id "ext.cljd.ping" {})
+                                    (catch Throwable e (str "ERR " (.getMessage e))))
+                          ref (try (vm/evaluate client iso-id
+                                     (vm/library-id client iso-id "cljd/flutter.dart")
+                                     (compiler/form->dart-expr
+                                       '(cljd.core/deref cljd.flutter/+cljd-picks+) false))
+                                   (catch Throwable e {:err (.getMessage e)}))
+                          obj (when (:id ref)
+                                (try (vm/get-object client iso-id (:id ref))
+                                     (catch Throwable e {:err (.getMessage e)})))]
+                      (send! {:value (pr-str {:ping ping
+                                              :ref-kind (:kind ref)
+                                              :ref-valueAsString (:valueAsString ref)
+                                              :getObject-kind (:kind obj)
+                                              :getObject-length (:length obj)
+                                              :getObject-fields (when (map? obj) (vec (keys obj)))
+                                              :events @*pick-events})
+                              :ns (name @*current-ns)}))
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).

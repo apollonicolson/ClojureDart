@@ -5,6 +5,8 @@
             ["package:flutter/foundation.dart" :as foundation]
             ["package:flutter/rendering.dart" :as rendering]
             ["dart:async" :as dart:async]
+            ["dart:developer" :as dev]
+            ["dart:convert" :as convert]
             ["dart:math" :as dart:math]
             ["dart:ui" :as dart:ui]
             [cljd.string :as str])
@@ -1298,6 +1300,49 @@
                 {:src (str (short-src-path file) ":" (subs j ls le)) :name nm}))))))
     (catch Object _ nil)))
 
+(defn- pick-label
+  "A RUNTIME disambiguator for loop-generated widgets (which all share one source line —
+   Dart's creation-location records where a widget is written, not per-instance). Climbs a
+   few levels to the enclosing item, then returns the longest short plain-text under it —
+   e.g. 'Word' for a nav tab whose icon glyph is what got hit. nil if nothing readable."
+  [^widgets/Element target]
+  (try
+    (let [texts (atom [])
+          root (loop [^widgets/Element el target n 0]
+                 (if (>= n 3)
+                   el
+                   (let [p (atom nil)]
+                     (.visitAncestorElements el (fn [a] (reset! p a) false))
+                     (if (nil? @p) el (recur @p (inc n))))))
+          collect (fn collect [^widgets/Element el depth]
+                    (when (< depth 8)
+                      (when (instance? widgets/RichText (.-widget el))
+                        (let [t (.toPlainText (.-text ^widgets/RichText (.-widget el)))]
+                          (when (and t (< 0 (.-length t) 40))
+                            (swap! texts conj t))))
+                      (.visitChildren el (fn [c] (collect c (inc depth)) nil))
+                      nil))]                 ; visitChildren returns void → keep collect Null
+      (collect root 0)
+      (->> @texts (sort-by (fn [^String s] (.-length s)) >) first))
+    (catch Object _ nil)))
+
+;; PROBE: validate the proper VM-Service channels before gutting the handrolled ones.
+;; ext.cljd.ping is a service extension the host calls (callServiceExtension) for structured
+;; data — no `evaluate`, no compilation, no 128-char cap. postEvent pushes a structured
+;; event to the host over the Extension stream — replaces the CLJD_PICK stdout marker.
+(defonce ^:private +cljd-ext-registered+ (atom false))
+
+(defn register-cljd-devtools!
+  "Register cljd dev-tool service extensions. Guarded so hot-reload can't re-register."
+  []
+  (when (compare-and-set! +cljd-ext-registered+ false true)
+    (dev/registerExtension "ext.cljd.ping"
+      (fn [_method _params]
+        (dart:async/Future.value
+          (dev/ServiceExtensionResponse.result "{\"pong\":true}"))))
+    nil)                                ; registerExtension returns void → keep the when Null
+  nil)
+
 (defn- capture-pick!
   "Pick callback. STATE = nearest enclosing repl-point (gives lexical scope + source-loc).
    TARGET = the deepest hit widget (Flutter hit-test, pixel-precise) — used for the box and
@@ -1315,6 +1360,7 @@
                     (vec (remove #(= (rect-key (:rect %)) k) ps))
                     (conj ps {:loc (.-source_loc w)         ; enclosing repl-point scope (clean .cljd)
                               :wloc (pick-widget-loc target) ; per-widget source (cljd-out Dart line)
+                              :label (pick-label target)     ; runtime label — tells loop items apart
                               :type (str (.-runtimeType (.-widget target)))
                               :env ((.-get_envmap w))
                               :rect rect}))))]
@@ -1323,7 +1369,13 @@
     ;; appears on-device automatically, no (picks) call needed.
     (when (> (count after) before)
       (when-let [src (:src (:wloc (peek after)))]
-        (println (str "CLJD_PICK " (dec (count after)) " " src))))
+        (println (str "CLJD_PICK " (dec (count after)) " " src))    ; old channel (to be gutted)
+        ;; PROBE: structured push over the Extension stream (replaces the marker above).
+        ;; jsonDecode yields a native Dart Map<String,dynamic> — the type postEvent wants.
+        (try (dev/postEvent "cljd.pick"
+               (convert/jsonDecode (str "{\"idx\":" (dec (count after)) ",\"src\":\"" src "\"}")))
+             nil                        ; postEvent returns void → keep the try Null
+             (catch Object _ nil))))
     (nudge-rebuild!)))
 
 (defn- repl-selections-column
@@ -1366,8 +1418,10 @@
                    .mainAxisSize widgets/MainAxisSize.min
                    .crossAxisAlignment widgets/CrossAxisAlignment.start
                    .children
-                   ;; primary: type + resolved .cljd (green) or Dart wloc fallback (white)
+                   ;; primary: type + runtime label (tells loop items apart) + resolved
+                   ;; .cljd (green) or Dart wloc fallback (white)
                    [(widgets/Text (str (inc i) ". " (:type p)
+                                    (when-let [lbl (:label p)] (str " [" lbl "]"))
                                     (when-let [loc (or (:cljd p) (:src (:wloc p)))]
                                       (str "  ·  " loc)))
                       .overflow widgets/TextOverflow.ellipsis
@@ -1522,7 +1576,7 @@
 
 (defn repl-hud [child]
   (widget
-    :managed [_ (println "[* RDY)_") :dispose nil]
+    :managed [_ (do (register-cljd-devtools!) (println "[* RDY)_")) :dispose nil]
     :let [*hud-enabled +cljd-hud-enabled+]
     (widgets/Stack
       .alignment widgets/AlignmentGeometry.topLeft

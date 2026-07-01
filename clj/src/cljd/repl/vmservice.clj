@@ -16,6 +16,7 @@
   (let [pending (atom {})                 ; request id -> promise
         idgen (AtomicLong. 0)
         sink (atom nil)                   ; optional (fn [stream-id text]) for stream output
+        event-sink (atom nil)             ; optional (fn [extension-kind data-map]) for Extension events
         buf (StringBuilder.)
         decoder (java.util.Base64/getDecoder)
         listener
@@ -37,18 +38,23 @@
                       ;; async stream notification (Stdout/Stderr WriteEvent)
                       (= "streamNotify" (:method msg))
                       (let [{:keys [streamId event]} (:params msg)]
-                        (when (and (#{"Stdout" "Stderr"} streamId)
-                                   (= "WriteEvent" (:kind event))
-                                   (:bytes event))
+                        (cond
+                          (and (#{"Stdout" "Stderr"} streamId)
+                               (= "WriteEvent" (:kind event))
+                               (:bytes event))
                           (when-some [f @sink]
-                            (f streamId (String. (.decode decoder ^String (:bytes event)) "UTF-8")))))))
+                            (f streamId (String. (.decode decoder ^String (:bytes event)) "UTF-8")))
+                          ;; structured device->host push: dart:developer postEvent(kind, data)
+                          (and (= "Extension" streamId) (= "Extension" (:kind event)))
+                          (when-some [g @event-sink]
+                            (g (:extensionKind event) (:extensionData event)))))))
                   (catch Exception _ nil))))   ; ignore unparsable frames
             (.request ws 1)
             nil)
           (onError [_ _ err] (binding [*out* *err*] (println "[vmservice]" (.getMessage err)))))]
     {:ws (-> (HttpClient/newHttpClient) .newWebSocketBuilder
              (.buildAsync (URI/create ws-uri) listener) .join)
-     :pending pending :idgen idgen :sink sink}))
+     :pending pending :idgen idgen :sink sink :event-sink event-sink}))
 
 (defn rpc
   "Synchronous JSON-RPC call. Returns the :result map, or throws on error/timeout."
@@ -85,12 +91,32 @@
   [client iso-id]
   (rpc client "reloadSources" {:isolateId iso-id}))
 
+(defn get-object
+  "Fetch a device object's FULL structure by id (no valueAsString truncation). For a
+   List/Map, :elements/:associations are refs you recurse into. `evaluate` returns such
+   an id in its :id — this is how you read a large device value without the 128-char cap."
+  [client iso-id obj-id]
+  (rpc client "getObject" {:isolateId iso-id :objectId obj-id}))
+
+(defn call-ext
+  "Call a registered Dart service extension (method like \"ext.cljd.picks\", registered
+   device-side via dart:developer registerExtension). PARAMS values must be strings.
+   Returns the extension's ServiceExtensionResponse.result parsed as JSON — structured
+   data, no compilation, no truncation."
+  [client iso-id method params]
+  (rpc client method (merge {:isolateId iso-id} params)))
+
+(defn set-event-sink!
+  "Set (or clear) the Extension-event handler (fn [extension-kind data-map]) on CLIENT."
+  [{:keys [event-sink]} f]
+  (reset! event-sink f))
+
 (defn listen-streams!
   "Subscribe to the isolate's Stdout/Stderr streams so WriteEvents reach `:sink`.
    Flutter may already hold a subscription (error 103 \"Stream already subscribed\");
    that is harmless and ignored."
   [client]
-  (doseq [stream ["Stdout" "Stderr"]]
+  (doseq [stream ["Stdout" "Stderr" "Extension"]]
     (try (rpc client "streamListen" {:streamId stream})
          (catch Exception _ nil))))   ; 103 already-subscribed, etc.
 
