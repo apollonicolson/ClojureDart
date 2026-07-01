@@ -1210,6 +1210,58 @@
 ;; to the rounded screen. Tunable; a platform channel would give the exact value.
 (def ^:private +screen-corner-radius+ 42.0)
 
+(defn repl-toolbar
+  "A draggable in-app debug toolbar (kDebugMode only). Positioned via Padding+Align (not
+   Positioned — the widget macro wraps it, so it can't be a direct Stack child). Lives
+   ABOVE MaterialApp, so it must carry its own Directionality for Material/Row/etc."
+  []
+  (letfn [(btn [icon on-tap]
+            (widgets/GestureDetector
+              .onTap (fn [] (on-tap) (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
+              .child (widgets/Padding
+                       .padding (widgets/EdgeInsets.all 10.0)
+                       .child (widgets/Icon icon .color material/Colors.white .size 20.0))))]
+    (widget
+      :managed [*pos (atom (widgets/Offset 16.0 90.0)) :dispose nil]
+      :watch [pos *pos]
+      (widgets/Padding
+        .padding (widgets/EdgeInsets.only .left (.-dx ^widgets/Offset pos)
+                                          .top (.-dy ^widgets/Offset pos))
+        .child
+        (widgets/Align
+          .alignment widgets/Alignment.topLeft
+          .child
+          ;; above MaterialApp → carry our own Directionality; use Container+Icon
+          ;; (no Material/IconButton, which need Theme/MaterialLocalizations context).
+          (widgets/Directionality
+            .textDirection widgets/TextDirection.ltr
+            .child
+            (widgets/GestureDetector
+              .onPanUpdate
+              (fn [^widgets/DragUpdateDetails d]
+                (swap! *pos (fn [^widgets/Offset o]
+                              (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
+                                              (+ (.-dy o) (.-dy (.-delta d)))))))
+              .child
+              (widgets/Container
+                .decoration (widgets/BoxDecoration
+                              .color (widgets/Color 0xDD1E1E1E)
+                              .borderRadius (widgets/BorderRadius.circular 22.0))
+                .child
+                (widgets/Row
+                  .mainAxisSize widgets/MainAxisSize.min
+                  .children
+                  [(widgets/Padding
+                     .padding (widgets/EdgeInsets.all 10.0)
+                     .child (widgets/Icon material/Icons.drag_indicator
+                              .color material/Colors.white54 .size 20.0))
+                   (btn material/Icons.grid_4x4
+                        (fn [] (set! rendering/debugPaintSizeEnabled
+                                     (not rendering/debugPaintSizeEnabled))))
+                   (btn material/Icons.gradient
+                        (fn [] (set! rendering/debugRepaintRainbowEnabled
+                                     (not rendering/debugRepaintRainbowEnabled))))])))))))))
+
 (defn repl-hud [child]
   (widget
     :managed [*hud-enabled (atom nil) :dispose nil
@@ -1302,7 +1354,8 @@
                nil)
              (shouldRepaint
                  [this old]
-                 true))))])))
+                 true))))
+       (repl-toolbar)])))
 
 (defmacro run
   "Starts an application, takes a widget body and uses it as the application root widget.

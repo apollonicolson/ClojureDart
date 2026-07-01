@@ -305,10 +305,32 @@ compiles, pick→tap→`(picked)` still captures (count *env=9). NOT verified: t
 `adb screencap` returns black for the Flutter hardware surface, so overlay *appearance* needs a
 human looking at the device.
 
-## Constraint for the overlay UI (Slices 3–4)
-The Flutter-rendered surface is **not screen-capturable** (hardware-composited → black). So any
-visual UI (draggable panel, inspector) can be validated by me for *compiles + no crash + logic*,
-but its *appearance/UX* requires the user's eyes. Build the logic headless; confirm look with a human.
+## Headless visual validation — SOLVED (the "blind" claim was wrong)
+`adb screencap` is black (hardware surface), but Flutter exposes its own pipeline. Enable the
+`flutter_driver` extension in the app (`enableFlutterDriverExtension()` before binding init —
+kora does this debug-only in `kora.core/main`), connect the `dart` MCP server to the app's DTD
+(`dtd` listConnectedApps/connect to the kora-workspace instance), and then:
+- `widget_inspector get_widget_tree` → the full widget "DOM" (types, text, nesting) — CDP-grade.
+- `flutter_driver_command screenshot` → a real PNG of the rendered app (NOT black) — read it to *see*.
+- `flutter_driver_command tap/scroll/...` + `get_runtime_errors` → drive + debug headlessly.
+This IS Flutter's CDP/Playwright: `pick!` is the user-directable inspector half; flutter_driver is
+the programmatic half. The overlay below was built entirely headless via build→screenshot→fix loops.
+
+## Slice 3 (overlay Phase 1) — DONE 2026-07-01, screenshot-validated on device
+`cljd.flutter/repl-toolbar`: a draggable in-app debug toolbar (a third `repl-hud` Stack child,
+kDebugMode-only, NOT tied to pick!). Dark rounded pill with a drag handle + toggle icons for
+`debugPaintSizeEnabled` and `debugRepaintRainbowEnabled` (each `set!`s the flag + reassembles).
+Proven: renders; tapping the grid icon toggled Flutter's layout guides on, tapping again off.
+Non-obvious fixes found only by screenshotting (it compiled but didn't render):
+- `Positioned` must be a *direct* Stack child; the widget macro wraps it → position with Padding+Align.
+- callbacks are `void`; a trailing `reassembleApplication` Future can't be returned → end with `nil`.
+- the HUD is ABOVE `MaterialApp` → no Directionality/Theme; `Material`/`IconButton` throw
+  "RenderBox not laid out". Use `Directionality` + `Container`/`GestureDetector`/`Icon` instead.
+
+## Remaining (overlay Phase 2 / Slice 4)
+pick! button in the toolbar (needs REPL-injected `+cljd-repl-pick!` OR a self-contained arm),
+navigable value inspector, live probes, per-widget `toImage` previews. And Slice 2b
+(mount!/ancestors/bare-local). Default toolbar pos overlaps the search bar slightly (draggable).
 
 ## Remaining
 - **Slice 2b** — bare-local resolution (`(with-picked …)` let-wrap over the reported env-keys),
