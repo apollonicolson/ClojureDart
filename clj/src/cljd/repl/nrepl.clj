@@ -158,6 +158,42 @@
                               {:ns-lib-uri "cljd/flutter.dart"})]
                       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
                       (send! {:value (:value full-r) :ns (name @*current-ns)}))
+                    ;; (picks): all on-device picks (multi-select), each :wloc (Flutter
+                    ;; track-widget-creation, a cljd-out Dart line) resolved to its .cljd
+                    ;; source line via the host source map (smap-search over @nses). The
+                    ;; device has no smap — this is the host hop that turns kora/nav.dart:249
+                    ;; into kora/nav.cljd:NN. Env keys are dropped so read-string can't choke.
+                    (= 'picks head)
+                    (let [proj-r (repl-eval/eval-form client iso-id
+                                   '(cljd.core/mapv
+                                      (fn [p] {:type (:type p) :wloc (:wloc p) :loc (:loc p)})
+                                      (cljd.core/deref cljd.flutter/+cljd-picks+))
+                                   {:ns-lib-uri "cljd/flutter.dart"})
+                          picks (try (read-string (:value proj-r)) (catch Throwable _ nil))
+                          smap-search (requiring-resolve 'cljd.build/smap-search)
+                          libs (:libs @compiler/nses)
+                          resolve-src
+                          (fn [wloc]
+                            (when-let [^String src (:src wloc)]
+                              (let [ci (.lastIndexOf src ":")]
+                                (when (pos? ci)
+                                  (let [path (subs src 0 ci)
+                                        line (try (Long/parseLong (subs src (inc ci)))
+                                                  (catch Throwable _ nil))
+                                        entry (some (fn [[k v]]
+                                                      (let [ks (str k)]
+                                                        (when (or (= ks path)
+                                                                  (.endsWith ks (str "/" path)))
+                                                          v)))
+                                                    libs)]
+                                    (when (and line smap-search (:smap entry))
+                                      (when-some [info (smap-search (:smap entry) line nil)]
+                                        (str (:file info) ":" (:line info)
+                                             (when (:column info) (str ":" (:column info)))))))))))
+                          enriched (mapv (fn [p] (assoc p :cljd (resolve-src (:wloc p))))
+                                         (or picks []))]
+                      (send! {:value (pr-str enriched) :ns (name @*current-ns)}))
+
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).
                     (#{'macroexpand 'macroexpand-1} head)
