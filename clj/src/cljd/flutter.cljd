@@ -1261,6 +1261,43 @@
   (swap! +cljd-picks+ (fn [ps] (vec (remove #(= (rect-key (:rect %)) (rect-key (:rect p))) ps))))
   (nudge-rebuild!))
 
+(defn- short-src-path
+  "file:///…/lib/cljd-out/kora/design/adaptive.dart → kora/design/adaptive.dart.
+   The path maps 1:1 to src/…/*.cljd; the line stays the compiled-Dart line."
+  [^String file]
+  (let [i (.indexOf file "/cljd-out/")]
+    (if (neg? i) file (subs file (+ i 10)))))
+
+(defn- pick-widget-loc
+  "Per-widget source pointer via Flutter track-widget-creation. getSelectedSummaryWidget
+   walks up to the nearest APP-authored widget (skips framework internals), returning its
+   creation location in the compiled cljd-out Dart. Distinct per pick; the file maps to the
+   .cljd, the line is the Dart line. Returns {:src \"kora/…/x.dart:NN\" :name \"Scaffold\"}
+   or nil. String-parsed (raw inspector JSON) to avoid Dart-Map interop."
+  [^widgets/Element target]
+  (try
+    (let [svc widgets/WidgetInspectorService.instance]
+      (when (.isWidgetCreationTracked svc)
+        (.setSelection svc target "cljd-pick")
+        (let [j (str (.getSelectedSummaryWidget svc nil "cljd-pick"))
+              fi (.indexOf j "\"file\":\"")]
+          (when-not (neg? fi)
+            (let [fs (+ fi 8)
+                  fe (.indexOf j "\"" fs)
+                  file (subs j fs fe)
+                  li (.indexOf j "\"line\":" fe)
+                  ls (+ li 7)
+                  le (loop [e ls]
+                       (if (and (< e (count j))
+                                (let [ch (.codeUnitAt j e)] (and (>= ch 48) (<= ch 57))))
+                         (recur (inc e)) e))
+                  ni (.indexOf j "\"name\":\"" fe)
+                  nm (when-not (neg? ni)
+                       (let [ns (+ ni 8)] (subs j ns (.indexOf j "\"" ns))))]
+              (when (> le ls)
+                {:src (str (short-src-path file) ":" (subs j ls le)) :name nm}))))))
+    (catch Object _ nil)))
+
 (defn- capture-pick!
   "Pick callback. STATE = nearest enclosing repl-point (gives lexical scope + source-loc).
    TARGET = the deepest hit widget (Flutter hit-test, pixel-precise) — used for the box and
@@ -1275,7 +1312,8 @@
       (fn [ps]
         (if (some #(= (rect-key (:rect %)) k) ps)
           (vec (remove #(= (rect-key (:rect %)) k) ps))
-          (conj ps {:loc (.-source_loc w)
+          (conj ps {:loc (.-source_loc w)         ; enclosing repl-point scope (clean .cljd)
+                    :wloc (pick-widget-loc target) ; per-widget source (cljd-out Dart line)
                     :type (str (.-runtimeType (.-widget target)))
                     :env ((.-get_envmap w))
                     :rect rect}))))
@@ -1437,9 +1475,25 @@
                           .decoration (widgets/BoxDecoration .color (pick-color i)
                                         .shape widgets/BoxShape.circle))
                         (widgets/SizedBox .width 8.0)
-                        (widgets/Text (str (inc i) ". " (:type p) "  ·  "
-                                        (let [l (:loc p)] (str (:ns l) ":" (:line l) ":" (:column l))))
-                          .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))
+                        (widgets/ConstrainedBox
+                          .constraints (widgets/BoxConstraints .maxWidth 280.0)
+                          .child
+                          (widgets/Column
+                            .mainAxisSize widgets/MainAxisSize.min
+                            .crossAxisAlignment widgets/CrossAxisAlignment.start
+                            .children
+                            ;; primary: what you pointed at + where it's written (per-widget)
+                            [(widgets/Text (str (inc i) ". " (:type p)
+                                             (when-let [wl (:wloc p)] (str "  ·  " (:src wl))))
+                               .overflow widgets/TextOverflow.ellipsis
+                               .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))
+                             ;; secondary: enclosing repl-point scope (clean .cljd, coarse)
+                             (widgets/Text (let [l (:loc p)]
+                                             (str "scope " (:ns l) ":" (:line l)
+                                                  (when-let [wl (:wloc p)]
+                                                    (when (:name wl) (str "  ·  " (:name wl))))))
+                               .overflow widgets/TextOverflow.ellipsis
+                               .style (widgets/TextStyle .color material/Colors.white38 .fontSize 10.0))]))
                         (widgets/SizedBox .width 8.0)
                         (widgets/GestureDetector
                           .onTap (fn [] (remove-pick! p) nil)
