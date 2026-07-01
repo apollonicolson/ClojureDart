@@ -1340,9 +1340,16 @@
                                          .color (if active? (widgets/Color 0xFF00E676) material/Colors.white54)
                                          .size 20.0)))))]
     (widget
-      :managed [*pos (atom (widgets/Offset 16.0 90.0)) :dispose nil]
+      :managed [*pos (atom (widgets/Offset 16.0 90.0)) :dispose nil
+                *collapsed (atom false) :dispose nil]
       :watch [pos *pos
+              collapsed *collapsed
               hidden +cljd-toolbar-hidden+]
+      ;; free drag: shared by the collapsed handle and the expanded drag grip.
+      :let [drag! (fn [^widgets/DragUpdateDetails d]
+                    (swap! *pos (fn [^widgets/Offset o]
+                                  (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
+                                                  (+ (.-dy o) (.-dy (.-delta d)))))))]
       (if hidden
        (widgets/SizedBox.shrink)
        (widgets/Padding
@@ -1364,33 +1371,41 @@
                               .color (widgets/Color 0xF2101418)
                               .borderRadius (widgets/BorderRadius.circular 22.0))
                 .child
+                ;; The drag handle is the toggle: TAP collapses/expands, DRAG moves.
+                ;; Collapsed → handle only (green developer_mode); expanded → handle
+                ;; (grey grip) + the tool buttons. No separate collapse button.
                 (widgets/Row
                   .mainAxisSize widgets/MainAxisSize.min
                   .children
-                  [(widgets/GestureDetector
-                     .onPanUpdate
-                     (fn [^widgets/DragUpdateDetails d]
-                       (swap! *pos (fn [^widgets/Offset o]
-                                     (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
-                                                     (+ (.-dy o) (.-dy (.-delta d)))))))
-                     .child (widgets/Padding
-                              .padding (widgets/EdgeInsets.all 10.0)
-                              .child (widgets/Icon material/Icons.drag_indicator
-                                       .color material/Colors.white54 .size 20.0)))
-                   (btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
-                        (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
-                   (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
-                        (fn [] (set! rendering/debugPaintSizeEnabled
-                                     (not rendering/debugPaintSizeEnabled))))
-                   (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
-                        (fn [] (set! rendering/debugRepaintRainbowEnabled
-                                     (not rendering/debugRepaintRainbowEnabled))))
-                   (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
-                        (fn [] (set! rendering/debugPaintBaselinesEnabled
-                                     (not rendering/debugPaintBaselinesEnabled))))
-                   (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
-                        (fn [] (set! rendering/debugPaintPointersEnabled
-                                     (not rendering/debugPaintPointersEnabled))))]))))))))))
+                  (into
+                    [(widgets/GestureDetector
+                       .onTap (fn [] (swap! *collapsed not)
+                                (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
+                       .onPanUpdate drag!
+                       .child (widgets/Padding
+                                .padding (widgets/EdgeInsets.all 10.0)
+                                .child (widgets/Icon
+                                         (if collapsed material/Icons.developer_mode
+                                             material/Icons.drag_indicator)
+                                         .color (if collapsed (widgets/Color 0xFF00E676)
+                                                    material/Colors.white54)
+                                         .size 20.0)))]
+                    (if collapsed
+                      []
+                      [(btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
+                            (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
+                       (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
+                            (fn [] (set! rendering/debugPaintSizeEnabled
+                                         (not rendering/debugPaintSizeEnabled))))
+                       (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
+                            (fn [] (set! rendering/debugRepaintRainbowEnabled
+                                         (not rendering/debugRepaintRainbowEnabled))))
+                       (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
+                            (fn [] (set! rendering/debugPaintBaselinesEnabled
+                                         (not rendering/debugPaintBaselinesEnabled))))
+                       (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
+                            (fn [] (set! rendering/debugPaintPointersEnabled
+                                         (not rendering/debugPaintPointersEnabled))))]))))))))))))
 
 (defn- fmt-val
   "Render an env value for the inspector: deref atoms to show the live value."
@@ -1869,3 +1884,4 @@
      (try
        (.toImageSync picture# (int ~w) (int ~h))
        (finally (.dispose picture#)))))
+
