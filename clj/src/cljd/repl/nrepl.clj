@@ -48,26 +48,50 @@
       {:ns (name (:ns info)) :name (name (:name info))
        :arglists al :doc (:doc m) :macro? (boolean (:macro m))})))
 
+(defn flatten-smap
+  "The compiler's lib smap is two-level: outer = per-def regions
+   [dart-line _ {:slug :smap :str}], inner = positions within a def
+   [rel-line _ {:file :line :column}] — but the inner interleaves REAL cljd positions
+   with 1:1 'untracked glue' markers. Flatten to one vector, sorted by absolute Dart line,
+   of [abs-dart-line {:file :line :column}] keeping only REAL positions (line>1). Then any
+   Dart line maps coherently to the nearest preceding real cljd form — no 1:1 holes."
+  [lib-smap]
+  (->> lib-smap
+       (mapcat (fn [[reg-line _ {:keys [smap]}]]
+                 (keep (fn [[rel-line _ info]]
+                         (when (and info (> (or (:line info) 0) 1))
+                           [(+ reg-line (dec rel-line)) info]))
+                       smap)))
+       (sort-by first)
+       vec))
+
+(defn dart-line->cljd
+  "Nearest preceding real cljd position for a Dart line, over a flattened smap. Coherent:
+   defined for ANY Dart line that has any tracked form before it in the file."
+  [flat dart-line]
+  (some (fn [[dl info]] (when (<= dl dart-line) info))
+        (reverse flat)))
+
+(defn find-lib
+  "The lib entry whose key ends with the dart path (e.g. 'kora/nav.dart')."
+  [libs ^String path]
+  (some (fn [[k v]] (let [ks (str k)] (when (or (= ks path) (.endsWith ks (str "/" path))) v))) libs))
+
 (defn resolve-wloc
   "A device pick's Dart wloc 'kora/nav.dart:249' -> its .cljd source 'kora/nav.cljd:78:12'
-   via the host source map (smap lives only in this build JVM). nil when unresolvable or
-   when it falls to the smap's 1:1 sentinel (a generated region with no fine entry)."
+   via the host source map. Coherent — any Dart line resolves to the nearest preceding real
+   cljd form (no 1:1 holes); nil only when the lib/smap is missing entirely."
   [libs ^String src]
   (when (and src (seq libs))
-    (when-some [smap-search (requiring-resolve 'cljd.build/smap-search)]
-      (let [ci (.lastIndexOf src ":")]
-        (when (pos? ci)
-          (let [path (subs src 0 ci)
-                line (try (Long/parseLong (subs src (inc ci))) (catch Throwable _ nil))
-                entry (some (fn [[k v]]
-                              (let [ks (str k)]
-                                (when (or (= ks path) (.endsWith ks (str "/" path))) v)))
-                            libs)]
-            (when (and line (:smap entry))
-              (when-some [info (smap-search (:smap entry) line nil)]
-                (when (> (or (:line info) 0) 1)
-                  (str (:file info) ":" (:line info)
-                       (when (:column info) (str ":" (:column info)))))))))))))
+    (let [ci (.lastIndexOf src ":")]
+      (when (pos? ci)
+        (let [path (subs src 0 ci)
+              line (try (Long/parseLong (subs src (inc ci))) (catch Throwable _ nil))
+              entry (find-lib libs path)]
+          (when (and line (:smap entry))
+            (when-some [info (dart-line->cljd (flatten-smap (:smap entry)) line)]
+              (str (:file info) ":" (:line info)
+                   (when (:column info) (str ":" (:column info)))))))))))
 
 (defn- resolve-and-push!
   "Resolve a device pick's Dart wloc SRC to .cljd and push it back via the ext.cljd.set-cljd
@@ -208,6 +232,14 @@
                     (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
                                  (catch Throwable e {:error (.getMessage e)}))]
                       (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
+
+                    ;; (cljd-src "kora/nav.dart" 249) -> "kora/nav.cljd:78:12". The coherent
+                    ;; Dart->cljd source map: works for ANY Dart line in a compiled lib.
+                    (= 'cljd-src head)
+                    (let [path (str (second form))
+                          line (nth form 2)
+                          cljd (resolve-wloc (:libs @compiler/nses) (str path ":" line))]
+                      (send! {:value (pr-str (or cljd "unresolved")) :ns (name @*current-ns)}))
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).
