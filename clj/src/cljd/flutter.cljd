@@ -1497,11 +1497,16 @@
                             .mainAxisSize widgets/MainAxisSize.min
                             .crossAxisAlignment widgets/CrossAxisAlignment.start
                             .children
-                            ;; primary: what you pointed at + where it's written (per-widget)
+                            ;; primary: what you pointed at + where it's written. Prefer the
+                            ;; host-resolved .cljd source (:cljd, pushed by the (picks) op);
+                            ;; fall back to the on-device Dart wloc until it's resolved.
                             [(widgets/Text (str (inc i) ". " (:type p)
-                                             (when-let [wl (:wloc p)] (str "  ·  " (:src wl))))
+                                             (when-let [loc (or (:cljd p) (:src (:wloc p)))]
+                                               (str "  ·  " loc)))
                                .overflow widgets/TextOverflow.ellipsis
-                               .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))
+                               .style (widgets/TextStyle
+                                        .color (if (:cljd p) (widgets/Color 0xFF00E676) material/Colors.white)
+                                        .fontSize 12.0))
                              ;; secondary: enclosing repl-point scope (clean .cljd, coarse)
                              (widgets/Text (let [l (:loc p)]
                                              (str "scope " (:ns l) ":" (:line l)

@@ -204,9 +204,19 @@
                                                  (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :src])
                                                  (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :type])
                                                  (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :name])))
-                                         [src typ nm] (if (vector? tri) tri [nil nil nil])]
-                                     {:n (inc i) :type typ :wloc src :name nm :cljd (resolve-src src)}))
+                                         [src typ nm] (if (vector? tri) tri [nil nil nil])
+                                         cljd (resolve-src src)]
+                                     ;; push the host-resolved .cljd loc back onto the device pick
+                                     ;; so the on-device inspector can display it (device has no smap).
+                                     (when cljd
+                                       (eval1 (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+
+                                                    'cljd.core/update i 'cljd.core/assoc :cljd cljd)))
+                                     {:n (inc i) :type typ :wloc src :name nm :cljd cljd}))
                                  (range n))]
+                      ;; rebuild the overlay so the inspector shows the pushed :cljd (module-atom
+                      ;; :watch doesn't rebuild on external swap!).
+                      (when (some :cljd rows)
+                        (eval1 '(.reassembleApplication (widgets/WidgetsBinding.instance))))
                       (send! {:value (pr-str rows) :ns (name @*current-ns)}))
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
