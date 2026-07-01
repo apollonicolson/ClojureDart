@@ -342,6 +342,14 @@ Interaction methods (answering "tap widgets directly, not locations"): (1) REPL 
 ByValueKey/ByText — works for *app* widgets (proven), but NOT the toolbar (it's above MaterialApp,
 outside flutter_driver's finder scope); (3) pixel taps — fragile fallback.
 
+## Toolbar active-state + pick button — DONE 2026-07-01 (screenshot-validated)
+- **Active-state**: each toggle reads its flag at build and tints green + highlights when on
+  (a toggle reassembles → the toolbar rebuilds → state refreshes). Proven: baselines on → its
+  button green, others dimmed.
+- **Pick button** (`ads_click` icon): arms/disarms repl-hud's `*hud-enabled` (passed into
+  `repl-toolbar`); when armed, tapping a widget highlights it and prints its source-loc.
+  (Full env-inspector panel is Phase 2b.) Callback needs `^ReplState`/`^ReplPointWidget` hints.
+
 ## Remaining (overlay Phase 2 / Slice 4)
 pick! button in the toolbar (needs REPL-injected `+cljd-repl-pick!` OR a self-contained arm),
 navigable value inspector, live probes, per-widget `toImage` previews. And Slice 2b

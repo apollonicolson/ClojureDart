@@ -1234,18 +1234,25 @@
   (createRenderObject [_ _ctx] (NoDebugPaintRender)))
 
 (defn repl-toolbar
-  "A draggable in-app debug toolbar (kDebugMode only). Positioned via Padding+Align (not
-   Positioned — the widget macro wraps it, so it can't be a direct Stack child). Lives
-   ABOVE MaterialApp, so it must carry its own Directionality for Material/Row/etc."
-  []
-  (letfn [(btn [k icon on-tap]
-            ;; keyed so headless tooling can tap ByValueKey (no pixel coordinates).
+  "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
+   hook — the pick button arms/disarms it. Toggles show active state (green tint+highlight);
+   NoDebugPaint keeps the tools out of their own debug paint. Above MaterialApp → own
+   Directionality. A toggle reassembles, which rebuilds the toolbar so active state refreshes."
+  [*hud-enabled]
+  (letfn [(btn [k icon active? on-tap]
+            ;; keyed for ByValueKey tapping; active? tints the icon green + highlights the box.
             (widgets/GestureDetector
               .key (widgets/ValueKey k)
               .onTap (fn [] (on-tap) (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
-              .child (widgets/Padding
-                       .padding (widgets/EdgeInsets.all 10.0)
-                       .child (widgets/Icon icon .color material/Colors.white .size 20.0))))]
+              .child (widgets/Container
+                       .decoration (widgets/BoxDecoration
+                                     .color (if active? (widgets/Color 0x3300E676) (widgets/Color 0x00000000))
+                                     .borderRadius (widgets/BorderRadius.circular 12.0))
+                       .child (widgets/Padding
+                                .padding (widgets/EdgeInsets.all 10.0)
+                                .child (widgets/Icon icon
+                                         .color (if active? (widgets/Color 0xFF00E676) material/Colors.white54)
+                                         .size 20.0)))))]
     (widget
       :managed [*pos (atom (widgets/Offset 16.0 90.0)) :dispose nil]
       :watch [pos *pos]
@@ -1281,16 +1288,22 @@
                               .padding (widgets/EdgeInsets.all 10.0)
                               .child (widgets/Icon material/Icons.drag_indicator
                                        .color material/Colors.white54 .size 20.0)))
-                   (btn "cljd-tb-paint" material/Icons.grid_4x4
+                   (btn "cljd-tb-pick" material/Icons.ads_click (some? @*hud-enabled)
+                        (fn [] (reset! *hud-enabled
+                                 (when-not @*hud-enabled
+                                   (fn [^ReplState state]
+                                     (println "; picked"
+                                       (.-source_loc ^ReplPointWidget (.-widget state))))))))
+                   (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
                         (fn [] (set! rendering/debugPaintSizeEnabled
                                      (not rendering/debugPaintSizeEnabled))))
-                   (btn "cljd-tb-repaint" material/Icons.gradient
+                   (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
                         (fn [] (set! rendering/debugRepaintRainbowEnabled
                                      (not rendering/debugRepaintRainbowEnabled))))
-                   (btn "cljd-tb-baseline" material/Icons.text_fields
+                   (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
                         (fn [] (set! rendering/debugPaintBaselinesEnabled
                                      (not rendering/debugPaintBaselinesEnabled))))
-                   (btn "cljd-tb-pointers" material/Icons.touch_app
+                   (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
                         (fn [] (set! rendering/debugPaintPointersEnabled
                                      (not rendering/debugPaintPointersEnabled))))])))))))))
 
@@ -1387,7 +1400,7 @@
              (shouldRepaint
                  [this old]
                  true))))
-       (repl-toolbar)])))
+       (repl-toolbar *hud-enabled)])))
 
 (defmacro run
   "Starts an application, takes a widget body and uses it as the application root widget.
