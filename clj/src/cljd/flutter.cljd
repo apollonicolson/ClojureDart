@@ -1242,9 +1242,24 @@
 ;; repl-hud's Listener hit-tests taps and its CustomPainter draws the magenta highlight.
 (defonce +cljd-hud-enabled+ (atom nil))
 
-;; Picked widgets (multi-select): a vector of {:loc :type :env :rect}. Each pick appends;
-;; the inspector's × clears all. The REPL reads @+cljd-picks+ to see everything pointed at.
+;; Picked widgets (multi-select): a vector of {:loc :type :env :rect}. Tapping a widget
+;; toggles it (dedup by bounds); the inspector's × clears all, per-row × removes one.
+;; The REPL reads @+cljd-picks+ to see everything pointed at.
 (defonce +cljd-picks+ (atom []))
+
+(def ^:private +pick-colors+
+  [0xFF00E676 0xFF40C4FF 0xFFFFAB40 0xFFFF4081 0xFFB388FF 0xFFFFEB3B])
+(defn- pick-color [i] (widgets/Color (nth +pick-colors+ (mod i (count +pick-colors+)))))
+(defn- rect-key [^widgets/Rect r] [(.-left r) (.-top r) (.-right r) (.-bottom r)])
+(defn- nudge-rebuild!
+  "Post-frame reassemble — :watch on a module atom doesn't rebuild on external swap!."
+  []
+  (widgets/WidgetsBinding.instance.addPostFrameCallback
+    (fn [_] (.reassembleApplication (widgets/WidgetsBinding.instance)) nil))
+  nil)
+(defn- remove-pick! [p]
+  (swap! +cljd-picks+ (fn [ps] (vec (remove #(= (rect-key (:rect %)) (rect-key (:rect p))) ps))))
+  (nudge-rebuild!))
 
 (defn- capture-pick!
   "Pick callback. STATE = nearest enclosing repl-point (gives lexical scope + source-loc).
@@ -1252,17 +1267,19 @@
    its runtime type. So one pick yields the exact widget's box + type AND the enclosing scope."
   [^ReplState state ^widgets/Element target]
   (let [^ReplPointWidget w (.-widget state)
-        ^rendering/RenderBox ro (.-renderObject target)]
-    (swap! +cljd-picks+ conj
-      {:loc (.-source_loc w)
-       :type (str (.-runtimeType (.-widget target)))
-       :env ((.-get_envmap w))
-       :rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))})
-    ;; :watch on a module atom doesn't rebuild on external swap!, so nudge a rebuild
-    ;; (post-frame to avoid reassembling mid-pointer-dispatch).
-    (widgets/WidgetsBinding.instance.addPostFrameCallback
-      (fn [_] (.reassembleApplication (widgets/WidgetsBinding.instance)) nil))
-    nil))
+        ^rendering/RenderBox ro (.-renderObject target)
+        rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))
+        k (rect-key rect)]
+    ;; toggle: tapping an already-picked widget (same bounds) deselects it.
+    (swap! +cljd-picks+
+      (fn [ps]
+        (if (some #(= (rect-key (:rect %)) k) ps)
+          (vec (remove #(= (rect-key (:rect %)) k) ps))
+          (conj ps {:loc (.-source_loc w)
+                    :type (str (.-runtimeType (.-widget target)))
+                    :env ((.-get_envmap w))
+                    :rect rect}))))
+    (nudge-rebuild!)))
 
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
@@ -1361,9 +1378,9 @@
           (paint [_ canvas size]
             (let [paint (doto (widgets/Paint)
                           (.-style! widgets/PaintingStyle.stroke)
-                          (.-strokeWidth! 2.5)
-                          (.-color! (widgets/Color 0xFF00E676)))]
-              (doseq [p picks :when (:rect p)]
+                          (.-strokeWidth! 2.5))]
+              (doseq [[i p] (map-indexed vector picks) :when (:rect p)]
+                (.-color! paint (pick-color i))     ; color matches the inspector line-item swatch
                 (.drawRRect canvas
                   (widgets/RRect.fromRectAndRadius (:rect p) (widgets/Radius.circular 4.0))
                   paint)))
@@ -1404,16 +1421,30 @@
                      .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
                    (widgets/SizedBox .width 12.0)
                    (widgets/GestureDetector
-                     .onTap (fn [] (reset! +cljd-picks+ []) nil)
+                     .onTap (fn [] (reset! +cljd-picks+ []) (nudge-rebuild!))
                      .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
                 (widgets/SizedBox .height 6.0)]
                (map-indexed
                  (fn [i p]
-                   (widgets/Text (str (inc i) ". " (:type p) "  ·  "
-                                   (let [l (:loc p)] (str (:ns l) ":" (:line l) ":" (:column l))))
-                     .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0)
-                     .maxLines 1
-                     .overflow widgets/TextOverflow.ellipsis))
+                   (widgets/Padding
+                     .padding (widgets/EdgeInsets.symmetric .vertical 1.0)
+                     .child
+                     (widgets/Row
+                       .mainAxisSize widgets/MainAxisSize.min
+                       .children
+                       [(widgets/Container
+                          .width 10.0 .height 10.0
+                          .decoration (widgets/BoxDecoration .color (pick-color i)
+                                        .shape widgets/BoxShape.circle))
+                        (widgets/SizedBox .width 8.0)
+                        (widgets/Text (str (inc i) ". " (:type p) "  ·  "
+                                        (let [l (:loc p)] (str (:ns l) ":" (:line l) ":" (:column l))))
+                          .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))
+                        (widgets/SizedBox .width 8.0)
+                        (widgets/GestureDetector
+                          .onTap (fn [] (remove-pick! p) nil)
+                          .child (widgets/Icon material/Icons.close
+                                   .color material/Colors.white38 .size 14.0))])))
                  picks)))))))))
 
 (defn repl-hud [child]
