@@ -1331,10 +1331,19 @@
   "Register cljd dev-tool service extensions. Guarded so hot-reload can't re-register."
   []
   (when (compare-and-set! +cljd-ext-registered+ false true)
+    ;; read the picks as structured JSON
     (dev/registerExtension "ext.cljd.picks"
       (fn [_method _params]
         (dart:async/Future.value
           (dev/ServiceExtensionResponse.result (picks->json)))))
+    ;; host pushes a resolved .cljd loc back onto the pick that matches "src" (its Dart wloc).
+    ;; Matching by src avoids parsing an int index; params values are strings.
+    (dev/registerExtension "ext.cljd.set-cljd"
+      (fn [_method params]
+        (let [src (get params "src") cljd (get params "cljd")]
+          (swap! +cljd-picks+
+            (fn [ps] (mapv (fn [p] (if (= (:src (:wloc p)) src) (assoc p :cljd cljd) p)) ps))))
+        (dart:async/Future.value (dev/ServiceExtensionResponse.result "{\"ok\":true}"))))
     nil)                                ; registerExtension returns void → keep the when Null
   nil)
 

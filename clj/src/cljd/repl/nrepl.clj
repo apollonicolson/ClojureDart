@@ -70,22 +70,13 @@
                        (when (:column info) (str ":" (:column info)))))))))))))
 
 (defn- resolve-and-push!
-  "Resolve pick IDX's Dart wloc SRC to .cljd and swap it back onto the device +cljd-picks+,
-   then reassemble so the on-device inspector shows it. No-op if unresolvable. Runs off the
-   eval handler, so it must set the compiler bindings eval-form relies on itself; *current-ns*
-   is cljd.flutter so the reassemble form's `widgets` alias resolves."
-  [client iso-id dart-version analyzer idx ^String src]
+  "Resolve a device pick's Dart wloc SRC to .cljd and push it back via the ext.cljd.set-cljd
+   service extension (matches the pick by src). Pure data over the channel — no `evaluate`,
+   so no compiler bindings, no form compilation. The device's repl-selections/pick-highlight
+   WATCH +cljd-picks+, so they rebuild reactively; no reassemble needed."
+  [client iso-id ^String src]
   (when-some [cljd (resolve-wloc (:libs @compiler/nses) src)]
-    (binding [compiler/*hosted* true
-              compiler/*dart-version* dart-version
-              compiler/analyzer-info analyzer
-              compiler/dynamic-warning compiler/on-dynamic-warn
-              compiler/*current-ns* 'cljd.flutter]
-      ;; just the swap! — repl-selections/repl-pick-highlight WATCH +cljd-picks+, so the
-      ;; on-device views rebuild reactively; no reassemble needed from the host.
-      (repl-eval/eval-form client iso-id
-        (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+ 'cljd.core/update idx 'cljd.core/assoc :cljd cljd)
-        {:ns-lib-uri "cljd/flutter.dart"}))))
+    (vm/call-ext client iso-id "ext.cljd.set-cljd" {:src src :cljd cljd})))
 
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
@@ -97,12 +88,11 @@
    ;; stdout sink just forwards REPL output to the active eval's transport (no marker scanning).
    (vm/set-sink! client (fn [stream text] (when-some [f @*eval-sink] (f stream text))))
    ;; pick resolution fires on the STRUCTURED Extension event (postEvent), off the WS
-   ;; listener thread (a future — eval-form on the listener thread would deadlock).
+   ;; listener thread (a future — a synchronous rpc on the listener thread would deadlock).
    (vm/set-event-sink! client
      (fn [kind data]
        (when (= kind "cljd.pick")
-         (future (try (resolve-and-push! client iso-id dart-version analyzer
-                        (long (:idx data)) (:src data))
+         (future (try (resolve-and-push! client iso-id (:src data))
                       (catch Throwable _ nil))))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
