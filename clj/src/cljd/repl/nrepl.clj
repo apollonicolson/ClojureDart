@@ -48,11 +48,69 @@
       {:ns (name (:ns info)) :name (name (:name info))
        :arglists al :doc (:doc m) :macro? (boolean (:macro m))})))
 
+(defn resolve-wloc
+  "A device pick's Dart wloc 'kora/nav.dart:249' -> its .cljd source 'kora/nav.cljd:78:12'
+   via the host source map (smap lives only in this build JVM). nil when unresolvable or
+   when it falls to the smap's 1:1 sentinel (a generated region with no fine entry)."
+  [libs ^String src]
+  (when (and src (seq libs))
+    (when-some [smap-search (requiring-resolve 'cljd.build/smap-search)]
+      (let [ci (.lastIndexOf src ":")]
+        (when (pos? ci)
+          (let [path (subs src 0 ci)
+                line (try (Long/parseLong (subs src (inc ci))) (catch Throwable _ nil))
+                entry (some (fn [[k v]]
+                              (let [ks (str k)]
+                                (when (or (= ks path) (.endsWith ks (str "/" path))) v)))
+                            libs)]
+            (when (and line (:smap entry))
+              (when-some [info (smap-search (:smap entry) line nil)]
+                (when (> (or (:line info) 0) 1)
+                  (str (:file info) ":" (:line info)
+                       (when (:column info) (str ":" (:column info)))))))))))))
+
+(defn- resolve-and-push!
+  "Resolve pick IDX's Dart wloc SRC to .cljd and swap it back onto the device +cljd-picks+,
+   then reassemble so the on-device inspector shows it. No-op if unresolvable. Runs off the
+   eval handler, so it must set the compiler bindings eval-form relies on itself; *current-ns*
+   is cljd.flutter so the reassemble form's `widgets` alias resolves."
+  [client iso-id dart-version analyzer idx ^String src]
+  (when-some [cljd (resolve-wloc (:libs @compiler/nses) src)]
+    (binding [compiler/*hosted* true
+              compiler/*dart-version* dart-version
+              compiler/analyzer-info analyzer
+              compiler/dynamic-warning compiler/on-dynamic-warn
+              compiler/*current-ns* 'cljd.flutter]
+      (repl-eval/eval-form client iso-id
+        (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+ 'cljd.core/update idx 'cljd.core/assoc :cljd cljd)
+        {:ns-lib-uri "cljd/flutter.dart"})
+      (repl-eval/eval-form client iso-id
+        '(.reassembleApplication (widgets/WidgetsBinding.instance))
+        {:ns-lib-uri "cljd/flutter.dart"}))))
+
+(defn install-pick-resolver!
+  "Install a PERSISTENT Stdout sink that auto-resolves on-device picks: it scans app output
+   for `CLJD_PICK <idx> <src>` markers (emitted by capture-pick!) and, off the WS listener
+   thread (a future — calling eval-form on the listener thread would deadlock), resolves +
+   pushes the .cljd loc back. Non-marker output is forwarded to *EVAL-SINK (the swappable
+   per-eval forwarder), so REPL println output still reaches the active eval's transport."
+  [client iso-id dart-version analyzer *eval-sink]
+  (vm/set-sink! client
+    (fn [stream text]
+      (doseq [[_ idx src] (re-seq #"CLJD_PICK (\d+) (\S+)" (str text))]
+        (future (try (resolve-and-push! client iso-id dart-version analyzer (Long/parseLong idx) src)
+                     (catch Throwable _ nil))))
+      (when-some [f @*eval-sink] (f stream text)))))
+
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
     :or {ns-lib-uri "cljd/core.dart"}}]
-  (fn [{:keys [op transport id session code] :as msg}]
+  ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
+  ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
+  (let [*eval-sink (atom nil)]
+   (install-pick-resolver! client iso-id dart-version analyzer *eval-sink)
+   (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
         "clone"       (transport/send transport {:id id :new-session (str (UUID/randomUUID)) :status ["done"]})
@@ -103,10 +161,10 @@
                   compiler/*current-ns* @*current-ns]
           ;; forward the app's Stdout/Stderr WriteEvents to this eval's transport
           ;; while it runs (println output etc.), then detach the sink.
-          (vm/set-sink! client (fn [stream text]
-                                 ;; strip Flutter's own per-line "flutter: " stdout prefix
-                                 (send! {(if (= stream "Stderr") :err :out)
-                                         (.replaceAll text "(?m)^flutter: " "")})))
+          (reset! *eval-sink (fn [stream text]
+                               ;; strip Flutter's own per-line "flutter: " stdout prefix
+                               (send! {(if (= stream "Stderr") :err :out)
+                                       (.replaceAll text "(?m)^flutter: " "")})))
           (let [errored (volatile! false)
                 switch-ns! (fn [ns-sym]            ; keep atom + per-batch dynamic binding in sync
                              (reset! *current-ns ns-sym)
@@ -166,49 +224,27 @@
                     ;; NB: VM-Service `evaluate` truncates string results at 128 chars, so we
                     ;; read the picks field-by-field (each tiny) rather than one big projection.
                     (= 'picks head)
-                    (let [smap-search (requiring-resolve 'cljd.build/smap-search)
-                          libs (:libs @compiler/nses)
+                    (let [libs (:libs @compiler/nses)
                           eval1 (fn [form]
                                   (let [r (repl-eval/eval-form client iso-id form
                                             {:ns-lib-uri "cljd/flutter.dart"})]
                                     (try (read-string (:value r)) (catch Throwable _ nil))))
-                          resolve-src
-                          (fn [^String src]
-                            (when (and src smap-search)
-                              (let [ci (.lastIndexOf src ":")]
-                                (when (pos? ci)
-                                  (let [path (subs src 0 ci)
-                                        line (try (Long/parseLong (subs src (inc ci)))
-                                                  (catch Throwable _ nil))
-                                        entry (some (fn [[k v]]
-                                                      (let [ks (str k)]
-                                                        (when (or (= ks path)
-                                                                  (.endsWith ks (str "/" path)))
-                                                          v)))
-                                                    libs)]
-                                    (when (and line (:smap entry))
-                                      (when-some [info (smap-search (:smap entry) line nil)]
-                                        ;; line<=1 is the source map's initial sentinel — the
-                                        ;; Dart line hit a generated region with no fine entry.
-                                        ;; Return nil (unresolved) so the caller keeps the wloc.
-                                        (when (> (or (:line info) 0) 1)
-                                          (str (:file info) ":" (:line info)
-                                               (when (:column info) (str ":" (:column info))))))))))))
                           n (let [c (eval1 '(cljd.core/count (cljd.core/deref cljd.flutter/+cljd-picks+)))]
                               (if (integer? c) c 0))
                           rows (mapv
                                  (fn [i]
-                                   ;; one small read per pick: [src type name] (< 128 chars)
-                                   (let [tri (eval1
+                                   ;; one small read per pick: [src type name cljd] (< 128 chars).
+                                   ;; :cljd may already be set by the auto-resolver — reuse it and
+                                   ;; only resolve+push when it's still missing (#3: fewer evals).
+                                   (let [tup (eval1
                                                (list 'cljd.core/vector
                                                  (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :src])
                                                  (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :type])
-                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :name])))
-                                         [src typ nm] (if (vector? tri) tri [nil nil nil])
-                                         cljd (resolve-src src)]
-                                     ;; push the host-resolved .cljd loc back onto the device pick
-                                     ;; so the on-device inspector can display it (device has no smap).
-                                     (when cljd
+                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :name])
+                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :cljd])))
+                                         [src typ nm existing] (if (vector? tup) tup [nil nil nil nil])
+                                         cljd (or existing (resolve-wloc libs src))]
+                                     (when (and cljd (not existing))
                                        (eval1 (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+
                                                     'cljd.core/update i 'cljd.core/assoc :cljd cljd)))
                                      {:n (inc i) :type typ :wloc src :name nm :cljd cljd}))
@@ -247,8 +283,8 @@
                 ;; compile-time error from turning the form into Dart
                 (send! {:err (errors/format-compile e)
                         :ex (str (class e)) :status ["done" "error"]}))
-              (finally (vm/set-sink! client nil)))))
-        (send! {:status ["done" "error" "unknown-op"]})))))
+              (finally (reset! *eval-sink nil)))))
+        (send! {:status ["done" "error" "unknown-op"]}))))))
 
 (defn start!
   "Start the nREPL server. Returns the nrepl server (has :port). Writes .nrepl-port."

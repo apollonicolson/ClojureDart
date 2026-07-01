@@ -1306,17 +1306,24 @@
   (let [^ReplPointWidget w (.-widget state)
         ^rendering/RenderBox ro (.-renderObject target)
         rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))
-        k (rect-key rect)]
-    ;; toggle: tapping an already-picked widget (same bounds) deselects it.
-    (swap! +cljd-picks+
-      (fn [ps]
-        (if (some #(= (rect-key (:rect %)) k) ps)
-          (vec (remove #(= (rect-key (:rect %)) k) ps))
-          (conj ps {:loc (.-source_loc w)         ; enclosing repl-point scope (clean .cljd)
-                    :wloc (pick-widget-loc target) ; per-widget source (cljd-out Dart line)
-                    :type (str (.-runtimeType (.-widget target)))
-                    :env ((.-get_envmap w))
-                    :rect rect}))))
+        k (rect-key rect)
+        before (count @+cljd-picks+)
+        ;; toggle: tapping an already-picked widget (same bounds) deselects it.
+        after (swap! +cljd-picks+
+                (fn [ps]
+                  (if (some #(= (rect-key (:rect %)) k) ps)
+                    (vec (remove #(= (rect-key (:rect %)) k) ps))
+                    (conj ps {:loc (.-source_loc w)         ; enclosing repl-point scope (clean .cljd)
+                              :wloc (pick-widget-loc target) ; per-widget source (cljd-out Dart line)
+                              :type (str (.-runtimeType (.-widget target)))
+                              :env ((.-get_envmap w))
+                              :rect rect}))))]
+    ;; On ADD, emit a marker on stdout. The host nREPL's persistent sink sees it,
+    ;; smap-resolves the Dart wloc to .cljd, and pushes :cljd back — so the source
+    ;; appears on-device automatically, no (picks) call needed.
+    (when (> (count after) before)
+      (when-let [src (:src (:wloc (peek after)))]
+        (println (str "CLJD_PICK " (dec (count after)) " " src))))
     (nudge-rebuild!)))
 
 (defn repl-toolbar
