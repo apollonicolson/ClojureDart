@@ -499,14 +499,23 @@
                                                (repl-eval/eval-form client iso
                                                  '(do
                                                     (def +cljd-repl-fbox+ (atom nil))
+                                                    ;; *1/*2/*3 history holders (plain vars — dynamic
+                                                    ;; *1's set! can't persist across evaluates).
+                                                    (def +cljd-repl-h1+ nil)
+                                                    (def +cljd-repl-h2+ nil)
+                                                    (def +cljd-repl-h3+ nil)
+                                                    (defn +cljd-repl-remember [v]
+                                                      (set! +cljd-repl-h3+ +cljd-repl-h2+)
+                                                      (set! +cljd-repl-h2+ +cljd-repl-h1+)
+                                                      (set! +cljd-repl-h1+ v) v)
                                                     (defn +cljd-repl-handle [v]
                                                       (if (dart/is? v dart-async/Future)
                                                         (do (reset! +cljd-repl-fbox+ nil)
                                                             (-> v
-                                                                (.then (fn [x] (reset! +cljd-repl-fbox+ (pr-str x))))
+                                                                (.then (fn [x] (+cljd-repl-remember x) (reset! +cljd-repl-fbox+ (pr-str x))))
                                                                 (.catchError (fn [e] (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
                                                             "__cljd_future_pending__")
-                                                        (pr-str v))))
+                                                        (do (+cljd-repl-remember v) (pr-str v)))))
                                                  {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
                                               (catch Throwable e
                                                 (println "[VMREPL] async init failed:" (.getMessage e)) false))
@@ -540,9 +549,12 @@
                                                       :ns-lib-uri "cljd/core.dart" :port 0
                                                       :trigger-reload trigger-reload
                                                       :await? (boolean await-ok)
-                                                      :pick? (boolean pick-ok)})]
+                                                      :pick? (boolean pick-ok)
+                                                      :remember? (boolean await-ok)})]
                                         (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
-                                          (str "(await " (if await-ok "on" "off") ", pick " (if pick-ok "on" "off") ")")))
+                                          (str "(await " (if await-ok "on" "off")
+                                               ", pick " (if pick-ok "on" "off")
+                                               ", *1 " (if await-ok "on" "off") ")")))
                                       (vmservice/close client)))
                                   (catch Throwable e
                                     (println "[VMREPL] error:" (.getMessage e)))))))))

@@ -34,18 +34,35 @@
   (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
 
 (defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick?}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick?]
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
     :or {ns-lib-uri "cljd/core.dart"}}]
-  (fn [{:keys [op transport id session code]}]
+  (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
         "clone"       (transport/send transport {:id id :new-session (str (UUID/randomUUID)) :status ["done"]})
         "ls-sessions" (send! {:sessions [] :status ["done"]})
-        "describe"    (send! {:ops (zipmap ["clone" "describe" "eval" "close" "ls-sessions" "interrupt"] (repeat {}))
+        "describe"    (send! {:ops (zipmap ["clone" "describe" "eval" "close" "ls-sessions"
+                                            "interrupt" "complete"] (repeat {}))
                               :versions {:cljd {:major 0 :minor 1}} :status ["done"]})
         "interrupt"   (send! {:status ["done" "interrupted"]})
         "close"       (send! {:status ["done" "session-closed"]})
+        ;; editor completion — answered host-side from @nses (current ns + cljd.core).
+        "complete"
+        (let [prefix (or (:prefix msg) (:symbol msg) "")
+              ns-sym (or (some-> (:ns msg) symbol) @*current-ns)
+              nses   @compiler/nses
+              ;; defs live as direct symbol keys of the ns map (see resolve-non-local-symbol);
+              ;; :mappings holds referred/aliased names. Gather both, for the ns + cljd.core.
+              names  (mapcat (fn [n]
+                               (let [m (get nses n)]
+                                 (concat (filter symbol? (keys m)) (keys (:mappings m)))))
+                             [ns-sym 'cljd.core])
+              cands  (->> names (map name) distinct
+                          (filter #(.startsWith ^String % prefix))
+                          sort (take 100)
+                          (mapv (fn [c] {:candidate c :ns (name ns-sym)})))]
+          (send! {:completions cands :status ["done"]}))
         "eval"
         (binding [compiler/*hosted* true
                   compiler/*dart-version* dart-version
@@ -103,11 +120,20 @@
                                    {:ns-lib-uri "cljd/flutter.dart"})]
                       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
                       (send! {:value (:value full-r) :ns (name @*current-ns)}))
+                    ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
+                    ;; compiler, not shipped to the device (cljd macros are compile-time).
+                    (#{'macroexpand 'macroexpand-1} head)
+                    (let [f (unwrap-quote (second form))
+                          expanded ((if (= 'macroexpand-1 head)
+                                      compiler/macroexpand-1 compiler/macroexpand) {} f)]
+                      (send! {:value (pr-str expanded) :ns (name @*current-ns)}))
+
                     :else
                     (let [r (repl-eval/eval-form client iso-id form
                                                  {:ns-lib-uri (ns->lib-uri @*current-ns)
                                                   :trigger-reload trigger-reload
-                                                  :await? await?})]
+                                                  :await? await?
+                                                  :remember? remember?})]
                       (case (:kind r)
                         :reload (do (when (= 'ns head) (switch-ns! (second form)))
                                     (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))

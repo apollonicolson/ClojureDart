@@ -258,6 +258,21 @@ VM-Service-answerable through the hybrid as built.
 
 **Immediate wiring targets (expose what the host already computes):** `resolve`, `macroexpand`,
 `complete`, `info` — the obvious first four nREPL ops, all backed by `@compiler/nses`.
+
+## Slice 1 — DONE 2026-07-01, device-validated (Pixel 8 Pro)
+- **`*1/*2/*3` history** — plain holder vars `+cljd-repl-h1/2/3+` injected into cljd.core (the
+  ^:dynamic *1/*2/*3 can't hold cross-`evaluate` state — set! doesn't persist without a shared
+  binding frame). `+cljd-repl-remember` shifts them; folded into the always-on `+cljd-repl-handle`
+  (async path), since `await?` is globally on so the sync-wrap never fires. Reads of *1/*2/*3 in
+  user forms are `postwalk-replace`d to the holders (eval.clj `history-reads`). Proven: `424242`
+  →`*1`=424242; after 10,20 →`*2`=10.
+- **`macroexpand`/`macroexpand-1`** — intercepted in the nREPL eval loop, answered host-side via
+  `compiler/macroexpand{,-1}`. Proven: `(when true 42)` → `(if true (do 42))`.
+- **`complete`** — nREPL op over `@nses`: defs are direct symbol keys of the ns map (NOT
+  `:mappings`, which holds referred/aliased names) — gather both for the ns + cljd.core. Proven:
+  "map"→map/mapv/mapcat/…, "redu"→reduce/reduced/…
+- Gap left for Slice 1b: `info`/`eldoc` (arglists/doc) — needs the exact def-meta shape, best read
+  from a live `@nses` mapping during the next device cycle rather than guessed.
 2. **Editor-parity audit** (the 4th research pass): our nREPL handles `{clone, ls-sessions,
    describe, interrupt, close, eval}` only — missing `complete`/`info`/`eldoc`/`lookup`/
    `load-file`, the ops CIDER/Calva/clojure-mcp use for completion/docs/jump. Answerable

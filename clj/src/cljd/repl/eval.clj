@@ -4,7 +4,14 @@
    recompile-form) to the vmservice client. Runs inside the bootstrapped cljd.build
    compiler context. See BUILD-PLAN.md."
   (:require [cljd.compiler :as compiler]
-            [cljd.repl.vmservice :as vm]))
+            [cljd.repl.vmservice :as vm]
+            [clojure.walk :as walk]))
+
+(def ^:private history-reads
+  "*1/*2/*3 are ^:dynamic in cljd.core and their `set!` can't persist across separate
+   `evaluate` calls (no shared binding frame). So history lives in plain holder vars and
+   reads of *1/*2/*3 in user forms are rewritten to them."
+  '{*1 cljd.core/+cljd-repl-h1+ *2 cljd.core/+cljd-repl-h2+ *3 cljd.core/+cljd-repl-h3+})
 
 (def ^:private toplevel-ops
   "Form heads (by name, ns-ignored) that introduce/change top-level program code and
@@ -47,9 +54,15 @@
 
 (defn- eval-expression
   "Compile EXPR to a Dart IIFE and `evaluate` it for a clean value. With await?, a
-   Future result is scheduled into the box and polled to its resolved value."
-  [client iso-id expr ns-lib-uri await? await-timeout-ms]
-  (let [dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
+   Future result is scheduled into the box and polled to its resolved value. With
+   remember? (sync path only), the result is threaded through cljd.core's injected
+   `+cljd-repl-remember` so it lands in *1/*2/*3 on-device."
+  [client iso-id expr ns-lib-uri await? await-timeout-ms remember?]
+  (let [expr (if remember? (walk/postwalk-replace history-reads expr) expr)
+        expr (if (and remember? (not await?))
+               (list 'cljd.core/+cljd-repl-remember expr)
+               expr)
+        dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
         lib  (vm/library-id client iso-id ns-lib-uri)
         r    (vm/evaluate client iso-id lib dart)]
     (cond
@@ -76,7 +89,7 @@
    (defaults to the cljd.user library)."
   [client iso-id form
    {:keys [recompile-count repltag ns-lib-uri trigger-reload reload-timeout-ms
-           await? await-timeout-ms]
+           await? await-timeout-ms remember?]
     :or   {recompile-count 0 repltag "repl" ns-lib-uri "cljd/user.dart"
            reload-timeout-ms 60000 await-timeout-ms 30000}}]
   (cond
@@ -86,7 +99,7 @@
     ;; reload doesn't re-run a static initializer. New vars fall through to reload.
     (and (seq? form) (= 'def (first form)) (= 3 (count form)) (existing-def? (second form)))
     (eval-expression client iso-id (list 'set! (second form) (nth form 2))
-                     ns-lib-uri await? await-timeout-ms)
+                     ns-lib-uri await? await-timeout-ms remember?)
 
     ;; --- new code: write the .dart into the app, then hot reload it in ---
     (emits-new-toplevel? form)
@@ -109,4 +122,4 @@
 
     ;; --- expression ---
     :else
-    (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms)))
+    (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms remember?)))
