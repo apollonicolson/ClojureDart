@@ -1242,8 +1242,9 @@
 ;; repl-hud's Listener hit-tests taps and its CustomPainter draws the magenta highlight.
 (defonce +cljd-hud-enabled+ (atom nil))
 
-;; The last picked widget: {:loc {:ns :line :column} :env {sym value}} — shown by repl-inspector.
-(defonce +cljd-picked+ (atom nil))
+;; Picked widgets (multi-select): a vector of {:loc :type :env :rect}. Each pick appends;
+;; the inspector's × clears all. The REPL reads @+cljd-picks+ to see everything pointed at.
+(defonce +cljd-picks+ (atom []))
 
 (defn- capture-pick!
   "Pick callback. STATE = nearest enclosing repl-point (gives lexical scope + source-loc).
@@ -1252,11 +1253,16 @@
   [^ReplState state ^widgets/Element target]
   (let [^ReplPointWidget w (.-widget state)
         ^rendering/RenderBox ro (.-renderObject target)]
-    (reset! +cljd-picked+
+    (swap! +cljd-picks+ conj
       {:loc (.-source_loc w)
        :type (str (.-runtimeType (.-widget target)))
        :env ((.-get_envmap w))
-       :rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))})))
+       :rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))})
+    ;; :watch on a module atom doesn't rebuild on external swap!, so nudge a rebuild
+    ;; (post-frame to avoid reassembling mid-pointer-dispatch).
+    (widgets/WidgetsBinding.instance.addPostFrameCallback
+      (fn [_] (.reassembleApplication (widgets/WidgetsBinding.instance)) nil))
+    nil))
 
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
@@ -1331,13 +1337,20 @@
                         (fn [] (set! rendering/debugPaintPointersEnabled
                                      (not rendering/debugPaintPointersEnabled))))]))))))))))
 
+(defn- fmt-val
+  "Render an env value for the inspector: deref atoms to show the live value."
+  [v]
+  (if (instance? cljd.core/Atom v)
+    (str "@" (deref v))
+    (str v)))
+
 (defn repl-pick-highlight
-  "Persistent green box around the picked widget (+cljd-picked+ :rect), shown independent of
-   the picker being armed — so the selection stays visible while you read the inspector."
+  "Persistent green boxes around ALL picked widgets (+cljd-picks+), independent of the picker
+   being armed — so the selections stay visible while you read the inspector."
   []
   (widget
-    :watch [picked +cljd-picked+]
-    :when (and picked (:rect picked))
+    :watch [picks +cljd-picks+]
+    :when (seq picks)
     (widgets/IgnorePointer
       .child
       (widgets/CustomPaint
@@ -1346,22 +1359,25 @@
         (reify :extends (widgets/CustomPainter)
           :no-meta true
           (paint [_ canvas size]
-            (.drawRRect canvas
-              (widgets/RRect.fromRectAndRadius (:rect picked) (widgets/Radius.circular 4.0))
-              (doto (widgets/Paint)
-                (.-style! widgets/PaintingStyle.stroke)
-                (.-strokeWidth! 2.5)
-                (.-color! (widgets/Color 0xFF00E676))))
+            (let [paint (doto (widgets/Paint)
+                          (.-style! widgets/PaintingStyle.stroke)
+                          (.-strokeWidth! 2.5)
+                          (.-color! (widgets/Color 0xFF00E676)))]
+              (doseq [p picks :when (:rect p)]
+                (.drawRRect canvas
+                  (widgets/RRect.fromRectAndRadius (:rect p) (widgets/Radius.circular 4.0))
+                  paint)))
             nil)
           (shouldRepaint [_ _] true))))))
 
 (defn repl-inspector
-  "Bottom panel showing the picked widget's source-loc + lexical env (from +cljd-picked+).
-   Appears when something is picked; the × clears it. Gensym locals are hidden."
+  "Bottom panel listing all picked widgets (+cljd-picks+): 'N. type · ns:line:col' per pick.
+   Appears when anything is picked; × clears all. The full env per pick is in @+cljd-picks+
+   (which the REPL reads) — pick several widgets to point at multiple things at once."
   []
   (widget
-    :watch [picked +cljd-picked+]
-    :when picked
+    :watch [picks +cljd-picks+]
+    :when (seq picks)
     (widgets/Directionality
       .textDirection widgets/TextDirection.ltr
       .child
@@ -1384,21 +1400,21 @@
                [(widgets/Row
                   .mainAxisSize widgets/MainAxisSize.min
                   .children
-                  [(widgets/Text (str (:type picked) "  ·  "
-                                   (let [l (:loc picked)] (str (:ns l) ":" (:line l) ":" (:column l))))
+                  [(widgets/Text (str (count picks) " picked")
                      .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
                    (widgets/SizedBox .width 12.0)
                    (widgets/GestureDetector
-                     .onTap (fn [] (reset! +cljd-picked+ nil) nil)
+                     .onTap (fn [] (reset! +cljd-picks+ []) nil)
                      .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
                 (widgets/SizedBox .height 6.0)]
-               (comp
-                 (remove (fn [[k _]] (.endsWith (str k) "__auto__")))
-                 (map (fn [[k v]]
-                        (let [sv (str v)]
-                          (widgets/Text (str k " = " (if (> (count sv) 50) (str (subs sv 0 50) "…") sv))
-                            .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))))))
-               (:env picked)))))))))
+               (map-indexed
+                 (fn [i p]
+                   (widgets/Text (str (inc i) ". " (:type p) "  ·  "
+                                   (let [l (:loc p)] (str (:ns l) ":" (:line l) ":" (:column l))))
+                     .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0)
+                     .maxLines 1
+                     .overflow widgets/TextOverflow.ellipsis))
+                 picks)))))))))
 
 (defn repl-hud [child]
   (widget
@@ -1445,7 +1461,9 @@
                      ;; state = nearest repl-point (scope); target = deepest hit widget (box).
                      (set-env state target)
                      (-> state .-m :*active-state (reset! state)))
-                   (swap! *hud-state assoc :repl-elts (-> repl-elts .-reversed vec)))))))
+                   ;; magenta repl-point painter retired — repl-pick-highlight (green, precise
+                   ;; target box) is the single highlight now. Empty rects → painter draws nothing.
+                   (swap! *hud-state assoc :repl-elts []))))))
          ::with-notifier
          ([*rects nil]
           :watch [{:keys [repl-elts]} *hud-state]
