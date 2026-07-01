@@ -88,31 +88,23 @@
         '(.reassembleApplication (widgets/WidgetsBinding.instance))
         {:ns-lib-uri "cljd/flutter.dart"}))))
 
-(defn install-pick-resolver!
-  "Install a PERSISTENT Stdout sink that auto-resolves on-device picks: it scans app output
-   for `CLJD_PICK <idx> <src>` markers (emitted by capture-pick!) and, off the WS listener
-   thread (a future — calling eval-form on the listener thread would deadlock), resolves +
-   pushes the .cljd loc back. Non-marker output is forwarded to *EVAL-SINK (the swappable
-   per-eval forwarder), so REPL println output still reaches the active eval's transport."
-  [client iso-id dart-version analyzer *eval-sink]
-  (vm/set-sink! client
-    (fn [stream text]
-      (doseq [[_ idx src] (re-seq #"CLJD_PICK (\d+) (\S+)" (str text))]
-        (future (try (resolve-and-push! client iso-id dart-version analyzer (Long/parseLong idx) src)
-                     (catch Throwable _ nil))))
-      (when-some [f @*eval-sink] (f stream text)))))
-
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
     :or {ns-lib-uri "cljd/core.dart"}}]
   ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
   ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
-  (let [*eval-sink (atom nil)
-        *pick-events (atom [])]                 ; PROBE: structured cljd.pick events from postEvent
-   (install-pick-resolver! client iso-id dart-version analyzer *eval-sink)
-   (vm/set-event-sink! client (fn [kind data]
-                                (when (= kind "cljd.pick") (swap! *pick-events conj data))))
+  (let [*eval-sink (atom nil)]
+   ;; stdout sink just forwards REPL output to the active eval's transport (no marker scanning).
+   (vm/set-sink! client (fn [stream text] (when-some [f @*eval-sink] (f stream text))))
+   ;; pick resolution fires on the STRUCTURED Extension event (postEvent), off the WS
+   ;; listener thread (a future — eval-form on the listener thread would deadlock).
+   (vm/set-event-sink! client
+     (fn [kind data]
+       (when (= kind "cljd.pick")
+         (future (try (resolve-and-push! client iso-id dart-version analyzer
+                        (long (:idx data)) (:src data))
+                      (catch Throwable _ nil))))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -219,67 +211,14 @@
                               {:ns-lib-uri "cljd/flutter.dart"})]
                       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
                       (send! {:value (:value full-r) :ns (name @*current-ns)}))
-                    ;; (picks): all on-device picks (multi-select), each :wloc (Flutter
-                    ;; track-widget-creation, a cljd-out Dart line) resolved to its .cljd
-                    ;; source line via the host source map (smap-search over @nses). The
-                    ;; device has no smap — this is the host hop that turns kora/nav.dart:249
-                    ;; into kora/nav.cljd:NN.
-                    ;; NB: VM-Service `evaluate` truncates string results at 128 chars, so we
-                    ;; read the picks field-by-field (each tiny) rather than one big projection.
+                    ;; (picks): read all on-device picks as STRUCTURED DATA via the
+                    ;; ext.cljd.picks service extension — one call, JSON, no `evaluate`, no
+                    ;; 128-char cap, no per-field reads. :cljd is already resolved by the
+                    ;; Extension-event auto-resolver, so this op is now a pure read.
                     (= 'picks head)
-                    (let [libs (:libs @compiler/nses)
-                          eval1 (fn [form]
-                                  (let [r (repl-eval/eval-form client iso-id form
-                                            {:ns-lib-uri "cljd/flutter.dart"})]
-                                    (try (read-string (:value r)) (catch Throwable _ nil))))
-                          n (let [c (eval1 '(cljd.core/count (cljd.core/deref cljd.flutter/+cljd-picks+)))]
-                              (if (integer? c) c 0))
-                          rows (mapv
-                                 (fn [i]
-                                   ;; one small read per pick: [src type name cljd] (< 128 chars).
-                                   ;; :cljd may already be set by the auto-resolver — reuse it and
-                                   ;; only resolve+push when it's still missing (#3: fewer evals).
-                                   (let [tup (eval1
-                                               (list 'cljd.core/vector
-                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :src])
-                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :type])
-                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :name])
-                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :cljd])))
-                                         [src typ nm existing] (if (vector? tup) tup [nil nil nil nil])
-                                         cljd (or existing (resolve-wloc libs src))]
-                                     (when (and cljd (not existing))
-                                       (eval1 (list 'cljd.core/swap! 'cljd.flutter/+cljd-picks+
-                                                    'cljd.core/update i 'cljd.core/assoc :cljd cljd)))
-                                     {:n (inc i) :type typ :wloc src :name nm :cljd cljd}))
-                                 (range n))]
-                      ;; rebuild the overlay so the inspector shows the pushed :cljd (module-atom
-                      ;; :watch doesn't rebuild on external swap!).
-                      (when (some :cljd rows)
-                        (eval1 '(.reassembleApplication (widgets/WidgetsBinding.instance))))
-                      (send! {:value (pr-str rows) :ns (name @*current-ns)}))
-
-                    ;; (vmprobe): validate the richer VM-Service channels — (1) call a
-                    ;; service extension for structured data, (2) getObject a large device
-                    ;; value with NO 128-char truncation, (3) confirm postEvent events landed.
-                    (= 'vmprobe head)
-                    (let [ping (try (vm/call-ext client iso-id "ext.cljd.ping" {})
-                                    (catch Throwable e (str "ERR " (.getMessage e))))
-                          ref (try (vm/evaluate client iso-id
-                                     (vm/library-id client iso-id "cljd/flutter.dart")
-                                     (compiler/form->dart-expr
-                                       '(cljd.core/deref cljd.flutter/+cljd-picks+) false))
-                                   (catch Throwable e {:err (.getMessage e)}))
-                          obj (when (:id ref)
-                                (try (vm/get-object client iso-id (:id ref))
-                                     (catch Throwable e {:err (.getMessage e)})))]
-                      (send! {:value (pr-str {:ping ping
-                                              :ref-kind (:kind ref)
-                                              :ref-valueAsString (:valueAsString ref)
-                                              :getObject-kind (:kind obj)
-                                              :getObject-length (:length obj)
-                                              :getObject-fields (when (map? obj) (vec (keys obj)))
-                                              :events @*pick-events})
-                              :ns (name @*current-ns)}))
+                    (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
+                                 (catch Throwable e {:error (.getMessage e)}))]
+                      (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).

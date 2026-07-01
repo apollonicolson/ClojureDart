@@ -1326,20 +1326,46 @@
       (->> @texts (sort-by (fn [^String s] (.-length s)) >) first))
     (catch Object _ nil)))
 
-;; PROBE: validate the proper VM-Service channels before gutting the handrolled ones.
-;; ext.cljd.ping is a service extension the host calls (callServiceExtension) for structured
-;; data — no `evaluate`, no compilation, no 128-char cap. postEvent pushes a structured
-;; event to the host over the Extension stream — replaces the CLJD_PICK stdout marker.
+;; The proper device<->host channels (VALIDATED, replacing handrolled ones):
+;;  • ext.cljd.picks — a service extension the host calls (callServiceExtension) to read
+;;    the picks as structured JSON. No `evaluate`, no compilation, no 128-char cap, one call
+;;    (was: per-field `evaluate` reads of +cljd-picks+).
+;;  • postEvent('cljd.pick', …) on pick — a structured push to the host over the Extension
+;;    stream (was: a CLJD_PICK line on stdout, regex-scanned host-side).
 (defonce ^:private +cljd-ext-registered+ (atom false))
+
+(defn- jstr
+  "A JSON value literal: jsonEncode a string (quotes + escapes it), or \"null\"."
+  [v]
+  (if (nil? v) "null" (convert/jsonEncode v)))
+
+(defn- picks->json
+  "The picks as a JSON object {\"picks\":[…]} — the payload of ext.cljd.picks (VM-Service
+   service-extension results must be JSON objects, not bare arrays)."
+  []
+  (str "{\"picks\":["
+       (apply str
+         (interpose ","
+           (map-indexed
+             (fn [i p]
+               (str "{\"n\":" (inc i)
+                    ",\"type\":" (jstr (:type p))
+                    ",\"wloc\":" (jstr (:src (:wloc p)))
+                    ",\"cljd\":" (jstr (:cljd p))
+                    ",\"label\":" (jstr (:label p))
+                    ",\"scope\":" (jstr (str (:ns (:loc p)) ":" (:line (:loc p))))
+                    "}"))
+             @+cljd-picks+)))
+       "]}"))
 
 (defn register-cljd-devtools!
   "Register cljd dev-tool service extensions. Guarded so hot-reload can't re-register."
   []
   (when (compare-and-set! +cljd-ext-registered+ false true)
-    (dev/registerExtension "ext.cljd.ping"
+    (dev/registerExtension "ext.cljd.picks"
       (fn [_method _params]
         (dart:async/Future.value
-          (dev/ServiceExtensionResponse.result "{\"pong\":true}"))))
+          (dev/ServiceExtensionResponse.result (picks->json)))))
     nil)                                ; registerExtension returns void → keep the when Null
   nil)
 
@@ -1369,8 +1395,7 @@
     ;; appears on-device automatically, no (picks) call needed.
     (when (> (count after) before)
       (when-let [src (:src (:wloc (peek after)))]
-        (println (str "CLJD_PICK " (dec (count after)) " " src))    ; old channel (to be gutted)
-        ;; PROBE: structured push over the Extension stream (replaces the marker above).
+        ;; structured push over the Extension stream → host resolves + pushes :cljd back.
         ;; jsonDecode yields a native Dart Map<String,dynamic> — the type postEvent wants.
         (try (dev/postEvent "cljd.pick"
                (convert/jsonDecode (str "{\"idx\":" (dec (count after)) ",\"src\":\"" src "\"}")))
