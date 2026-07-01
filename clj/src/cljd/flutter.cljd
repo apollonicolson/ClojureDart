@@ -1322,6 +1322,7 @@
                     ",\"type\":" (jstr (:type p))
                     ",\"wloc\":" (jstr (:src (:wloc p)))
                     ",\"cljd\":" (jstr (:cljd p))
+                    ",\"resolved\":" (if (:resolved? p) "true" "false")
                     ",\"scope\":" (jstr (str (:ns (:loc p)) ":" (:line (:loc p))))
                     "}"))
              @+cljd-picks+)))
@@ -1342,7 +1343,11 @@
       (fn [_method params]
         (let [src (get params "src") cljd (get params "cljd")]
           (swap! +cljd-picks+
-            (fn [ps] (mapv (fn [p] (if (= (:src (:wloc p)) src) (assoc p :cljd cljd) p)) ps))))
+            (fn [ps] (mapv (fn [p] (if (= (:src (:wloc p)) src)
+                                     ;; :resolved? marks the round-trip done; :cljd is the cljd
+                                     ;; loc, or nil when it's non-cljd Dart (empty string).
+                                     (assoc p :resolved? true :cljd (when (seq cljd) cljd))
+                                     p)) ps))))
         (dart:async/Future.value (dev/ServiceExtensionResponse.result "{\"ok\":true}"))))
     nil)                                ; registerExtension returns void → keep the when Null
   nil)
@@ -1420,13 +1425,18 @@
                    .mainAxisSize widgets/MainAxisSize.min
                    .crossAxisAlignment widgets/CrossAxisAlignment.start
                    .children
-                   ;; primary: type + resolved .cljd (green) or Dart wloc fallback (white)
-                   [(widgets/Text (str (inc i) ". " (:type p)
-                                    (when-let [loc (or (:cljd p) (:src (:wloc p)))]
-                                      (str "  ·  " loc)))
+                   ;; primary: type + source. Until the host round-trip resolves it, show
+                   ;; "resolving…" (dim) — no premature Dart-wloc flash. Then green .cljd
+                   ;; (cljd source) or white Dart wloc (confirmed non-cljd Dart).
+                   [(widgets/Text (str (inc i) ". " (:type p) "  ·  "
+                                    (cond (:cljd p) (:cljd p)
+                                          (:resolved? p) (:src (:wloc p))
+                                          :else "resolving…"))
                       .overflow widgets/TextOverflow.ellipsis
                       .style (widgets/TextStyle
-                               .color (if (:cljd p) (widgets/Color 0xFF00E676) material/Colors.white)
+                               .color (cond (:cljd p) (widgets/Color 0xFF00E676)
+                                            (:resolved? p) material/Colors.white
+                                            :else material/Colors.white38)
                                .fontSize 12.0))
                     ;; secondary: enclosing repl-point scope (clean .cljd, coarse) + widget name
                     (widgets/Text (let [l (:loc p)]

@@ -99,8 +99,10 @@
    so no compiler bindings, no form compilation. The device's repl-selections/pick-highlight
    WATCH +cljd-picks+, so they rebuild reactively; no reassemble needed."
   [client iso-id ^String src]
-  (when-some [cljd (resolve-wloc (:libs @compiler/nses) src)]
-    (vm/call-ext client iso-id "ext.cljd.set-cljd" {:src src :cljd cljd})))
+  ;; ALWAYS push a result so the device can distinguish pending from resolved: a cljd loc
+  ;; when it's cljd source, or "" to confirm it's non-cljd Dart (show the Dart wloc, no flash).
+  (let [cljd (resolve-wloc (:libs @compiler/nses) src)]
+    (vm/call-ext client iso-id "ext.cljd.set-cljd" {:src src :cljd (or cljd "")})))
 
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
