@@ -1218,15 +1218,25 @@
 (deftype ^:private NoDebugPaintRender []
   :extends (rendering/RenderProxyBox)
   (paint [this context offset]
-    (when (or rendering/debugPaintSizeEnabled rendering/debugRepaintRainbowEnabled)
+    ;; suppress ALL debug-paint flags while painting the tools so the tools don't frame/
+    ;; baseline/pointer-paint themselves; restore after the frame (the observed app painted
+    ;; earlier this frame keeps its guides). Baselines + pointers were the missing two.
+    (when (or rendering/debugPaintSizeEnabled rendering/debugRepaintRainbowEnabled
+              rendering/debugPaintBaselinesEnabled rendering/debugPaintPointersEnabled)
       (let [a rendering/debugPaintSizeEnabled
-            b rendering/debugRepaintRainbowEnabled]
+            b rendering/debugRepaintRainbowEnabled
+            c rendering/debugPaintBaselinesEnabled
+            d rendering/debugPaintPointersEnabled]
         (set! rendering/debugPaintSizeEnabled false)
         (set! rendering/debugRepaintRainbowEnabled false)
+        (set! rendering/debugPaintBaselinesEnabled false)
+        (set! rendering/debugPaintPointersEnabled false)
         (widgets/WidgetsBinding.instance.addPostFrameCallback
           (fn [_]
             (set! rendering/debugPaintSizeEnabled a)
             (set! rendering/debugRepaintRainbowEnabled b)
+            (set! rendering/debugPaintBaselinesEnabled c)
+            (set! rendering/debugPaintPointersEnabled d)
             nil))))
     (.paint ^super this context offset)
     nil))
@@ -1384,6 +1394,23 @@
              nil                        ; postEvent returns void → keep the try Null
              (catch Object _ nil))))
     nil))                               ; the swap! above rebuilds the watching views
+
+;; REPL-facing tool toggles. The debug-paint flags are GLOBAL and non-reactive, so a change
+;; only shows after a reassemble (repaints the app AND rebuilds the toolbar so its button
+;; reflects). The toolbar buttons already do set!+reassemble on tap; these give the REPL the
+;; same, so driving the tools from the REPL updates the UI. Each returns the new state.
+(defn- tools-reassemble! []
+  (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
+(defn paint!    ([] (paint! (not rendering/debugPaintSizeEnabled)))
+                ([on] (set! rendering/debugPaintSizeEnabled (boolean on)) (tools-reassemble!) on))
+(defn repaint!  ([] (repaint! (not rendering/debugRepaintRainbowEnabled)))
+                ([on] (set! rendering/debugRepaintRainbowEnabled (boolean on)) (tools-reassemble!) on))
+(defn baseline! ([] (baseline! (not rendering/debugPaintBaselinesEnabled)))
+                ([on] (set! rendering/debugPaintBaselinesEnabled (boolean on)) (tools-reassemble!) on))
+(defn pointers! ([] (pointers! (not rendering/debugPaintPointersEnabled)))
+                ([on] (set! rendering/debugPaintPointersEnabled (boolean on)) (tools-reassemble!) on))
+(defn arm!      ([] (arm! true))
+                ([on] (reset! +cljd-hud-enabled+ (when on capture-pick!)) (tools-reassemble!) (boolean on)))
 
 (defn- repl-selections-column
   "The picks list for the dev panel: a 'N picked' header (× clears all) then one row per
