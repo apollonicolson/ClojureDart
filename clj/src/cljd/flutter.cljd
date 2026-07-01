@@ -1237,6 +1237,11 @@
 ;; (reset! cljd.flutter/+cljd-toolbar-hidden+ true) hides it, false shows it.
 (defonce +cljd-toolbar-hidden+ (atom false))
 
+;; The picker hook, module-level so both the toolbar pick button AND the REPL can arm it:
+;; (reset! cljd.flutter/+cljd-hud-enabled+ (fn [state] ...)) arms; nil disarms. When armed,
+;; repl-hud's Listener hit-tests taps and its CustomPainter draws the magenta highlight.
+(defonce +cljd-hud-enabled+ (atom nil))
+
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
    hook — the pick button arms/disarms it. Toggles show active state (green tint+highlight);
@@ -1316,8 +1321,8 @@
 
 (defn repl-hud [child]
   (widget
-    :managed [*hud-enabled (atom nil) :dispose nil
-              _ (println "[* RDY)_") :dispose nil]
+    :managed [_ (println "[* RDY)_") :dispose nil]
+    :let [*hud-enabled +cljd-hud-enabled+]
     (widgets/Stack
       .alignment widgets/AlignmentGeometry.topLeft
       .fit widgets/StackFit.expand
