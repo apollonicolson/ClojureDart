@@ -1634,6 +1634,113 @@
             nil)
           (shouldRepaint [_ _] true))))))
 
+;; ── Refine pick (tap+hold) ──────────────────────────────────────────────────
+;; Plain tap picks the deepest widget. Tap+HOLD enters refine: scrub the finger over the
+;; app to seek widgets (live cyan preview) or slide onto the ancestor list to pick a level;
+;; release confirms. +cljd-refine+ = nil | {:chain [deepest..ancestors] :idx candidate}.
+(defonce ^:private +cljd-refine+ (atom nil))
+(def ^:private +refine-x+ 12.0)
+(def ^:private +refine-y+ 96.0)
+(def ^:private +refine-row+ 34.0)
+(def ^:private +refine-w+ 300.0)
+
+(defn- hit-element
+  "Deepest widget Element under screen position POS."
+  [^widgets/Offset pos]
+  (let [result (rendering/BoxHitTestResult)]
+    (-> ::app-root global-key ^widgets/Element (.-currentContext)
+        ^rendering/RenderBox (.-renderObject) (.hitTest result .position pos))
+    (some (fn [^rendering/HitTestEntry {:flds [target]}]   ; :flds name = the field: .target
+            (when (instance? rendering/RenderObject target)
+              (some-> ^rendering/RenderObject target ^widgets/DebugCreator (.-debugCreator) .-element)))
+          (-> result .-path))))
+
+(defn- ancestor-chain
+  "[element ..ancestors] deepest-first, capped at 10, for the refine list."
+  [^widgets/Element el]
+  (let [acc #dart ^widgets/Element [el]]
+    (.visitAncestorElements el (fn [^widgets/Element a] (.add acc a) (< (.-length acc) 10)))
+    (vec acc)))
+
+(defn- elem-rect [^widgets/Element el]
+  (when-some [ro (.-renderObject el)]
+    (rendering/MatrixUtils.transformRect (.getTransformTo ^rendering/RenderBox ro nil)
+                                         (.-paintBounds ^rendering/RenderBox ro))))
+
+(defn- pick-element!
+  "Nearest repl-point above EL, then capture-pick! it (SET-ENV = the pick hook)."
+  [set-env ^widgets/Element el]
+  (let [repl-elts #dart ^widgets/StatefulElement []]
+    (.visitAncestorElements el
+      (fn [^widgets/Element a]
+        (when (and (instance? widgets/StatefulElement a)
+                   (instance? ReplState (.-state ^widgets/StatefulElement a)))
+          (.add repl-elts a))
+        true))
+    (when-some [^ReplState state (some-> repl-elts .-first .-state)]
+      (set-env state el)
+      (-> state .-m :*active-state (reset! state)))
+    nil))
+
+(defn- refine-row-at
+  "Row index if screen POS is over the refine list of N rows; else nil."
+  [^widgets/Offset pos n]
+  (let [x (.-dx pos) y (.-dy pos)]
+    (when (and (<= +refine-x+ x (+ +refine-x+ +refine-w+))
+               (<= +refine-y+ y (+ +refine-y+ (* n +refine-row+))))
+      (min (dec n) (int (/ (- y +refine-y+) +refine-row+))))))
+
+(defn- repl-refine
+  "Refine overlay: a cyan box on the candidate + the ancestor list (types), candidate
+   highlighted. Purely visual (IgnorePointer) — the picker GestureDetector owns the gesture."
+  []
+  (widget
+    :watch [r +cljd-refine+]
+    :when r
+    :let [chain (:chain r) idx (:idx r)
+          rect (some-> (nth chain idx nil) elem-rect)]
+    (widgets/Directionality
+      .textDirection widgets/TextDirection.ltr
+      .child
+      (widgets/IgnorePointer
+       .child
+       (widgets/Stack
+        .children
+        [(if rect
+           (widgets/Positioned
+             .left (.-left ^widgets/Rect rect) .top (.-top ^widgets/Rect rect)
+             .width (.-width ^widgets/Rect rect) .height (.-height ^widgets/Rect rect)
+             .child (widgets/DecoratedBox
+                      .decoration (widgets/BoxDecoration
+                                    .border (widgets/Border.all .color (widgets/Color 0xFF40C4FF) .width 2.5)
+                                    .borderRadius (widgets/BorderRadius.circular 4.0))))
+           (widgets/SizedBox.shrink))
+         (widgets/Positioned
+           .left +refine-x+ .top +refine-y+ .width +refine-w+
+           .child
+           (NoDebugPaint
+            (widgets/Container
+              .decoration (widgets/BoxDecoration .color (widgets/Color 0xF2101418)
+                            .borderRadius (widgets/BorderRadius.circular 10.0))
+              .padding (widgets/EdgeInsets.symmetric .vertical 4.0)
+              .child
+              (widgets/Column
+                .mainAxisSize widgets/MainAxisSize.min
+                .crossAxisAlignment widgets/CrossAxisAlignment.start
+                .children
+                (vec (map-indexed
+                       (fn [i ^widgets/Element el]
+                         (widgets/Container
+                           .height +refine-row+
+                           .padding (widgets/EdgeInsets.symmetric .horizontal 12.0)
+                           .alignment widgets/Alignment.centerLeft
+                           .color (if (= i idx) (widgets/Color 0x3340C4FF) (widgets/Color 0x00000000))
+                           .child (widgets/Text (str (if (= i idx) "▶ " "    ") (.-runtimeType (.-widget el)))
+                                    .style (widgets/TextStyle
+                                             .color (if (= i idx) (widgets/Color 0xFF40C4FF) material/Colors.white70)
+                                             .fontSize 12.0))))
+                       chain))))))])))))
+
 (defn repl-hud [child]
   (widget
     :managed [_ (do (register-cljd-devtools!) (println "[* RDY)_")) :dispose nil]
@@ -1649,87 +1756,36 @@
        (widget
          :watch [set-env *hud-enabled]
          :when set-env
-         :managed [*hud-state (atom {}) :dispose nil]
-         (widgets/Listener
+         ;; plain tap → deepest widget; tap+HOLD → refine (scrub the app to seek widgets, or
+         ;; slide onto the ancestor list to pick a level) → release confirms. GestureDetector
+         ;; (not Listener) so Flutter's arena cleanly separates tap from long-press-drag.
+         (widgets/GestureDetector
            .behavior widgets/HitTestBehavior.opaque
-           .onPointerDown
-           (fn [^widgets/PointerDownEvent e]
-             (let [result (rendering/BoxHitTestResult)]
-               (-> ::app-root
-                 global-key
-                 ^widgets/Element (.-currentContext)
-                 ^rendering/RenderBox (.-renderObject)
-                 (.hitTest result .position (.-position e)))
-               #_(rendering/RendererBinding.instance.hitTest result (.-position e))
-               (when-some [^widgets/Element target
-                           (some (fn [^rendering/HitTestEntry {:flds [target]}]
-                                   (when (instance? rendering/RenderObject target)
-                                     (some->  ^rendering/RenderObject target
-                                       ^widgets/DebugCreator (.-debugCreator)
-                                       .-element)))
-                             (-> result .-path))]
-                 (let [repl-elts #dart ^widgets/StatefulElement []]
-                   (.visitAncestorElements target
-                     (fn [^widgets/Element anc]
-                       (when (and (instance? widgets/StatefulElement anc)
-                               (instance? ReplState (.-state ^widgets/StatefulElement anc)))
-                         (.add repl-elts anc))
-                       true))
-                   (when-some [^ReplState state (some-> repl-elts .-first .-state)]
-                     ;; state = nearest repl-point (scope); target = deepest hit widget (box).
-                     (set-env state target)
-                     (-> state .-m :*active-state (reset! state)))
-                   ;; magenta repl-point painter retired — repl-pick-highlight (green, precise
-                   ;; target box) is the single highlight now. Empty rects → painter draws nothing.
-                   (swap! *hud-state assoc :repl-elts []))))))
-         ::with-notifier
-         ([*rects nil]
-          :watch [{:keys [repl-elts]} *hud-state]
-          :let [rects (into []
-                        (keep (fn [^widgets/Element {ro .-renderObject}]
-                                (when ro
-                                  (rendering/MatrixUtils.transformRect
-                                    (.getTransformTo ro nil)
-                                    (.-paintBounds ro)))))
-                        repl-elts)]
-          rects)
-         (widgets/CustomPaint
-           .painter
-           (reify :extends
-             (widgets/CustomPainter .repaint *rects)
-             :no-meta true
-             (paint [_ canvas size]
-               ;; clip highlight strokes to the screen's rounded corners so an edge
-               ;; widget's box follows the curve instead of a sharp corner masked by the
-               ;; hardware. Radius is a constant (no stable Flutter corner-radius API);
-               ;; a platform channel (Android 12+ WindowInsets.getRoundedCorner) would
-               ;; give the exact per-device value.
-               (.clipRRect canvas
-                 (widgets/RRect.fromRectAndRadius
-                   (widgets/Rect.fromLTWH 0.0 0.0 (.-width size) (.-height size))
-                   (widgets/Radius.circular +screen-corner-radius+)))
-               (let [{:flds [hue] :as color} (widgets/HSVColor.fromColor (widgets/Color.fromRGBO 255 0 255 0.7))
-                     paint (doto (widgets/Paint)
-                             (.-style! widgets/PaintingStyle.stroke))
-                     min-w 1
-                     max-w 6
-                     rects @*rects
-                     N-1 (dec (count rects))]
-                 (reduce-kv
-                   (fn [_ i rect]
-                     (.drawRect canvas
-                       rect (doto paint
-                              (.-strokeWidth!
-                                (+ min-w (* (- max-w min-w) (dart:math/pow 0.5 (- N-1 i)))))
-                              (.-color! (-> color
-                                          (.withHue (mod (+ hue (* i 41.5)) 360.0))
-                                          .toColor)))))
-                   nil
-                   rects))
-               nil)
-             (shouldRepaint
-                 [this old]
-                 true))))
+           .onTapUp
+           (fn [^widgets/TapUpDetails d]
+             (when-some [el (hit-element (.-globalPosition d))] (pick-element! set-env el))
+             nil)
+           .onLongPressStart
+           (fn [^widgets/LongPressStartDetails d]
+             (when-some [el (hit-element (.-globalPosition d))]
+               (reset! +cljd-refine+ {:chain (ancestor-chain el) :idx 0}))
+             nil)
+           .onLongPressMoveUpdate
+           (fn [^widgets/LongPressMoveUpdateDetails d]
+             (let [pos (.-globalPosition d)]
+               (when-some [cur @+cljd-refine+]
+                 (if-some [row (refine-row-at pos (count (:chain cur)))]
+                   (swap! +cljd-refine+ assoc :idx row)   ; slide onto the list → pick that level
+                   (when-some [el (hit-element pos)]       ; scrub over the app → seek widgets
+                     (reset! +cljd-refine+ {:chain (ancestor-chain el) :idx 0})))))
+             nil)
+           .onLongPressEnd
+           (fn [^widgets/LongPressEndDetails d]
+             (when-some [cur @+cljd-refine+]
+               (when-some [el (nth (:chain cur) (:idx cur) nil)] (pick-element! set-env el)))
+             (reset! +cljd-refine+ nil)
+             nil)))
+       (repl-refine)
        (repl-pick-highlight)
        ;; toolbar + inspector unified: selections live inside the expanded panel now.
        (repl-toolbar *hud-enabled)])))
