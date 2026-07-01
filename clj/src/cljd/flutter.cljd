@@ -1246,14 +1246,15 @@
 (defonce +cljd-picked+ (atom nil))
 
 (defn- capture-pick!
-  "Pick callback: capture the tapped widget's source-loc + lexical env + global bounds
-   (for the persistent highlight box) into +cljd-picked+."
-  [^ReplState state]
+  "Pick callback. STATE = nearest enclosing repl-point (gives lexical scope + source-loc).
+   TARGET = the deepest hit widget (Flutter hit-test, pixel-precise) — used for the box and
+   its runtime type. So one pick yields the exact widget's box + type AND the enclosing scope."
+  [^ReplState state ^widgets/Element target]
   (let [^ReplPointWidget w (.-widget state)
-        ^widgets/Element ctx (.-context state)
-        ^rendering/RenderBox ro (.-renderObject ctx)]
+        ^rendering/RenderBox ro (.-renderObject target)]
     (reset! +cljd-picked+
       {:loc (.-source_loc w)
+       :type (str (.-runtimeType (.-widget target)))
        :env ((.-get_envmap w))
        :rect (rendering/MatrixUtils.transformRect (.getTransformTo ro nil) (.-paintBounds ro))})))
 
@@ -1383,7 +1384,8 @@
                [(widgets/Row
                   .mainAxisSize widgets/MainAxisSize.min
                   .children
-                  [(widgets/Text (let [l (:loc picked)] (str (:ns l) ":" (:line l) ":" (:column l)))
+                  [(widgets/Text (str (:type picked) "  ·  "
+                                   (let [l (:loc picked)] (str (:ns l) ":" (:line l) ":" (:column l))))
                      .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
                    (widgets/SizedBox .width 12.0)
                    (widgets/GestureDetector
@@ -1440,7 +1442,8 @@
                          (.add repl-elts anc))
                        true))
                    (when-some [^ReplState state (some-> repl-elts .-first .-state)]
-                     (set-env state)
+                     ;; state = nearest repl-point (scope); target = deepest hit widget (box).
+                     (set-env state target)
                      (-> state .-m :*active-state (reset! state)))
                    (swap! *hud-state assoc :repl-elts (-> repl-elts .-reversed vec)))))))
          ::with-notifier
