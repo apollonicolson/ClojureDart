@@ -7,8 +7,7 @@
             ["dart:async" :as dart:async]
             ["dart:math" :as dart:math]
             ["dart:ui" :as dart:ui]
-            [cljd.string :as str]
-            [cljd.flutter.repl-impl :as repl-impl])
+            [cljd.string :as str])
   (:host-ns
    (:require [clojure.string :as str])))
 
@@ -1203,80 +1202,9 @@
       (assert (or active-is-mounted (not is-active)))
       (when (or is-active (not active-is-mounted))
         (when-not active-is-mounted
-          (-> (global-key ::app-root) .-currentContext (peek-of ::repl-impl/hud-enabled)
+          (-> (global-key ::app-root) .-currentContext (peek-of :cljd.flutter.repl-impl/hud-enabled)
             (reset! nil))
-          (reset! (:*active-state m) state))
-        (widgets/WidgetsBinding.instance.addPostFrameCallback
-          (fn [_]
-            (repl-impl/repl-exec))
-          .debugLabel "repl")
-        ;; An idle app schedules no frame, so the post-frame callback above never
-        ;; fires and the REPL form never executes — the root cause of REPL evals
-        ;; "hanging" on a static UI. Force a frame so the callback always runs.
-        (widgets/WidgetsBinding.instance.scheduleFrame)))))
-
-(def ^:dynamic *-repl-control-* nil)
-
-(defn spawn-repl! [tag]
-  (let [out *out*
-        prval (repl-impl/prefixing-string-sink out (str "[" tag " =)"))
-        prack (repl-impl/prefixing-string-sink out (str "[" tag " !)"))
-        ack! #(.writeln prack ">") ; the trailing > is to pass the regexp in build.clj
-        {:flds [sink stream close]} (dart:async/StreamController .sync true)]
-    (binding [*out* (repl-impl/prefixing-string-sink out (str "[" tag " o)"))
-              *err* (repl-impl/prefixing-string-sink out (str "[" tag " e)"))
-              *print-length* 40
-              *print-level* 6
-              *1 nil
-              *2 nil
-              *3 nil
-              *e nil
-              *st nil
-              *env nil
-              *ns* 'repl.uninitialized
-              *-repl-control-* nil]
-      (println "ClojureDart\n")
-      (println "Use `(pick!)` to toggle the widget picker. The picked widget becomes `*1`.")
-      (println "Use `(mount!)` to replace the picked widget by `*1`.")
-      (println "`*env` contains the lexical scope for the picked widget.\nBuildContext at `(:ctx *env)`.")
-
-      (.forEach stream
-        (fn [[f mode]]
-          (let [prev-ns *ns*]
-            (try
-              (let [r (f)]
-                (set! *3 *2)
-                (set! *2 *1)
-                (set! *1 r)
-                (case mode
-                  :user (binding [*out* prval] (prn r))
-                  :tooling nil))
-              (catch dart:core/Object e# st#
-                     (set! *e e#)
-                     (set! *st st#)
-                     (binding [*out* *err*]
-                       (println "Error: " (or (ex-message e#)
-                                            (:cause e#))))
-                     nil)
-              (finally
-                (case mode
-                  :user (print (str *ns* "=> "))
-                  :tooling (when-not (= *ns* prev-ns)
-                             (print (str "\n" *ns* "=> "))))
-                (.flush ^repl-impl/PrefixingStringSink *out*)
-                (.writeln prack (str *ns*)))))))
-      (set! *-repl-control-*
-        (fn
-          ([] (close))
-          ([f mode] (.add sink [f mode])))))))
-
-(defonce ^:private *repls (atom {}))
-
-(defn dispatch-to-repl! [tag thunk mode]
-  (let [repl (or (@*repls tag)
-               (doto (spawn-repl! tag)
-                 (->> (swap! *repls assoc tag))))]
-    (repl thunk mode)))
+          (reset! (:*active-state m) state))))))
 
 (defn repl-hud [child]
   (widget
@@ -1287,7 +1215,7 @@
       .fit widgets/StackFit.expand
       .children
       [(widget
-         :bind {::repl-impl/hud-enabled *hud-enabled}
+         :bind {:cljd.flutter.repl-impl/hud-enabled *hud-enabled}
          :global-key ::app-root
          child)
        (widget

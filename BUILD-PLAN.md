@@ -37,15 +37,11 @@ eval(code):
    PROVEN on device: `(println …)`/`(dotimes … println)` output arrives as `:out`,
    interleaved correctly with `:value`. (Lines carry Flutter's own `flutter: ` stdout
    prefix — strippable polish, left as honest passthrough for now.)
-7. ⛔ **delete old machinery** — RE-SCOPED. The original list assumed the VM-Service
-   path would replace reload too. It doesn't: the new reload REUSES Flutter's hot-reload
-   daemon (`trigger-reload` → "r" → "Reloaded N libraries" state machine → done-promise),
-   which was the right call (don't reinvent Flutter reload). So the dispatch daemon +
-   reload state-machine + `r`/`R` stdin forwarding are now LOAD-BEARING, not deletable.
-   Only the legacy `clojure.core.server` socket REPL + `parse-repl-line` + in-app
-   `form-exec`/`repl-exec` remain candidates — but they're tangled into the same daemon,
-   so removal means editing the working reload path + a full device re-validation, for
-   cleanliness not function. Deferred deliberately; the old front is harmless dead weight.
+7. ✅ **delete old machinery** — DONE 2026-07-01 (branch `repl-cleanup-dead-socket`),
+   device-validated on the Pixel. Corrects this step's earlier re-scoping: the reload
+   state-machine + `r`/`R` stdin forwarding ARE load-bearing and were KEPT; the socket
+   transport and the in-app execution chain the new path reused-but-didn't-need were
+   removed. Net −420 lines across 5 files. See "Dead-code removal" below.
 8. ✅ **polish** — async Future-await ✅, ns-context ✅, var-redef ✅, `pick!` ✅ (all below).
 
 ## Error DX (`cljd.repl.errors`) — done 2026-06-30
@@ -89,10 +85,183 @@ jars, no integrated REPL source). No upstream fix exists for any of these. So:
   3× and cljd inlined the local, re-emitting `set!`'s lifted temp ("already declared"). Now it
   passes the value ONCE to an injected `cljd.core/+cljd-repl-handle` helper.
 
-## Delete list (the simplification)
-`parse-repl-line`, the `[id mode)…_` protocol, `form-exec`/`repl-exec`/`ReplHackContrib`,
-the dispatch daemon + state machine + `Reloaded N libraries` regexes, `r`/`R` stdin
-forwarding, the `clojure.core.server` socket REPL. The 5 prior fixes are transitional.
+## Dead-code removal — DONE 2026-07-01, device-validated (branch `repl-cleanup-dead-socket`)
+
+**Corrected understanding (the original delete list was wrong).** The dead code was two
+layers, not one, and the second was NOT actually dead:
+
+1. **Socket transport** — genuinely unused; the nREPL is its own transport.
+   Removed: `clojure.core.server` require, `eval-to-repl`, `repl`, `restartable-repl`,
+   the `server/start-server` listener, `*repl-states`, `*repl-port`, the `REPL.lock`
+   writer.
+2. **In-app execution chain** — `recompile-form` (called by the NEW path, `eval.clj:94`)
+   emitted `form-exec`/`dispatch-to-repl!`, so this chain RAN on every reload. But it was
+   *functionally redundant*: reload only handles `def`-like forms (they take effect by
+   being redefined, not re-executed); the nREPL gets values via `evaluate` and output via
+   VM-Service streams. So `recompile-form` was rewired to emit the **bare form**, orphaning
+   and removing: `form-exec`/`ReplHackContrib` + `dispatch-to-repl!`/`spawn-repl!`/`*repls`/
+   `*-repl-control-*`/`PrefixingStringSink` (whole files `flutter/repl_impl.cljd` +
+   `flutter/repl.cljd` deleted), `parse-repl-line`, the daemon's socket output-routing,
+   and `ReplState.reassemble`'s `repl-exec` post-frame + `scheduleFrame`.
+
+**KEPT (load-bearing):** the reload/restart state-machine daemon (`trigger-reload` → "r"
+→ "Reloaded N libraries" → done-promise), `r`/`R` stdin forwarding, `smap-line`, the HUD
+picker machinery (`repl-hud`/`ReplState`/`ReplPointWidget`). The `[* RDY)_` restart marker
+is now matched by a plain `.contains` instead of `parse-repl-line`.
+
+**Device-validated (rank 1, Pixel 8 Pro):** expression eval, collection literals, `defn`
+reload + call via the decoupled `recompile-form` (`(cube 4)`→64, body redefined→12),
+var-redef (`vx`→2→102), `println`→`:out` via VM-Service streams, `pick!` arms
+("picker ON"/"picker off" — HUD hook intact). Net −420 lines across 5 files.
+
+**Known pre-existing fragility (NOT introduced here):** defining into the default
+`cljd.core` triggers recompilation of dependents (incl. `cljd.flutter`) via
+`recompile-form`'s `nses-to-recompile`, which WIPES runtime-injected helpers like
+`+cljd-repl-pick!` → `(pick!)` then fails to resolve until re-injected. Avoid by
+`(in-ns 'kora.…)` to a leaf ns before defining. Fix later: exclude the REPL-injected
+defs from dependent recompilation, or re-inject after a core reload.
+
+## Inert after this change
+The `ensure-no-existing!` REPL.lock double-launch guard now reads a lock nothing writes
+(the socket wrote it), so it never fires. Left in place (harmless); either drop it or have
+the nREPL write `REPL.lock` to restore the guard.
+
+## Feature recovery — reimplement over the nREPL (from the deleted socket REPL)
+The deleted code implemented real REPL/dev features for the OLD in-app-execution model.
+They were dead-in-context under the new nREPL (never populated for `evaluate`d
+expressions), so removing them lost no working capability — but the good ones are portable
+and should be re-added against the new "JVM-compiles / device-executes" model. Grounded in
+the deleted `spawn-repl!` (flutter.cljd) + `flutter/repl.cljd`.
+
+**Tier 1 — core REPL affordances (cheap; injected-helper pattern, like `+cljd-repl-handle`):**
+- `*1 *2 *3` result history — inject `+cljd-repl-remember` (`(set! *3 *2)(set! *2 *1)(set! *1 v) v`),
+  wrap each eval expr; keeps `*1` the real live on-device value. ~15 lines. Vars already in cljd.core.
+- `*e` / `*st` last error + stacktrace — set in the `@Error` / `catchError` paths. ~10 lines.
+- Bounded printing `*print-length* 40` / `*print-level* 6` — bind in the eval wrapper. Trivial.
+- Prompt/`*ns*` feedback — ns already tracked host-side + returned as `:ns`; prompt is cosmetic.
+
+**Tier 2 — on-device dev features (moderate):**
+- `mount!` — hot-swap the picked widget with a REPL value (or reset). Re-wire to the new
+  `+cljd-repl-picked+` atom + `ReplState`'s existing `:child` override (`setState`). The
+  deleted `repl.cljd` had the working logic to adapt.
+- `ancestors` — widget ancestry chain via `debugGetDiagnosticChain` of the picked element. Cheap.
+- `*env` scope binding (was the Tier-3 TODO) — resolve the picked widget's lexical locals in
+  eval by passing the runtime env to VM-Service `evaluate`'s `scope` param. HIGH value, harder.
+
+**Tier 3 — transport / architecture:**
+- Second REPL front reusing the eval core — `cljd.repl.eval/eval-form` is transport-agnostic
+  (that's why the socket removal was clean). A terminal / socket / web front is a thin adapter
+  over `eval-form` + `vmservice`; only the front differs. Cheap to add another.
+- Multi-session eval state (per-session `*current-ns`, `*1` history) — the nREPL `clone` op
+  already mints sessions; state is currently global. LOW priority.
+
+## On-device HMR toolset — research synthesis + build order (2026-07-01)
+Three parallel research passes (Flutter capabilities / live-programming prior art / exact
+runtime symbols). Convergent findings:
+
+**Architectural split (organizing principle).** Cheap, in-app runtime flags + our picker go
+in the **overlay**; heavy analysis (CPU sampling, real heap snapshots, interactive tree/
+layout explorer, editor completion) runs **host-side on the JVM over the VM Service**. Don't
+attempt the heavy tools in-app.
+
+**Foundation already built.** Both the Flutter-capability and prior-art passes independently
+land on: the picker + captured `+cljd-repl-picked+` scope IS the 80%. Formalizing captured
+picks into addressable scope (à la `sc.api`) is the multiplier everything composes on.
+
+**Symbols verified on-disk (Flutter 3.44.4, `src/rendering/debug.dart` etc.):** the 6 paint
+flags (`debugPaintSizeEnabled`, `debugPaintBaselinesEnabled`, `debugPaintPointersEnabled`,
+`debugPaintLayerBordersEnabled`, `debugRepaintRainbowEnabled`, `debugRepaintTextRainbowEnabled`)
++ 3 `debugDisable{Clip,PhysicalShape,Opacity}Layers` are top-level bools needing
+`WidgetsBinding.instance.reassembleApplication()` after `set!` (a hot reload does it).
+`timeDilation` (scheduler.dart, double) and `WidgetsBinding.instance.debugShowWidgetInspectorOverride`
+(ValueNotifier-backed) self-trigger — no reassemble. Tree dumps `debugDumpApp/RenderTree/
+LayerTree/SemanticsTree` are zero-arg calls → REPL stdout. Gotcha: profile flags split libs
+(`widgets/debug.dart` vs `rendering/debug.dart`).
+
+**Prioritized build order:**
+- **Phase 0 — REPL muscle memory** (host/injection, no UI): `*1/*2/*3/*e` + bounded printing
+  (the Tier-1 helper). Cheapest, unblocks daily use.
+- **Phase 1 — overlay debug-flag strip** (near-zero effort, verified symbols): one button
+  template over the 9 paint/disable bools (`set!` + `reassembleApplication`), a `timeDilation`
+  slider, a `debugShowWidgetInspectorOverride` toggle (Flutter's own inspector, free full
+  diagnostics tree — complements our picker), tree-dump buttons → stdout.
+- **Phase 2 — picker → workbench**: inspect-to-source (tap → jump to the `f/widget` form; the
+  SAFE anchor if scope-capture doesn't transfer), then `*env` scope binding (VM-Service
+  `evaluate` `scope` param), `mount!` hot-swap, in-inspector action buttons.
+- **Phase 3 — value inspector + probes**: navigable EDN/Dart value tree (Portal/Reveal style)
+  in the overlay; live probes (pinned exprs recomputed per rebuild); moldable per-type views
+  (Verse/Prayer/datalog).
+- **Phase 4 — host-side heavy tools**: frame-timing/jank chart (`SchedulerBinding.addTimingsCallback`),
+  editor-parity nREPL ops (`complete`/`info`/`eldoc` from `@nses`), CPU/memory profiling
+  (VM Service, host-rendered).
+
+**Two gating spikes before committing Phase 2:**
+1. **Scope-capture feasibility on cljd** — ✅ SPIKED GREEN 2026-07-01 (rank 3, read
+   `expand-repl-point` flutter.cljd:1024). Every `f/widget` emits a live `get_envmap` closure
+   capturing each lexical local by name (`(fn [] (apply hash-map #dart ['sym sym …]))`), and
+   source-loc (`:ns/:line/:column`) is captured beside it. So picking gives `{sym → live
+   value}` + jump-to-source, for free. To bind a bare local in eval, two mechanisms:
+   (A) compile-side `let`-wrap using the reported env-keys + a stored envmap — no vmservice
+   change, no objectId lifetime issues [RECOMMENDED]; (B) VM-Service `evaluate` `scope` param
+   (`Map<name→objectId>`) — our `evaluate` (vmservice.clj:77) doesn't pass `:scope` yet; needs
+   an objectId fetch per value. Phase 2 spine is sound; device confirm = 1 relaunch cycle.
+
+## Rejected path — hybrid JVM-Clojure-on-ART REPL (researched 2026-07-01)
+Explored: embed a real JVM Clojure runtime on ART (in-process with Flutter, reached via
+`package:jni`) to get true `eval`/`resolve`/`reflect`/runtime-macros on device — the "full
+JVM-like REPL." **Verdict: not worth it for live Flutter dev; a detour.** Why (adversarial):
+- The embedded JVM Clojure is a **separate island** — two heaps, two var tables. Its full
+  semantics operate on JVM/Android objects, **not** cljd vars or Flutter widgets. It can't
+  hold or mutate a Dart object; it can only poke Dart via a marshaled callback.
+- **JVM→Dart is the crux and it's costly.** Clojure runs on its own threads → calls into Dart
+  take the cross-thread "post-message + block-and-wait" path (jnigen `threading.md`), marshaling
+  each crossing, deadlock risk. So driving Flutter from it is **slower** than the VM-Service
+  nREPL we already have, which reaches the Dart heap natively.
+- Cost: 0.7–3.5s Clojure bootstrap on ART, a runtime `d8→DEX` dexer for `eval`, APK/dex bloat.
+  Clojure-on-Android is effectively abandoned tooling (peaked ~2015; `xlisp/clojure-android` is
+  a lone modern fork). **UNVERIFIED**: no prior art of JVM Clojure *inside a Flutter app* (the
+  combination is inference); modern-ART cold-start numbers rest on 2015 benchmarks.
+- Pays off ONLY under a different goal (on-device `java.*` libs / Android-SDK reflection /
+  self-modifying JVM code) — and then it's a JVM Clojure sandbox sharing a process, not a
+  Flutter-REPL enhancement.
+
+Correction folded in: an earlier claim that on-device full-JVM-semantics is "structurally
+impossible" was wrong — it's *possible* (you can embed the runtime), just walled off from the
+Dart/Flutter heap and slower to bridge than the existing nREPL. The right target for live app
+dev remains the **parity layer** (`complete`/`info`/`eldoc`/`*1/*2/*3` from `@nses`), which
+makes the cljd nREPL indistinguishable-from-JVM for *interactive* work.
+
+## The interactive REPL surface is ALREADY in the hybrid we have (host compiler + `@nses`)
+Key reframe (2026-07-01). The "hybrid" that matters is the one we built: **`evaluate` +
+Flutter hot reload**. It is NOT device-only — it is *host-compiles / device-executes*, and the
+host is a complete cljd/Clojure runtime holding the full var table (`@compiler/nses`). So the
+introspection + metaprogramming surface of a JVM Clojure REPL is already *computed* on the host;
+it's just not yet *exposed* as nREPL ops. The "parity layer" is therefore not a consolation for
+missing JVM semantics — it is **surfacing what the hybrid already knows.**
+
+Where each JVM-REPL affordance resolves in the current hybrid:
+
+| Feature | Resolves via | Status |
+|---|---|---|
+| interactive `eval` (type form → runs) | device (`evaluate` / reload) | **have** |
+| `macroexpand` / `macroexpand-1` | host compiler | trivial — expander is in-process |
+| `resolve` / `find-var` / `ns-publics` / `ns-map` | host `@nses` | wire an op |
+| `complete` / `info` / `doc` / `eldoc` | host `@nses` (arglists, docstrings) | wire an op |
+| `clojure.reflect`-style object/type inspection | VM-Service `getObject` / `getClass` | possible, different shape |
+| `*1 *2 *3 *e` result/error history | injected helper (`+cljd-repl-remember`) | ~15 lines |
+| `source` | host disk + captured `:line/:column` | mostly have |
+
+**Sole genuine exclusion:** programmatic runtime `eval` *from inside app Dart code* (app calling
+`(eval …)` at runtime) — needs an on-device interpreter (the rejected JVM-on-ART path). No
+Flutter app needs it. Everything an interactive Clojure REPL user reaches for is host- or
+VM-Service-answerable through the hybrid as built.
+
+**Immediate wiring targets (expose what the host already computes):** `resolve`, `macroexpand`,
+`complete`, `info` — the obvious first four nREPL ops, all backed by `@compiler/nses`.
+2. **Editor-parity audit** (the 4th research pass): our nREPL handles `{clone, ls-sessions,
+   describe, interrupt, close, eval}` only — missing `complete`/`info`/`eldoc`/`lookup`/
+   `load-file`, the ops CIDER/Calva/clojure-mcp use for completion/docs/jump. Answerable
+   host-side from `@nses`. Highest existing-user DX unlock.
 
 ## Lives in
 the cljd build JVM (has compiler+analyzer+nses); VM-service client + nREPL front added

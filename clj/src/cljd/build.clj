@@ -15,8 +15,7 @@
             [clojure.tools.deps :as deps]
             [clojure.string :as str]
             [clojure.stacktrace :as st]
-            [clojure.java.io :as io]
-            [clojure.core.server :as server]))
+            [clojure.java.io :as io]))
 
 (def ^:dynamic *ansi* false)
 (def ^:dynamic *deps*)
@@ -217,112 +216,10 @@
        (finally
          (run! remove-tap fns#)))))
 
-(defn eval-to-repl [repltag expr-or-throwable *compiler-state trigger-reload p]
-  (loop [expr-or-throwable expr-or-throwable
-         throwable-phase (when (instance? Throwable expr-or-throwable)
-                           :read-source)]
-
-    (assert (= (some? throwable-phase)
-              (instance? Throwable expr-or-throwable)))
-
-    (let [expr (if throwable-phase
-                 `(throw '~(-> expr-or-throwable
-                             Throwable->map
-                             (assoc :phase throwable-phase)))
-                 expr-or-throwable)
-          {N :recompile-count} (swap! *compiler-state update :recompile-count inc)
-          throwable
-          (try
-            (compiler/recompile-form expr N repltag)
-            (trigger-reload)
-            nil
-            (catch Throwable t t))]
-      (when throwable
-        (if throwable-phase
-          ; failed handling error, throw it for good
-          (deliver p throwable)
-          (recur throwable :compilation))))))
-
-(defn repl [*repl-states {:keys [dart-version analyzer-info *compiler-state trigger-reload
-                                 repltag]}]
-  (binding [compiler/*dart-version* dart-version
-            compiler/*hosted* true
-            compiler/analyzer-info analyzer-info
-            compiler/dynamic-warning compiler/on-dynamic-warn
-            *in* (clojure.lang.LineNumberingPushbackReader. *in*)]
-    (compiler/with-cljd-reader
-      (try
-        (binding [compiler/*current-ns* 'cljd.core]
-          (loop [expr-or-throwable '(ns cljd.user
-                                      (:require #_[cljd.flutter.repl-impl]
-                                                [cljd.flutter.repl :refer [pick! mount!]]
-                                                [cljd.flutter :as f]
-                                                ["package:flutter/material.dart" :as m]))]
-            (locking *compiler-state
-              (let [p (promise)
-                    _ (swap! *repl-states assoc-in [repltag :ack!] #(deliver p %))
-                    _ (eval-to-repl repltag expr-or-throwable *compiler-state trigger-reload p)
-                    str-or-throwable @p]
-                (if (instance? Throwable str-or-throwable)
-                  (throw str-or-throwable)
-                  (set! compiler/*current-ns* (symbol str-or-throwable)))))
-            (let [x (try
-                      (compiler/read {:eof *in* :read-cond :allow :features #{:cljd}} *in*)
-                      (catch Throwable t t))]
-              (when-not (identical? *in* x)
-                (recur x)))))
-        (catch java.io.IOException e (throw e))
-        (catch Exception e
-          (println "REPL session terminated." (.getMessage e))
-          (st/print-stack-trace e))))))
-
 (defmacro ^:private daemon [& forms]
   `(doto (Thread. (fn [] ~@forms))
     (.setDaemon true)
     .start))
-
-(defn restartable-repl [*repl-states options]
-  (let [{:keys [cnt]} (swap! *repl-states update :cnt inc)
-        repltag (Long/toString cnt 36)
-        true-in *in*
-        true-out *out*
-        reset-repl-state!
-        (fn self []
-          (let [reader (java.io.PipedReader.)
-                writer (java.io.PipedWriter. reader)
-                [{prev repltag} {curr repltag}] (swap-vals! *repl-states
-                                                  assoc repltag
-                                                  {:out true-out
-                                                   :writer writer
-                                                   :reader reader
-                                                   :restart! self})]
-            (some-> ^java.io.Writer (:writer prev) .close)
-            curr))
-        {:keys [reader writer]} (reset-repl-state!)]
-
-    (daemon ; copy true-in to actual in of the repl
-      (let [^chars buffer (make-array Character/TYPE 1024)]
-        (loop [size 0 ^java.io.Writer writer writer]
-          (case size
-            -1 nil
-            0 (recur (.read true-in buffer) writer)
-            (if (try
-                  (.write writer buffer 0 size)
-                  true
-                  (catch java.io.IOException e
-                    (when-not (= "Pipe closed" (.getMessage e))
-                      (throw e))))
-              (recur 0 writer)
-              (recur size (:writer (@*repl-states repltag))))))))
-
-    (loop [reader reader]
-      (binding [*in* reader]
-        (repl *repl-states (assoc options :repltag repltag)))
-      (let [reader' (:reader (@*repl-states repltag))]
-        (when-not (identical? reader reader')
-          ; pipe cycled by a restart
-          (recur reader'))))))
-
 
 (defn bsearch
   "pred is monotonic false -> true through v.
@@ -419,37 +316,9 @@
           (println (str "Another ClojureDart process is running (PID " pid ")"))
           (System/exit 1))))))
 
-(defn parse-repl-line [line]
-  (when-some [[_ repltag mode cont text]
-              ; lines coming from flutter have this shape:
-              ; flutter: [id mode)>actual content_
-              ; where > is the continuation flag
-              ; and _ is a sentinel to prevent line trimming
-              ;
-              ; the mismatched brackets [id) are there on purpose so that's it's unlikely
-              ; to match some spurious output.
-              ;
-              ; The existing modes are: !, =, o, and e
-              ; resp. acknowledge, evaluation result, stdout, stderr
-              ;
-              ; The continuation flag can be either: space (or newline), /, or >
-              ; resp.:
-              ; - end of line (the newline is part of the output and the output must be flushed),
-              ; - flush (end of line is not part of the ouput and the output must be flushed)
-              ; - multiline (end of line is not part of the ouput and the output should not
-              ;   be flushed)
-              ;
-              ; The "flutter…: " prefix is OPTIONAL: on Android `flutter run` prefixes app
-              ; output with "I/flutter (pid): " (matched by .*?flutter.*?: ), but on web the
-              ; lines arrive BARE ("[id mode)…_"), so requiring the prefix left web REPL
-              ; output unrouted. The [id)…_ shape + sentinel keeps bare matching unambiguous.
-              (re-matches #"(?:.*?flutter.*?: )?\[([^ )]+) ([^)]*)\)(?:([>/ ])(.*))?_" line)]
-    {:repltag repltag :mode mode :cont (or cont " ") :text (or text "")}))
-
 (defn compile-cli
   [& {:keys [watch namespaces flutter] :or {watch false}}]
-  (let [*repl-states (atom {:cnt 0})
-        user-dir (System/getProperty "user.dir")
+  (let [user-dir (System/getProperty "user.dir")
         analyzer-dir (ensure-cljd-analyzer!)]
     (exec {:in nil :out nil} (some-> *deps* :cljd/opts :kind name) "pub" "get")
     (with-taps
@@ -536,7 +405,6 @@
                         true-out *out*
                         trigger-reload (fn ([] (.put q {:kind :reload}))
                                          ([done] (.put q {:kind :reload :done done})))
-                        *repl-port (atom nil)
                         vm-uri-p (promise)]   ; resolves with the app's VM-Service ws URI
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
@@ -695,45 +563,22 @@
 
                               (= :restarting state)
                               (do
-                                (doseq [[tag {:keys [restart! out]}] (dissoc @*repl-states :cnt)]
-                                  ;; same hazard as the dispatch write: a closed client
-                                  ;; socket here threw and killed the daemon. Isolate it.
-                                  (try
-                                    (binding [*out* out]
-                                      (println "\n\n;;;; App restarting. Abandon all state!\n"))
-                                    (restart!)
-                                    (catch java.io.IOException _
-                                      (swap! *repl-states dissoc tag))))
+                                (println (bright "\n\n;;;; App restarting. Abandon all state!\n"))
                                 (recur :waiting-end-of-restart pending-reload pending-done))
 
                               :else
                               (let [{:keys [kind line done]} (.take q)
                                     line (some-> line smap-line)
-                                    {:keys [repltag mode cont text]} (some-> line parse-repl-line)
-                                    is-ready-message (and (= repltag "*") (= mode "RDY"))]
-                                (when-not (or
-                                            (nil? line)
-                                            (= :reload-failed state)
-                                            is-ready-message)
-                                  (if-some [{:keys [^java.io.Writer out ack!]}
-                                            (@*repl-states repltag)]
-                                    ;; A disconnected REPL client leaves a closed
-                                    ;; socket writer; writing to it threw and killed
-                                    ;; the whole dispatch daemon (taking down output
-                                    ;; routing for every session). Isolate the failure:
-                                    ;; drop the dead session and keep the daemon alive.
-                                    (try
-                                      (case mode
-                                        "!" (ack! text)
-                                        ("=" "o" "e")
-                                        (doto out
-                                          (.write text)
-                                          (cond->
-                                              (= cont " ") (doto (.write "\n"))
-                                              (not= cont ">") (doto .flush))))
-                                      (catch java.io.IOException _
-                                        (swap! *repl-states dissoc repltag)))
-                                    (println line)))
+                                    ;; repl-hud prints "[* RDY)_" once the app root mounts;
+                                    ;; it marks the end of a hot restart (see :waiting-end-of-restart).
+                                    is-ready-message (some-> line (.contains "[* RDY)"))]
+                                ;; flutter's own stdout (build/reload messages, app println —
+                                ;; the latter also reaches the nREPL via VM-Service streams)
+                                ;; just echoes to the build console now; no socket routing.
+                                (when (and line
+                                           (not= :reload-failed state)
+                                           (not is-ready-message))
+                                  (println line))
 
                                 (case kind
                                   :reload (recur state true (or done pending-done))
@@ -780,30 +625,8 @@
                                             (deliver pending-done (boolean reload-done?)))
                                         pending-done (if (and pending-done (or reload-done? reload-fail?))
                                                        nil pending-done)]
-                                    (when is-ready-message
-                                      (when-some [port @*repl-port]
-                                        (newline)
-                                        (println (title "🤫 ClojureDart REPL")
-                                          (cond->> "listening on port"
-                                            (pos? (:restart-count @*compiler-state)) (str "still "))
-                                          (title port))
-                                        (newline)))
                                     (recur (or state' state) pending-reload pending-done)))))))))
 
-                    (let [^java.net.ServerSocket socket
-                          (server/start-server {:port 0 :name "CLJD repl" :accept 'cljd.build/restartable-repl
-                                                :args [*repl-states
-                                                       {:dart-version compiler/*dart-version*
-                                                        :analyzer-info compiler/analyzer-info
-                                                        :*compiler-state *compiler-state
-                                                        :trigger-reload trigger-reload}]})
-                          port (.getLocalPort socket)]
-                      (reset! *repl-port port)
-                      (doto (java.io.File. "REPL.lock")
-                        .deleteOnExit
-                        (spit (str port " " (-> (java.lang.ProcessHandle/current) .pid) "\n")))
-                      #_#_(println (title "ClojureDart REPL (experimental 💥)") "listening on port" (title port))
-                      (newline))
                     (watch-dirs-until (fn [_] (some-> p .isAlive not)) nil dirs (compile-files flutter-stdin))
                     (when p
                       (println (str "💀 Flutter sub-process exited with " (.exitValue p)))))

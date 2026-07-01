@@ -5175,11 +5175,10 @@
             (when-not (nses-before ns-name) ; new ns
               (binding [*host-eval* true] (emit-ns form {}))
               (binding [*host-eval* false] (emit-ns form {})))
-            (binding [*recompile-count* recompile-count
-                      *locals-gen* {}
-                      *dart-out* *out*]
-              (emit `(cljd.flutter.repl-impl/form-exec
-                       (cljd.flutter/dispatch-to-repl! ~repltag (fn [] (set! cljd.core/*ns* '~ns-name)) :tooling)) {})))
+            ;; The VM-Service nREPL tracks *current-ns* host-side and reloads the
+            ;; recompiled lib via Flutter hot reload; no in-app runtime *ns* set or
+            ;; form-exec execution hook is needed (the old socket REPL needed both).
+            nil)
 
           ; regular form
           (let [current-ns *current-ns*
@@ -5200,8 +5199,11 @@
             (binding [*recompile-count* recompile-count]
               (binding [*locals-gen* {}
                         *dart-out* *out*]
-                (emit `(cljd.flutter.repl-impl/form-exec
-                         (cljd.flutter/dispatch-to-repl! ~repltag (fn [] ~form) :user)) {}))
+                ;; Emit the form as ordinary top-level code; Flutter hot reload
+                ;; brings it into the live app. The old socket REPL wrapped this in
+                ;; form-exec/dispatch-to-repl! to re-execute and route output — the
+                ;; nREPL gets values via `evaluate` and output via VM-Service streams.
+                (emit form {}))
 
               ; Prior to recompilation of nses-to-recompile, remove them and
               ; their contributions to extension points so that we don't have
