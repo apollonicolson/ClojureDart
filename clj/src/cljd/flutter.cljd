@@ -1480,10 +1480,10 @@
                     (swap! *pos (fn [^widgets/Offset o]
                                   (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
                                                   (+ (.-dy o) (.-dy (.-delta d)))))))
-            ;; the drag handle: TAP toggles collapse/expand, DRAG moves. Used in both states.
+            ;; the handle just TAPS to collapse/expand now — dragging is handled by the
+            ;; whole-toolbar pan detector below, so you can drag from anywhere.
             handle (widgets/GestureDetector
                      .onTap (fn [] (swap! *collapsed not) nil)   ; :watch rebuilds; no reassemble
-                     .onPanUpdate drag!
                      .child (widgets/Padding
                               .padding (widgets/EdgeInsets.all 10.0)
                               .child (widgets/Icon
@@ -1501,11 +1501,12 @@
          ;; EdgeInsets asserts non-negative insets, so dragging off-left red-screened — and
          ;; the error-recovery rebuild duplicated the toolbar. This positions freely instead.
          (widgets/Transform.translate
-          ;; clamp AT RENDER → any :pos (persisted, dragged, or set) is always on-screen,
-          ;; so the handle stays grabbable and a stale off-screen value self-heals.
+          ;; clamp AT RENDER → any :pos (persisted, dragged, or set) is always on-screen with
+          ;; a margin, so the handle stays grabbable and a stale off-screen value self-heals.
+          ;; +edge-pad+ keeps it off the edges; -56 keeps the handle (44) + pad visible.
           .offset (widgets/Offset
-                    (.clamp (.-dx ^widgets/Offset pos) 0.0 (- (nth screen 0) 44.0))
-                    (.clamp (.-dy ^widgets/Offset pos) 0.0 (- (nth screen 1) 44.0)))
+                    (.clamp (.-dx ^widgets/Offset pos) 12.0 (max 12.0 (- (nth screen 0) 56.0)))
+                    (.clamp (.-dy ^widgets/Offset pos) 12.0 (max 12.0 (- (nth screen 1) 56.0))))
           .child
           ;; NoDebugPaint suppresses global debug-paint flags on this subtree so the tools
           ;; don't frame themselves. Above MaterialApp → also carry our own Directionality
@@ -1514,7 +1515,12 @@
            (widgets/Directionality
             .textDirection widgets/TextDirection.ltr
             .child
-            (widgets/Container
+            ;; whole toolbar is draggable — pan anywhere moves it; button taps still tap
+            ;; (Flutter's arena: no movement → button onTap, movement → this pan).
+            (widgets/GestureDetector
+             .onPanUpdate drag!
+             .child
+             (widgets/Container
                 .decoration (widgets/BoxDecoration
                               .color (widgets/Color 0xF2101418)
                               .borderRadius (widgets/BorderRadius.circular 22.0))
@@ -1547,7 +1553,7 @@
                              (fn [] (set! rendering/debugPaintPointersEnabled
                                           (not rendering/debugPaintPointersEnabled))))])
                      ;; self-watching → rebuilds on any pick change, no reassemble
-                     (repl-selections)])))))))))))
+                     (repl-selections)]))))))))))))
 
 (defn- fmt-val
   "Render an env value for the inspector: deref atoms to show the live value."
