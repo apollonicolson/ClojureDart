@@ -10,8 +10,11 @@
 (def ^:private history-reads
   "*1/*2/*3 are ^:dynamic in cljd.core and their `set!` can't persist across separate
    `evaluate` calls (no shared binding frame). So history lives in plain holder vars and
-   reads of *1/*2/*3 in user forms are rewritten to them."
-  '{*1 cljd.core/+cljd-repl-h1+ *2 cljd.core/+cljd-repl-h2+ *3 cljd.core/+cljd-repl-h3+})
+   reads of *1/*2/*3 (and *env, the picked widget's scope map) are rewritten to them."
+  '{*1   cljd.core/+cljd-repl-h1+
+    *2   cljd.core/+cljd-repl-h2+
+    *3   cljd.core/+cljd-repl-h3+
+    *env cljd.core/+cljd-repl-env+})
 
 (def ^:private toplevel-ops
   "Form heads (by name, ns-ignored) that introduce/change top-level program code and

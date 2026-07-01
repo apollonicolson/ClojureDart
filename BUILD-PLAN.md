@@ -271,8 +271,24 @@ VM-Service-answerable through the hybrid as built.
 - **`complete`** — nREPL op over `@nses`: defs are direct symbol keys of the ns map (NOT
   `:mappings`, which holds referred/aliased names) — gather both for the ns + cljd.core. Proven:
   "map"→map/mapv/mapcat/…, "redu"→reduce/reduced/…
-- Gap left for Slice 1b: `info`/`eldoc` (arglists/doc) — needs the exact def-meta shape, best read
-  from a live `@nses` mapping during the next device cycle rather than guessed.
+## Slice 1b + 2a — DONE 2026-07-01, device-validated (Pixel 8 Pro)
+- **`info` / `eldoc` / `lookup`** — host-side from `@nses`. A def's info is `(get-in @nses [ns sym])`
+  with `:meta` carrying `:doc` + `:arglists` (the latter stored *quoted*, `'(...)`, so unwrap).
+  Proven: `info map` → arglists + the lazy-seq docstring; `eldoc assoc` → `[["map" "key" "val"]
+  ["map" "key" "val" "&" "kvs"]]`.
+- **`*env` scope access (Slice 2a, mechanism-A-lite)** — the picker already captures the widget's
+  live `get_envmap`; the pick callback now stores `:env`, `(picked)` copies it into the cljd.core
+  holder `+cljd-repl-env+`, and `*env` in user forms is `postwalk`-rewritten to that holder (same
+  mechanism as *1/*2/*3). Proven: pick→tap→`(picked)` → `(some? *env)`=true, `(count *env)`=9
+  (nav widget's `selected-index`/`current-index`/…). `(get *env "selected-index")` now resolves.
+
+Device-instability note: the Pixel dozes → hot-restarts the app → the nREPL's cached isolate
+goes stale (evals return nil). Fix during validation: `adb shell svc power stayon true` +
+`cmd statusbar collapse` to keep it awake and foreground. (A durable fix is reconnect-on-restart
+in the nREPL — deferred.)
+
+Remaining Slice 2b: bare-local resolution (`(with-picked …)` let-wrap over env-keys), `mount!`,
+`ancestors`. Then Slices 3–4 (overlay UI).
 2. **Editor-parity audit** (the 4th research pass): our nREPL handles `{clone, ls-sessions,
    describe, interrupt, close, eval}` only — missing `complete`/`info`/`eldoc`/`lookup`/
    `load-file`, the ops CIDER/Calva/clojure-mcp use for completion/docs/jump. Answerable

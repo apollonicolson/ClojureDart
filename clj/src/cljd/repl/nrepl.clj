@@ -33,6 +33,21 @@
 (defn- ns-exists? [ns-sym]
   (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
 
+(defn- sym-info
+  "Look up SYM (maybe ns-qualified) in @nses relative to CUR-NS. A def's info is stored
+   at [ns sym] with :meta carrying :doc/:arglists/:macro (compiler/do-def). Falls back to
+   cljd.core. Returns {:ns :name :arglists :doc :macro?} or nil."
+  [nses cur-ns sym]
+  (let [ns'  (if-let [n (namespace sym)] (symbol n) cur-ns)
+        nm   (symbol (name sym))
+        info (or (get-in nses [ns' nm]) (get-in nses ['cljd.core nm]))
+        m    (:meta info)
+        ;; :arglists is stored as the quoted form '(...); unwrap to the raw list of vectors.
+        al   (let [a (:arglists m)] (if (and (seq? a) (= 'quote (first a))) (second a) a))]
+    (when info
+      {:ns (name (:ns info)) :name (name (:name info))
+       :arglists al :doc (:doc m) :macro? (boolean (:macro m))})))
+
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
@@ -43,7 +58,8 @@
         "clone"       (transport/send transport {:id id :new-session (str (UUID/randomUUID)) :status ["done"]})
         "ls-sessions" (send! {:sessions [] :status ["done"]})
         "describe"    (send! {:ops (zipmap ["clone" "describe" "eval" "close" "ls-sessions"
-                                            "interrupt" "complete"] (repeat {}))
+                                            "interrupt" "complete" "info" "lookup" "eldoc"]
+                                           (repeat {}))
                               :versions {:cljd {:major 0 :minor 1}} :status ["done"]})
         "interrupt"   (send! {:status ["done" "interrupted"]})
         "close"       (send! {:status ["done" "session-closed"]})
@@ -63,6 +79,22 @@
                           sort (take 100)
                           (mapv (fn [c] {:candidate c :ns (name ns-sym)})))]
           (send! {:completions cands :status ["done"]}))
+        ;; symbol info / doc — arglists + docstring from the def's stored :meta.
+        ("info" "lookup")
+        (let [i (sym-info @compiler/nses @*current-ns (symbol (or (:symbol msg) (:sym msg) "")))]
+          (if i
+            (send! {:name (:name i) :ns (:ns i)
+                    :arglists-str (if (:arglists i) (pr-str (:arglists i)) "")
+                    :doc (or (:doc i) "")
+                    :status ["done"]})
+            (send! {:status ["done" "no-info"]})))
+        "eldoc"
+        (let [i (sym-info @compiler/nses @*current-ns (symbol (or (:symbol msg) (:sym msg) "")))]
+          (if (and i (:arglists i))
+            (send! {:name (:name i) :ns (:ns i) :type "function"
+                    :eldoc (mapv (fn [al] (mapv str al)) (:arglists i))
+                    :status ["done"]})
+            (send! {:status ["done" "no-eldoc"]})))
         "eval"
         (binding [compiler/*hosted* true
                   compiler/*dart-version* dart-version
@@ -117,7 +149,13 @@
                           target (try (read-string (:value loc-r)) (catch Throwable _ nil))
                           full-r (repl-eval/eval-form client iso-id
                                    '(cljd.core/deref cljd.flutter/+cljd-repl-picked+)
-                                   {:ns-lib-uri "cljd/flutter.dart"})]
+                                   {:ns-lib-uri "cljd/flutter.dart"})
+                          ;; load the picked widget's scope map into *env (cljd.core holder)
+                          ;; so `*env` / `(get *env "local")` resolve in subsequent evals.
+                          _ (repl-eval/eval-form client iso-id
+                              '(set! cljd.core/+cljd-repl-env+
+                                     (:env (cljd.core/deref cljd.flutter/+cljd-repl-picked+)))
+                              {:ns-lib-uri "cljd/flutter.dart"})]
                       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
                       (send! {:value (:value full-r) :ns (name @*current-ns)}))
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the

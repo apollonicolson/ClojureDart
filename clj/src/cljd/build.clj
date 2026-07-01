@@ -504,6 +504,9 @@
                                                     (def +cljd-repl-h1+ nil)
                                                     (def +cljd-repl-h2+ nil)
                                                     (def +cljd-repl-h3+ nil)
+                                                    ;; *env: the picked widget's lexical scope map,
+                                                    ;; loaded by (picked). Read via the *env rewrite.
+                                                    (def +cljd-repl-env+ nil)
                                                     (defn +cljd-repl-remember [v]
                                                       (set! +cljd-repl-h3+ +cljd-repl-h2+)
                                                       (set! +cljd-repl-h2+ +cljd-repl-h1+)
@@ -538,6 +541,7 @@
                                                                 (let [w (.-widget (.-context state))]
                                                                   (reset! +cljd-repl-picked+
                                                                     {:loc (.-source_loc w)
+                                                                     :env ((.-get_envmap w))
                                                                      :env-keys (vec (keys ((.-get_envmap w))))})))))
                                                           (if on? "picker ON — tap a widget on the device" "picker off"))))
                                                    {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload})))
