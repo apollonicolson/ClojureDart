@@ -287,8 +287,27 @@ goes stale (evals return nil). Fix during validation: `adb shell svc power stayo
 `cmd statusbar collapse` to keep it awake and foreground. (A durable fix is reconnect-on-restart
 in the nREPL — deferred.)
 
-Remaining Slice 2b: bare-local resolution (`(with-picked …)` let-wrap over env-keys), `mount!`,
-`ancestors`. Then Slices 3–4 (overlay UI).
+## Slice 3 capability — PROVEN via REPL 2026-07-01 (no code needed)
+The verified debug flags toggle live from the REPL today — the overlay is *sugar over evals
+that already work*. Proven on device: `(in-ns 'cljd.flutter)` then
+`(set! rendering/debugPaintSizeEnabled true)` → true (reads back true);
+`(.reassembleApplication (widgets/WidgetsBinding.instance))` → executes; same for
+`debugRepaintRainbowEnabled`; reset to false. So the "debug-flag toolbar" is a UI convenience
+over `set!`+reassemble, not new capability. (Tree-dump via `dart:developer/log` needs the alias
+required in the eval ns — minor.)
+
+## Remaining
+- **Slice 2b** — bare-local resolution (`(with-picked …)` let-wrap over the reported env-keys),
+  `mount!` (live widget hot-swap — riskiest), `ancestors` (widget diagnostic chain).
+- **Slices 3–4 (overlay UI)** — the draggable in-app panel: buttons wiring the (proven) debug-flag
+  toggles + `pick!` + a navigable value inspector + live probes. This is the one genuinely large
+  new-code piece (cljd.flutter widget work + several device cycles) — best as its own focused
+  effort now that every underlying capability it needs is proven.
+
+## Durable follow-ups surfaced during Slices
+- nREPL reconnect-on-hot-restart (the isolate goes stale on restart → evals return nil; worked
+  around with `svc power stayon true`).
+- `info`/`complete` currently only reach nses actually compiled into the app.
 2. **Editor-parity audit** (the 4th research pass): our nREPL handles `{clone, ls-sessions,
    describe, interrupt, close, eval}` only — missing `complete`/`info`/`eldoc`/`lookup`/
    `load-file`, the ops CIDER/Calva/clojure-mcp use for completion/docs/jump. Answerable
