@@ -1326,6 +1326,67 @@
         (println (str "CLJD_PICK " (dec (count after)) " " src))))
     (nudge-rebuild!)))
 
+(defn- repl-selections-column
+  "The picks list for the dev panel: a 'N picked' header (× clears all) then one row per
+   pick — color swatch · type · resolved .cljd (green) or Dart wloc (white) · scope · a
+   per-row ×. Shared so the panel and the standalone inspector render identically."
+  [picks]
+  (widgets/Column
+    .mainAxisSize widgets/MainAxisSize.min
+    .crossAxisAlignment widgets/CrossAxisAlignment.start
+    .children
+    (into
+      [(widgets/Row
+         .mainAxisSize widgets/MainAxisSize.min
+         .children
+         [(widgets/Text (str (count picks) " picked")
+            .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
+          (widgets/SizedBox .width 12.0)
+          (widgets/GestureDetector
+            .onTap (fn [] (reset! +cljd-picks+ []) (nudge-rebuild!))
+            .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
+       (widgets/SizedBox .height 6.0)]
+      (map-indexed
+        (fn [i p]
+          (widgets/Padding
+            .padding (widgets/EdgeInsets.symmetric .vertical 1.0)
+            .child
+            (widgets/Row
+              .mainAxisSize widgets/MainAxisSize.min
+              .children
+              [(widgets/Container
+                 .width 10.0 .height 10.0
+                 .decoration (widgets/BoxDecoration .color (pick-color i)
+                               .shape widgets/BoxShape.circle))
+               (widgets/SizedBox .width 8.0)
+               (widgets/ConstrainedBox
+                 .constraints (widgets/BoxConstraints .maxWidth 280.0)
+                 .child
+                 (widgets/Column
+                   .mainAxisSize widgets/MainAxisSize.min
+                   .crossAxisAlignment widgets/CrossAxisAlignment.start
+                   .children
+                   ;; primary: type + resolved .cljd (green) or Dart wloc fallback (white)
+                   [(widgets/Text (str (inc i) ". " (:type p)
+                                    (when-let [loc (or (:cljd p) (:src (:wloc p)))]
+                                      (str "  ·  " loc)))
+                      .overflow widgets/TextOverflow.ellipsis
+                      .style (widgets/TextStyle
+                               .color (if (:cljd p) (widgets/Color 0xFF00E676) material/Colors.white)
+                               .fontSize 12.0))
+                    ;; secondary: enclosing repl-point scope (clean .cljd, coarse) + widget name
+                    (widgets/Text (let [l (:loc p)]
+                                    (str "scope " (:ns l) ":" (:line l)
+                                         (when-let [wl (:wloc p)]
+                                           (when (:name wl) (str "  ·  " (:name wl))))))
+                      .overflow widgets/TextOverflow.ellipsis
+                      .style (widgets/TextStyle .color material/Colors.white38 .fontSize 10.0))]))
+               (widgets/SizedBox .width 8.0)
+               (widgets/GestureDetector
+                 .onTap (fn [] (remove-pick! p) nil)
+                 .child (widgets/Icon material/Icons.close .color material/Colors.white38 .size 14.0))])))
+        picks))))
+
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
    hook — the pick button arms/disarms it. Toggles show active state (green tint+highlight);
@@ -1352,11 +1413,26 @@
       :watch [pos *pos
               collapsed *collapsed
               hidden +cljd-toolbar-hidden+]
-      ;; free drag: shared by the collapsed handle and the expanded drag grip.
-      :let [drag! (fn [^widgets/DragUpdateDetails d]
+      ;; picks: deref'd inline (not :watch) — reassemble from capture-pick!/auto-resolve
+      ;; drives the rebuild, matching how module atoms are handled elsewhere here.
+      :let [picks @+cljd-picks+
+            drag! (fn [^widgets/DragUpdateDetails d]
                     (swap! *pos (fn [^widgets/Offset o]
                                   (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
-                                                  (+ (.-dy o) (.-dy (.-delta d)))))))]
+                                                  (+ (.-dy o) (.-dy (.-delta d)))))))
+            ;; the drag handle: TAP toggles collapse/expand, DRAG moves. Used in both states.
+            handle (widgets/GestureDetector
+                     .onTap (fn [] (swap! *collapsed not)
+                              (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
+                     .onPanUpdate drag!
+                     .child (widgets/Padding
+                              .padding (widgets/EdgeInsets.all 10.0)
+                              .child (widgets/Icon
+                                       (if collapsed material/Icons.developer_mode
+                                           material/Icons.drag_indicator)
+                                       .color (if collapsed (widgets/Color 0xFF00E676)
+                                                  material/Colors.white54)
+                                       .size 20.0)))]
       (if hidden
        (widgets/SizedBox.shrink)
        (widgets/Padding
@@ -1378,41 +1454,38 @@
                               .color (widgets/Color 0xF2101418)
                               .borderRadius (widgets/BorderRadius.circular 22.0))
                 .child
-                ;; The drag handle is the toggle: TAP collapses/expands, DRAG moves.
-                ;; Collapsed → handle only (green developer_mode); expanded → handle
-                ;; (grey grip) + the tool buttons. No separate collapse button.
-                (widgets/Row
-                  .mainAxisSize widgets/MainAxisSize.min
-                  .children
-                  (into
-                    [(widgets/GestureDetector
-                       .onTap (fn [] (swap! *collapsed not)
-                                (.reassembleApplication (widgets/WidgetsBinding.instance)) nil)
-                       .onPanUpdate drag!
-                       .child (widgets/Padding
-                                .padding (widgets/EdgeInsets.all 10.0)
-                                .child (widgets/Icon
-                                         (if collapsed material/Icons.developer_mode
-                                             material/Icons.drag_indicator)
-                                         .color (if collapsed (widgets/Color 0xFF00E676)
-                                                    material/Colors.white54)
-                                         .size 20.0)))]
-                    (if collapsed
-                      []
-                      [(btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
-                            (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
-                       (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
-                            (fn [] (set! rendering/debugPaintSizeEnabled
-                                         (not rendering/debugPaintSizeEnabled))))
-                       (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
-                            (fn [] (set! rendering/debugRepaintRainbowEnabled
-                                         (not rendering/debugRepaintRainbowEnabled))))
-                       (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
-                            (fn [] (set! rendering/debugPaintBaselinesEnabled
-                                         (not rendering/debugPaintBaselinesEnabled))))
-                       (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
-                            (fn [] (set! rendering/debugPaintPointersEnabled
-                                         (not rendering/debugPaintPointersEnabled))))]))))))))))))
+                ;; Collapsed → just the handle. Expanded → a panel: the tools row on top,
+                ;; the live selections (picks + resolved cljd source) below. One draggable,
+                ;; collapsible unit — the toolbar and inspector are the same thing now.
+                (if collapsed
+                  handle
+                  (widgets/Column
+                    .mainAxisSize widgets/MainAxisSize.min
+                    .crossAxisAlignment widgets/CrossAxisAlignment.start
+                    .children
+                    (into
+                      [(widgets/Row
+                         .mainAxisSize widgets/MainAxisSize.min
+                         .children
+                         [handle
+                          (btn "cljd-tb-pick" material/Icons.highlight_alt (some? @*hud-enabled)
+                               (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
+                          (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
+                               (fn [] (set! rendering/debugPaintSizeEnabled
+                                            (not rendering/debugPaintSizeEnabled))))
+                          (btn "cljd-tb-repaint" material/Icons.gradient rendering/debugRepaintRainbowEnabled
+                               (fn [] (set! rendering/debugRepaintRainbowEnabled
+                                            (not rendering/debugRepaintRainbowEnabled))))
+                          (btn "cljd-tb-baseline" material/Icons.text_fields rendering/debugPaintBaselinesEnabled
+                               (fn [] (set! rendering/debugPaintBaselinesEnabled
+                                            (not rendering/debugPaintBaselinesEnabled))))
+                          (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
+                               (fn [] (set! rendering/debugPaintPointersEnabled
+                                            (not rendering/debugPaintPointersEnabled))))])]
+                      (when (seq picks)
+                        [(widgets/Padding
+                           .padding (widgets/EdgeInsets.only .left 10.0 .right 10.0 .bottom 10.0)
+                           .child (repl-selections-column picks))])))))))))))))
 
 (defn- fmt-val
   "Render an env value for the inspector: deref atoms to show the live value."
@@ -1446,87 +1519,6 @@
                   paint)))
             nil)
           (shouldRepaint [_ _] true))))))
-
-(defn repl-inspector
-  "Bottom panel listing all picked widgets (+cljd-picks+): 'N. type · ns:line:col' per pick.
-   Appears when anything is picked; × clears all. The full env per pick is in @+cljd-picks+
-   (which the REPL reads) — pick several widgets to point at multiple things at once."
-  []
-  (widget
-    :watch [picks +cljd-picks+]
-    :when (seq picks)
-    (widgets/Directionality
-      .textDirection widgets/TextDirection.ltr
-      .child
-      (widgets/Align
-        .alignment widgets/Alignment.bottomCenter
-        .child
-        (NoDebugPaint
-         (widgets/Container
-           .margin (widgets/EdgeInsets.all 12.0)
-           .padding (widgets/EdgeInsets.all 12.0)
-           .decoration (widgets/BoxDecoration
-                         .color (widgets/Color 0xF2101418)
-                         .borderRadius (widgets/BorderRadius.circular 16.0))
-           .child
-           (widgets/Column
-             .mainAxisSize widgets/MainAxisSize.min
-             .crossAxisAlignment widgets/CrossAxisAlignment.start
-             .children
-             (into
-               [(widgets/Row
-                  .mainAxisSize widgets/MainAxisSize.min
-                  .children
-                  [(widgets/Text (str (count picks) " picked")
-                     .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
-                   (widgets/SizedBox .width 12.0)
-                   (widgets/GestureDetector
-                     .onTap (fn [] (reset! +cljd-picks+ []) (nudge-rebuild!))
-                     .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
-                (widgets/SizedBox .height 6.0)]
-               (map-indexed
-                 (fn [i p]
-                   (widgets/Padding
-                     .padding (widgets/EdgeInsets.symmetric .vertical 1.0)
-                     .child
-                     (widgets/Row
-                       .mainAxisSize widgets/MainAxisSize.min
-                       .children
-                       [(widgets/Container
-                          .width 10.0 .height 10.0
-                          .decoration (widgets/BoxDecoration .color (pick-color i)
-                                        .shape widgets/BoxShape.circle))
-                        (widgets/SizedBox .width 8.0)
-                        (widgets/ConstrainedBox
-                          .constraints (widgets/BoxConstraints .maxWidth 280.0)
-                          .child
-                          (widgets/Column
-                            .mainAxisSize widgets/MainAxisSize.min
-                            .crossAxisAlignment widgets/CrossAxisAlignment.start
-                            .children
-                            ;; primary: what you pointed at + where it's written. Prefer the
-                            ;; host-resolved .cljd source (:cljd, pushed by the (picks) op);
-                            ;; fall back to the on-device Dart wloc until it's resolved.
-                            [(widgets/Text (str (inc i) ". " (:type p)
-                                             (when-let [loc (or (:cljd p) (:src (:wloc p)))]
-                                               (str "  ·  " loc)))
-                               .overflow widgets/TextOverflow.ellipsis
-                               .style (widgets/TextStyle
-                                        .color (if (:cljd p) (widgets/Color 0xFF00E676) material/Colors.white)
-                                        .fontSize 12.0))
-                             ;; secondary: enclosing repl-point scope (clean .cljd, coarse)
-                             (widgets/Text (let [l (:loc p)]
-                                             (str "scope " (:ns l) ":" (:line l)
-                                                  (when-let [wl (:wloc p)]
-                                                    (when (:name wl) (str "  ·  " (:name wl))))))
-                               .overflow widgets/TextOverflow.ellipsis
-                               .style (widgets/TextStyle .color material/Colors.white38 .fontSize 10.0))]))
-                        (widgets/SizedBox .width 8.0)
-                        (widgets/GestureDetector
-                          .onTap (fn [] (remove-pick! p) nil)
-                          .child (widgets/Icon material/Icons.close
-                                   .color material/Colors.white38 .size 14.0))])))
-                 picks)))))))))
 
 (defn repl-hud [child]
   (widget
@@ -1625,8 +1617,8 @@
                  [this old]
                  true))))
        (repl-pick-highlight)
-       (repl-toolbar *hud-enabled)
-       (repl-inspector)])))
+       ;; toolbar + inspector unified: selections live inside the expanded panel now.
+       (repl-toolbar *hud-enabled)])))
 
 (defmacro run
   "Starts an application, takes a widget body and uses it as the application root widget.
