@@ -1242,6 +1242,15 @@
 ;; repl-hud's Listener hit-tests taps and its CustomPainter draws the magenta highlight.
 (defonce +cljd-hud-enabled+ (atom nil))
 
+;; The last picked widget: {:loc {:ns :line :column} :env {sym value}} — shown by repl-inspector.
+(defonce +cljd-picked+ (atom nil))
+
+(defn- capture-pick!
+  "Pick callback: capture the tapped widget's source-loc + lexical env into +cljd-picked+."
+  [^ReplState state]
+  (let [^ReplPointWidget w (.-widget state)]
+    (reset! +cljd-picked+ {:loc (.-source_loc w) :env ((.-get_envmap w))})))
+
 (defn repl-toolbar
   "A draggable in-app debug toolbar (kDebugMode only). `*hud-enabled` is repl-hud's picker
    hook — the pick button arms/disarms it. Toggles show active state (green tint+highlight);
@@ -1301,11 +1310,7 @@
                               .child (widgets/Icon material/Icons.drag_indicator
                                        .color material/Colors.white54 .size 20.0)))
                    (btn "cljd-tb-pick" material/Icons.ads_click (some? @*hud-enabled)
-                        (fn [] (reset! *hud-enabled
-                                 (when-not @*hud-enabled
-                                   (fn [^ReplState state]
-                                     (println "; picked"
-                                       (.-source_loc ^ReplPointWidget (.-widget state))))))))
+                        (fn [] (reset! *hud-enabled (when-not @*hud-enabled capture-pick!))))
                    (btn "cljd-tb-paint" material/Icons.grid_4x4 rendering/debugPaintSizeEnabled
                         (fn [] (set! rendering/debugPaintSizeEnabled
                                      (not rendering/debugPaintSizeEnabled))))
@@ -1318,6 +1323,50 @@
                    (btn "cljd-tb-pointers" material/Icons.touch_app rendering/debugPaintPointersEnabled
                         (fn [] (set! rendering/debugPaintPointersEnabled
                                      (not rendering/debugPaintPointersEnabled))))]))))))))))
+
+(defn repl-inspector
+  "Bottom panel showing the picked widget's source-loc + lexical env (from +cljd-picked+).
+   Appears when something is picked; the × clears it. Gensym locals are hidden."
+  []
+  (widget
+    :watch [picked +cljd-picked+]
+    :when picked
+    (widgets/Directionality
+      .textDirection widgets/TextDirection.ltr
+      .child
+      (widgets/Align
+        .alignment widgets/Alignment.bottomCenter
+        .child
+        (NoDebugPaint
+         (widgets/Container
+           .margin (widgets/EdgeInsets.all 12.0)
+           .padding (widgets/EdgeInsets.all 12.0)
+           .decoration (widgets/BoxDecoration
+                         .color (widgets/Color 0xF2101418)
+                         .borderRadius (widgets/BorderRadius.circular 16.0))
+           .child
+           (widgets/Column
+             .mainAxisSize widgets/MainAxisSize.min
+             .crossAxisAlignment widgets/CrossAxisAlignment.start
+             .children
+             (into
+               [(widgets/Row
+                  .mainAxisSize widgets/MainAxisSize.min
+                  .children
+                  [(widgets/Text (let [l (:loc picked)] (str (:ns l) ":" (:line l) ":" (:column l)))
+                     .style (widgets/TextStyle .color (widgets/Color 0xFF00E676) .fontSize 13.0))
+                   (widgets/SizedBox .width 12.0)
+                   (widgets/GestureDetector
+                     .onTap (fn [] (reset! +cljd-picked+ nil) nil)
+                     .child (widgets/Icon material/Icons.close .color material/Colors.white54 .size 18.0))])
+                (widgets/SizedBox .height 6.0)]
+               (comp
+                 (remove (fn [[k _]] (.endsWith (str k) "__auto__")))
+                 (map (fn [[k v]]
+                        (let [sv (str v)]
+                          (widgets/Text (str k " = " (if (> (count sv) 50) (str (subs sv 0 50) "…") sv))
+                            .style (widgets/TextStyle .color material/Colors.white .fontSize 12.0))))))
+               (:env picked)))))))))
 
 (defn repl-hud [child]
   (widget
@@ -1412,7 +1461,8 @@
              (shouldRepaint
                  [this old]
                  true))))
-       (repl-toolbar *hud-enabled)])))
+       (repl-toolbar *hud-enabled)
+       (repl-inspector)])))
 
 (defmacro run
   "Starts an application, takes a widget body and uses it as the application root widget.

@@ -369,10 +369,20 @@ rebuild, same nREPL port. PROVEN: changed the toolbar color, saw it live without
 `false` + reassemble shows it. (The `:watch` on the module atom doesn't auto-rebuild — needs the
 reassemble; minor. A :managed/global-notifier would fix the auto-refresh.)
 
+## Value inspector (Phase 2 flagship) — DONE 2026-07-01, screenshot-validated
+`repl-inspector` (a repl-hud Stack child) watches `+cljd-picked+` and shows a bottom panel:
+source-loc header (green) + × to clear, then the picked widget's lexical env as `key = value`
+rows (gensym `*__auto__` locals hidden, long values truncated). The pick callback `capture-pick!`
+stores `{:loc (.-source_loc w) :env ((.-get_envmap w))}`; both the toolbar pick button and the
+REPL (`(reset! +cljd-hud-enabled+ capture-pick!)`) arm it. PROVEN: picked kora.nav:182:5 →
+panel showed `ctx = widget_home_screen…`, `selected-index = Instance of 'Atom'`, `current-index = 0`.
+Built entirely via hot-reload (no rebuild).
+
 ## Remaining (overlay Phase 2 / Slice 4)
-- pick highlight: expose pick-arming as a REPL-controllable module atom so the picker (which
-  already draws magenta highlight rects) arms from both the toolbar button and the REPL, and is
-  robustly testable (the toolbar button is above MaterialApp → not flutter_driver-tappable).
+- Inspector polish: deref atoms to show values, drill into nested data (Portal/Reveal style),
+  bottom safe-area padding, eval-in-scope (bind the picked env so `selected-index` resolves in eval).
+- Finer highlight: card-level needs app-side `f/widget` instrumentation (repl-points).
+- Live probes, per-widget `toImage` previews. Slice 2b (mount!/ancestors/bare-local).
 pick! button in the toolbar (needs REPL-injected `+cljd-repl-pick!` OR a self-contained arm),
 navigable value inspector, live probes, per-widget `toImage` previews. And Slice 2b
 (mount!/ancestors/bare-local). Default toolbar pos overlaps the search bar slightly (draggable).
