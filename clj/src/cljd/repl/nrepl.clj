@@ -162,19 +162,19 @@
                     ;; track-widget-creation, a cljd-out Dart line) resolved to its .cljd
                     ;; source line via the host source map (smap-search over @nses). The
                     ;; device has no smap — this is the host hop that turns kora/nav.dart:249
-                    ;; into kora/nav.cljd:NN. Env keys are dropped so read-string can't choke.
+                    ;; into kora/nav.cljd:NN.
+                    ;; NB: VM-Service `evaluate` truncates string results at 128 chars, so we
+                    ;; read the picks field-by-field (each tiny) rather than one big projection.
                     (= 'picks head)
-                    (let [proj-r (repl-eval/eval-form client iso-id
-                                   '(cljd.core/mapv
-                                      (fn [p] {:type (:type p) :wloc (:wloc p) :loc (:loc p)})
-                                      (cljd.core/deref cljd.flutter/+cljd-picks+))
-                                   {:ns-lib-uri "cljd/flutter.dart"})
-                          picks (try (read-string (:value proj-r)) (catch Throwable _ nil))
-                          smap-search (requiring-resolve 'cljd.build/smap-search)
+                    (let [smap-search (requiring-resolve 'cljd.build/smap-search)
                           libs (:libs @compiler/nses)
+                          eval1 (fn [form]
+                                  (let [r (repl-eval/eval-form client iso-id form
+                                            {:ns-lib-uri "cljd/flutter.dart"})]
+                                    (try (read-string (:value r)) (catch Throwable _ nil))))
                           resolve-src
-                          (fn [wloc]
-                            (when-let [^String src (:src wloc)]
+                          (fn [^String src]
+                            (when (and src smap-search)
                               (let [ci (.lastIndexOf src ":")]
                                 (when (pos? ci)
                                   (let [path (subs src 0 ci)
@@ -186,13 +186,28 @@
                                                                   (.endsWith ks (str "/" path)))
                                                           v)))
                                                     libs)]
-                                    (when (and line smap-search (:smap entry))
+                                    (when (and line (:smap entry))
                                       (when-some [info (smap-search (:smap entry) line nil)]
-                                        (str (:file info) ":" (:line info)
-                                             (when (:column info) (str ":" (:column info)))))))))))
-                          enriched (mapv (fn [p] (assoc p :cljd (resolve-src (:wloc p))))
-                                         (or picks []))]
-                      (send! {:value (pr-str enriched) :ns (name @*current-ns)}))
+                                        ;; line<=1 is the source map's initial sentinel — the
+                                        ;; Dart line hit a generated region with no fine entry.
+                                        ;; Return nil (unresolved) so the caller keeps the wloc.
+                                        (when (> (or (:line info) 0) 1)
+                                          (str (:file info) ":" (:line info)
+                                               (when (:column info) (str ":" (:column info))))))))))))
+                          n (let [c (eval1 '(cljd.core/count (cljd.core/deref cljd.flutter/+cljd-picks+)))]
+                              (if (integer? c) c 0))
+                          rows (mapv
+                                 (fn [i]
+                                   ;; one small read per pick: [src type name] (< 128 chars)
+                                   (let [tri (eval1
+                                               (list 'cljd.core/vector
+                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :src])
+                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :type])
+                                                 (list 'cljd.core/get-in '(cljd.core/deref cljd.flutter/+cljd-picks+) [i :wloc :name])))
+                                         [src typ nm] (if (vector? tri) tri [nil nil nil])]
+                                     {:n (inc i) :type typ :wloc src :name nm :cljd (resolve-src src)}))
+                                 (range n))]
+                      (send! {:value (pr-str rows) :ns (name @*current-ns)}))
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).
