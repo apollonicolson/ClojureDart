@@ -421,7 +421,13 @@
   {:inline (fn [class x] `(dart/is? ~x ~class))
    :inline-arities #{2}}
   [class x]
-  (throw (UnsupportedError. "instance? can't be used as a function due to Dart design. See https://github.com/Tensegritics/ClojureDart/issues/11 to track progress.")))
+  (throw (UnsupportedError.
+           (str "instance? can't be called as a higher-order function: Dart tests "
+                "`x is T` only when T is a literal type known at compile time, not a "
+                "runtime Type value, so there is no subtype-aware runtime form. "
+                "Use it inline — (instance? SomeType x) — or `(dart/is? x SomeType)`; "
+                "for dynamic dispatch use a protocol or multimethod. "
+                "See https://github.com/Tensegritics/ClojureDart/issues/11"))))
 
 (defmacro definterface [iface & meths]
   `(deftype ~(vary-meta iface assoc :abstract true) []
