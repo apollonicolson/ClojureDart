@@ -225,7 +225,7 @@
 ;; exact reader-tracked span. Reuses the compiler reader for positions; the watcher recompiles +
 ;; hot-reloads on save. Spiked end-to-end 2026-07-04.
 
-(defn- read-forms-pos
+(defn- read-source-forms
   "Top-level forms of FILE, each collection form carrying :line/:column/:end-* meta (from a
    line-numbering reader — the compiler's own reader, so cljd syntax reads clean)."
   [^String file]
@@ -235,7 +235,7 @@
         (let [f (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)]
           (if (= f ::eof) acc (recur (conj acc f))))))))
 
-(defn- line-start
+(defn- line-start-offset
   "0-based char offset of the start of 1-based LINE in TEXT."
   [^String text line]
   (loop [off 0 ln 1]
@@ -243,9 +243,9 @@
       (let [nl (.indexOf text (int \newline) off)]
         (if (neg? nl) off (recur (inc nl) (inc ln)))))))
 
-(defn- lc->off [^String text line col] (+ (line-start text line) (dec col)))
+(defn- line-column->offset [^String text line col] (+ (line-start-offset text line) (dec col)))
 
-(defn- span-contains? [m line col]
+(defn- loc-contains? [m line col]
   (and (:line m)
        (or (< (:line m) line) (and (= (:line m) line) (<= (:column m) col)))
        (or (> (:end-line m) line) (and (= (:end-line m) line) (>= (:end-column m) col)))))
@@ -254,40 +254,42 @@
   "Innermost collection form in FORMS whose span contains LINE:COL — the picked widget form."
   [forms line col]
   (->> (mapcat #(tree-seq coll? seq %) forms)
-       (filter #(and (coll? %) (span-contains? (meta %) line col)))
+       (filter #(and (coll? %) (loc-contains? (meta %) line col)))
        (sort-by #(let [m (meta %)] [(- (:line m)) (- (:column m))]))
        first))
 
-(defn- child-spans
-  "Each direct child of the form in FORM-TEXT with its [line col] start/end — read from the
-   reader's OWN position, so bare literals (numbers/strings/keywords, not IMeta) are spanned too."
+(defn- child-locs
+  "Each direct child of the form in FORM-TEXT as {:form :start [line column] :end [line column]},
+   read from the reader's OWN position — so bare literals (numbers/strings/keywords, not IMeta,
+   which carry no :line meta) are located too."
   [^String form-text]
   (with-open [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. form-text))]
     (compiler/with-cljd-reader
       (.read r)                                    ; consume the opening delimiter
       (loop [acc []]
-        (let [sl (.getLineNumber r) sc (.getColumnNumber r)
-              f (try (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)
-                     (catch Exception _ ::eof))]
-          (if (= f ::eof) acc
-            (recur (conj acc {:v f :start [sl sc] :end [(.getLineNumber r) (.getColumnNumber r)]}))))))))
+        (let [start-line (.getLineNumber r) start-column (.getColumnNumber r)
+              form (try (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)
+                        (catch Exception _ ::eof))]
+          (if (= form ::eof) acc
+            (recur (conj acc {:form form :start [start-line start-column]
+                              :end [(.getLineNumber r) (.getColumnNumber r)]}))))))))
 
-(defn- prop-value-span
+(defn- prop-value-offsets
   "Abs [start end) char offsets in TEXT of the value following PROP in FORM (a widget form carrying
    :line/:column meta). Leading whitespace trimmed off the value. nil if PROP is absent."
   [^String text form prop]
   (let [m (meta form)
-        fstart (lc->off text (:line m) (:column m))
-        ftext  (subs text fstart (lc->off text (:end-line m) (:end-column m)))
-        rel->abs (fn [[l c]] (+ fstart (lc->off ftext l c)))]
+        fstart (line-column->offset text (:line m) (:column m))
+        ftext  (subs text fstart (line-column->offset text (:end-line m) (:end-column m)))
+        rel->abs (fn [[l c]] (+ fstart (line-column->offset ftext l c)))]
     (some (fn [[a b]]
-            (when (= (:v a) prop)
+            (when (= (:form a) prop)
               (let [s (rel->abs (:start b)) e (rel->abs (:end b))
                     lead (count (take-while #(Character/isWhitespace ^char %) (subs text s e)))]
                 [(+ s lead) e])))
-      (partition 2 1 (child-spans ftext)))))
+      (partition 2 1 (child-locs ftext)))))
 
-(defn- resolve-src-file
+(defn- resolve-source-file
   "The cljd loc's relative path (e.g. \"kora/nav.cljd\") → an absolute source file under SOURCE-DIRS."
   [source-dirs cljd-path]
   (some (fn [d] (let [f (java.io.File. (str d) ^String cljd-path)]
@@ -602,7 +604,7 @@
                                               (try [(aget ps 0) (Long/parseLong (aget ps 1))
                                                     (Long/parseLong (aget ps 2))]
                                                    (catch Throwable _ nil)))))
-                          file (when path (resolve-src-file source-dirs path))]
+                          file (when path (resolve-source-file source-dirs path))]
                       (cond
                         (not (and (string? loc) (seq loc)))
                         (send! {:err "no active pick with a resolved cljd loc — pick a cljd widget first"
@@ -612,8 +614,8 @@
                                 :ex "cljd.no-file"})
                         :else
                         (let [text (slurp file)
-                              wform (form-at (read-forms-pos file) ln col)
-                              span (and wform (prop-value-span text wform prop))]
+                              wform (form-at (read-source-forms file) ln col)
+                              span (and wform (prop-value-offsets text wform prop))]
                           (if span
                             (let [[s e] span
                                   old (subs text s e)]
