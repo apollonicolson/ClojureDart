@@ -513,7 +513,12 @@
                         true-out *out*
                         trigger-reload (fn ([] (.put q {:kind :reload}))
                                          ([done] (.put q {:kind :reload :done done})))
-                        vm-uri-p (promise)]   ; resolves with the app's VM-Service ws URI
+                        vm-uri-p (promise)   ; resolves with the app's VM-Service ws URI
+                        ;; (restart!) op → write "R" to flutter (same as typing R at the console).
+                        ;; The nREPL server drives replay itself off the device's cljd.booted event.
+                        trigger-restart (fn [] (when flutter-stdin
+                                                 (locking flutter-stdin
+                                                   (doto flutter-stdin (.write "R") .flush))))]
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
                       (daemon
@@ -655,6 +660,7 @@
                                                       :dart-version dartv :*current-ns (atom 'cljd.core)
                                                       :ns-lib-uri "cljd/core.dart" :port 0
                                                       :trigger-reload trigger-reload
+                                                      :trigger-restart trigger-restart
                                                       :await? (boolean await-ok)
                                                       :pick? (boolean pick-ok)
                                                       :remember? (boolean await-ok)})]

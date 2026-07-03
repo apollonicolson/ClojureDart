@@ -4,6 +4,7 @@
             ["package:flutter/material.dart" :as material]
             ["package:flutter/foundation.dart" :as foundation]
             ["package:flutter/rendering.dart" :as rendering]
+            ["package:flutter/scheduler.dart" :as scheduler]
             ["dart:async" :as dart:async]
             ["dart:developer" :as dev]
             ["dart:convert" :as convert]
@@ -1585,23 +1586,26 @@
    parsed host-side); for each id present live, reset! its atom. Only EDN-round-trippable state
    restores. Returns the number of ids matched live now.
 
-   Frame-safe: the reset!s run in a post-frame callback, never inline. A host eval can land at any
-   moment, including mid-frame; a synchronous reset! then fires the atom's :watch → setState during
-   build/layout → 'Build scheduled during frame' and a torn rebuild. Deferring lands the state change
-   cleanly between frames (scheduleFrame guarantees the callback runs even when the app is idle).
-   The live-state walk (Element.visitChildElements) also happens inside the callback — walking the
-   tree synchronously mid-frame is itself illegal ('visitChildElements() called during build'), so
-   nothing here touches the element tree until the post-frame point. Returns the count REQUESTED."
+   Frame-safe by PHASE, not by unconditional deferral. When the scheduler is idle (the common case:
+   a host eval lands between frames), reset! synchronously — immediate and reliable even when the app
+   is otherwise idle (e.g. just after a hot restart), where a scheduled post-frame callback may never
+   pump. When mid-frame (write-state driven from a build/reassemble), a synchronous reset! would fire
+   the atom's :watch → setState during build/layout → 'Build scheduled during frame'; and the
+   live-state walk (Element.visitChildElements) is itself illegal during build — so defer BOTH to a
+   post-frame callback. Returns the number of ids actually matched+written (idle path) or requested
+   (deferred path, where the match count isn't known yet)."
   [snap]
-  (let [wb (widgets/WidgetsBinding.instance)]
-    (.addPostFrameCallback wb
-      (fn [_]
-        (let [live (live-state)]
-          (doseq [e snap]
-            (when-some [a (get live (key e))] (reset! a (val e)))))
-        nil))
-    (.scheduleFrame wb)
-    (count snap)))
+  (let [wb (widgets/WidgetsBinding.instance)
+        apply! (fn []
+                 (let [live (live-state)]
+                   (reduce (fn [n e]
+                             (if-some [a (get live (key e))] (do (reset! a (val e)) (inc n)) n))
+                           0 snap)))]
+    (if (= (.-schedulerPhase wb) scheduler/SchedulerPhase.idle)
+      (apply!)
+      (do (.addPostFrameCallback wb (fn [_] (apply!) nil))
+          (.scheduleFrame wb)
+          (count snap)))))
 
 (defn- stream-change!
   "Stream one atom change to the host as data (cljd.state-change): id + pr-str'd new value (EDN,
@@ -2332,7 +2336,10 @@
 
 (defn repl-hud [child]
   (widget
-    :managed [_ (do (register-cljd-devtools!) (println "[* RDY)_")) :dispose nil]
+    ;; post "cljd.booted" on every root mount (incl. after a hot restart, which spins a fresh
+    ;; isolate). The host keys off this to refresh its isolate id and replay recorded state —
+    ;; a VM-Service event survives the restart where stdout markers don't.
+    :managed [_ (do (register-cljd-devtools!) (post-event! "cljd.booted" {}) (println "[* RDY)_")) :dispose nil]
     :let [*armed +cljd-armed+]
     (widgets/Stack
       .alignment widgets/AlignmentGeometry.topLeft

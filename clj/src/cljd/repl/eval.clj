@@ -150,9 +150,12 @@
    ISO-ID, the ANALYZER + DART-VERSION the compiler needs, the default evaluate scope
    (NS-LIB-URI) and the default compile ns (DEFAULT-NS). Pass to eval! / call! /
    with-compiler-context — nothing else should touch client/iso-id or the binding block."
-  [{:keys [client iso-id analyzer dart-version ns-lib-uri default-ns]
+  [{:keys [client iso-id *iso analyzer dart-version ns-lib-uri default-ns]
     :or {ns-lib-uri "cljd/core.dart" default-ns 'cljd.core}}]
-  {:client client :iso-id iso-id :analyzer analyzer :dart-version dart-version
+  ;; *iso holds the CURRENT main isolate id in an atom (refreshed after a hot restart, which
+  ;; spins a new isolate). eval!/call! deref it, so the boundary survives a restart. Callers
+  ;; that only have a fixed iso-id still work — we box it.
+  {:client client :*iso (or *iso (atom iso-id)) :analyzer analyzer :dart-version dart-version
    :ns-lib-uri ns-lib-uri :default-ns default-ns})
 
 (defmacro with-compiler-context
@@ -178,10 +181,10 @@
   ([ctx form] (eval! ctx form nil))
   ([ctx form {:keys [ns] :as opts}]
    (with-compiler-context ctx (or ns (:default-ns ctx))
-     (eval-form (:client ctx) (:iso-id ctx) form
+     (eval-form (:client ctx) @(:*iso ctx) form
                 (merge {:ns-lib-uri (:ns-lib-uri ctx)} (dissoc opts :ns))))))
 
 (defn call!
   "A device service-extension call (structured, compilation-free); coordinates from CTX."
   [ctx method params]
-  (vm/call-ext (:client ctx) (:iso-id ctx) method params))
+  (vm/call-ext (:client ctx) @(:*iso ctx) method params))

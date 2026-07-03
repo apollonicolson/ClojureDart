@@ -211,9 +211,16 @@
          (cons (first f)
            (map-indexed (fn [i a] (instrument (conj coord (inc i)) a)) (rest f))))))))
 
+(defn- change-snapshot
+  "Collapse an ordered change-log ({:id :value} seq) into the state map {id → value}, last write
+   winning per id. The basis for replay and time-travel: (seek n) snapshots a prefix, (replay)/boot
+   snapshots the whole log."
+  [changes]
+  (reduce (fn [m c] (assoc m (:id c) (:value c))) {} changes))
+
 (defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :trigger-restart :await? :pick? :remember?}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload trigger-restart await? pick? remember?]
     :or {ns-lib-uri "cljd/core.dart"}
     :as cfg}]
   ;; ctx: the host↔device boundary, bundled once. Every crossing goes through repl-eval's
@@ -221,7 +228,14 @@
   ;; threads client/iso-id by hand. (default-ns 'cljd.core matches the *current-ns atom's start.)
   ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
   ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
-  (let [ctx (repl-eval/context (assoc cfg :default-ns 'cljd.core))
+  (let [;; *iso: the CURRENT main isolate id. A Flutter hot restart (R) spins a NEW isolate, so the
+        ;; id captured at launch goes stale and every eval fails ("Expression compilation error").
+        ;; refresh-iso! re-resolves it (fired on the device's cljd.booted event); ctx + the eval op
+        ;; deref this, so the whole REPL survives a restart.
+        *iso (atom iso-id)
+        refresh-iso! (fn [] (when-some [i (try (vm/main-isolate-id client) (catch Throwable _ nil))]
+                              (reset! *iso i)))
+        ctx (repl-eval/context (assoc cfg :*iso *iso :default-ns 'cljd.core))
         *eval-sink (atom nil)
         ;; the ONE error store: EVERY error — device-pushed (framework/async/report-error!) AND
         ;; eval-path (runtime @Error, compile) — lands here as data via remember-error!. `(errors)`
@@ -233,6 +247,9 @@
         ;; continuous change-stream: while recording, each device atom change arrives here as
         ;; {:id :value} in order. seek(N) replays 0..N into a state snapshot → write-state.
         +cljd-change-log+ (atom [])
+        ;; recording armed? — gates cross-restart auto-replay (only restore state when the user
+        ;; asked for a durable recording; a plain hot-restart otherwise starts clean).
+        +cljd-recording?+ (atom false)
         ;; last coverage snapshot (set of dart uri:line) — (ran) diffs against it.
         +cljd-coverage-snap+ (atom #{})
         ;; the UNIFIED timeline: every device event (tap / log / error / state-change) appended in
@@ -255,7 +272,51 @@
                   (if (and prev (= (:phase prev) (:phase e)) (= (:message prev) (:message e)))
                     (conj (pop es) (update prev :count (fnil inc 1)))
                     (vec (take-last 25 (conj es (assoc e :count 1))))))))
-            (when-not dupe? e)))]
+            (when-not dupe? e)))
+        ;; replay!: re-apply the whole recorded change-log (last value wins per id) onto the
+        ;; device's live atoms via write-state. The change-log lives HERE (host), so this
+        ;; survives a device hot-restart — the isolate/atoms are fresh, addressed by stable
+        ;; [loc sym]. Returns {:atoms n :wrote m} or nil when nothing is recorded.
+        replay!
+        (fn []
+          (let [snap (change-snapshot @+cljd-change-log+)]
+            (when (seq snap)
+              (let [wrote (try (:value (repl-eval/eval-form client @*iso
+                                         (list 'cljd.flutter/write-state snap)
+                                         {:ns-lib-uri "cljd/flutter.dart"}))
+                               (catch Throwable _ nil))]
+                {:atoms (count snap) :wrote wrote}))))
+        ;; replay-settle!: the boot-time replay (fired on cljd.booted after a restart). Runs on the
+        ;; WS-listener future, which lacks the compiler bindings, so it establishes the context
+        ;; itself. Retries on a short backoff until every recorded-and-live id matches its value:
+        ;; startup pumps frames, and a mid-frame write-state defers (and may not land on an idle
+        ;; app), so one shot isn't enough. Re-arms device recording after, so capture continues
+        ;; across the restart. Returns the {:tries :ok} verdict (also logged to the timeline).
+        replay-settle!
+        (fn []
+          (repl-eval/with-compiler-context ctx @*current-ns
+            (let [snap (change-snapshot @+cljd-change-log+)
+                  read-live #(try (read-string (:value (repl-eval/eval-form client @*iso
+                                                         '(cljd.flutter/read-state)
+                                                         {:ns-lib-uri "cljd/flutter.dart"})))
+                                  (catch Throwable _ nil))
+                  ;; landed? every recorded id that is CURRENTLY live equals its recorded value.
+                  ;; (Ids for not-yet-mounted widgets are skipped — can't restore what isn't there.)
+                  landed? (fn [live] (and live (every? (fn [[id v]]
+                                                         (or (not (contains? live id)) (= v (get live id))))
+                                                       snap)))
+                  result (loop [tries 0]
+                           (Thread/sleep (min 800 (+ 250 (* tries 200))))
+                           (replay!)
+                           (let [live (read-live)]
+                             (if (or (landed? live) (>= tries 6))
+                               {:tries tries :ok (boolean (landed? live))}
+                               (recur (inc tries)))))]
+              (record-tl! :log (merge {:cljd/replayed (count snap)} result))
+              (try (repl-eval/eval-form client @*iso '(cljd.flutter/arm-recording! true)
+                     {:ns-lib-uri "cljd/flutter.dart"})
+                   (catch Throwable _ nil))
+              result)))]
    ;; stdout sink just forwards REPL output to the active eval's transport (no marker scanning).
    (vm/set-sink! client (fn [stream text] (when-some [f @*eval-sink] (f stream text))))
    ;; ONE structured-event intake off the Extension stream. `cljd.pick` resolves the pick; any
@@ -305,7 +366,18 @@
          ;; (trace 'form): each instrumented sub-expression streams its coord + value here.
          (= kind "cljd.trace")
          (let [v (try (read-string (:value data)) (catch Throwable _ (:value data)))]
-           (record-tl! :trace {:coord (:coord data) :value v})))))
+           (record-tl! :trace {:coord (:coord data) :value v}))
+
+         ;; cljd.booted: the app root just (re)mounted. After a hot restart that's a NEW isolate, so
+         ;; refresh the isolate id first (or every eval fails against the dead one), then — when
+         ;; recording — replay the host-durable state into the fresh app. Off-thread (evals on the
+         ;; device); replay-settle! owns the compiler context, retry-until-landed, and re-arm.
+         (= kind "cljd.booted")
+         (future
+           (try
+             (refresh-iso!)
+             (when @+cljd-recording?+ (replay-settle!))
+             (catch Throwable _ nil))))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -366,7 +438,10 @@
                              (set! compiler/*current-ns* ns-sym))]
             (try
               (doseq [form (read-forms code)]
-                (let [head (and (seq? form) (first form))]
+                (let [head (and (seq? form) (first form))
+                      ;; always eval against the CURRENT isolate (refreshed on restart) — shadows
+                      ;; the launch-time id so every op below survives a hot restart.
+                      iso-id @*iso]
                   ;; dispatch the REPL's special ops as a table (case on the form head); anything
                   ;; not an op falls through to the default — compile + eval/reload on the device.
                   (case head
@@ -555,11 +630,13 @@
                                    {:ns-lib-uri "cljd/flutter.dart"})
                               base (try (read-string (:value r0)) (catch Throwable _ {}))]
                           (reset! +cljd-change-log+ (mapv (fn [[id v]] {:id id :value v}) base))
+                          (reset! +cljd-recording?+ true)
                           (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
                             {:ns-lib-uri "cljd/flutter.dart"})
                           (send! {:value (str "recording on (" (count @+cljd-change-log+) " base atoms)")
                                   :ns (name @*current-ns)}))
-                        (do (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! false)
+                        (do (reset! +cljd-recording?+ false)
+                            (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! false)
                               {:ns-lib-uri "cljd/flutter.dart"})
                             (send! {:value "recording off" :ns (name @*current-ns)}))))
 
@@ -570,14 +647,38 @@
                     ;; snapshot (last value wins per id) → write-state. Continuous time-travel.
                     seek
                     (let [n (second form)
-                          snap (reduce (fn [m c] (assoc m (:id c) (:value c))) {}
-                                 (take (inc n) @+cljd-change-log+))]
+                          snap (change-snapshot (take (inc n) @+cljd-change-log+))]
                       (if (seq snap)
                         (let [r (repl-eval/eval-form client iso-id (list 'cljd.flutter/write-state snap)
                                   {:ns-lib-uri "cljd/flutter.dart"})]
                           (send! {:value (str "sought to change " n " (" (:value r) " atoms)")
                                   :ns (name @*current-ns)}))
                         (send! {:err (str "no changes up to " n " (record first?)") :ex "cljd.no-change"})))
+
+                    ;; (replay): re-apply the WHOLE recorded change-log onto the live atoms — the
+                    ;; latest state, not a point in time. Same write-state mechanism as (seek); used
+                    ;; to restore after a hot restart (fired automatically — see (restart!)). Manual
+                    ;; call is the testable core of cross-restart replay.
+                    replay
+                    (let [res (replay!)]
+                      (if res
+                        (send! {:value (str "replayed " (:atoms res) " atoms → " (:wrote res) " written")
+                                :ns (name @*current-ns)})
+                        (send! {:value "nothing to replay (record first?)" :ns (name @*current-ns)})))
+
+                    ;; (restart!): hot-restart the app (host writes "R" to flutter, as if typed). When
+                    ;; recording is on, the recorded state replays automatically once the fresh isolate
+                    ;; re-mounts (the device's cljd.booted event fires refresh-iso! + replay-settle!).
+                    ;; Also the fix for the binding-shape-change friction — a restart no longer means
+                    ;; losing your place.
+                    restart!
+                    (if trigger-restart
+                      (do (trigger-restart)
+                          (send! {:value (if @+cljd-recording?+
+                                           "hot restart requested (state will replay on re-mount)"
+                                           "hot restart requested (recording off → clean slate)")
+                                  :ns (name @*current-ns)}))
+                      (send! {:err "no restart trigger wired (flutter not running?)" :ex "cljd.no-restart"}))
 
                     ;; (coverage): snapshot which cljd forms have executed (line-granular, per-script
                     ;; getSourceReport). (ran): after an interaction, the cljd locs NEWLY executed

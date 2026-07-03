@@ -228,6 +228,15 @@ device — inline + amber handle + exact loc — instead of silently keeping old
   plain values: `(q (frequencies (map :kind timeline)))`, `(q (filter #(= "flutter" (:phase %)) errors))`.
   Closes the "ops aren't values" gap — no more dump-and-grep.
 
+- **Cross-restart state replay — SHIPPED.** `(restart!)` hot-restarts the app from the REPL; when
+  recording, state auto-replays into the fresh app so you keep your place. The hard part was that a hot
+  restart spins a NEW isolate — the host's cached isolate id went stale and *all* eval died. Fix: the
+  isolate id lives in an atom, refreshed on a device `cljd.booted` Extension event (survives the
+  restart; app stdout doesn't reach `flutter run` under `CLJD_VMREPL`). `replay-settle!` retries the
+  change-log replay until every live id matches (startup pumps frames), then re-arms recording.
+  `write-state` became phase-aware (synchronous when idle — reliable on an idle app — deferred only
+  mid-frame). The change-log being host-durable (it always was, by design) is what makes this possible.
+
 - **Clojure-native observability — SHIPPED (`tap>`/`log!`, rank 1).** `cljd.core` defines
   `add-tap`/`tap>` (`core.cljd:9370`). Device→host: `(add-tap #(post-event! "cljd.tap" {:edn (pr-str %)}))`
   + a `cljd.tap` host branch + `(taps)` — ~15 lines (cljd `tap>` runs inline, so keep the fn cheap).
