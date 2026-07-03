@@ -43,6 +43,42 @@
 - **Compiler dynamic bindings don't cross into `future`s** — a bare `future` silently drops `binding [compiler/*hosted* …]`. **Fixed** in the toolkit via `eval!`/`with-compiler-context`/`call!` — but it was a silent landmine; upstream cljd could bundle the binding into the eval entry.
 - **Macros run on the JVM host** (`^:macro-support` to be reachable) — not self-hosted; a fixed constraint to know.
 
+## E. Shapes cheat-sheet (the papercuts, copy-paste)
+
+The interop shapes that are easy to forget — verified against `doc/differences.md` (rank 3, 2026-07-03):
+
+```clojure
+;; Record ctor needs 3 trailing args: meta, extmap, hash
+(defrecord R [a])
+(R. "arg" nil {} -1)              ; not (R. "arg")
+
+;; catch: an extra binding after the exception name captures the stacktrace
+(catch Exception e st  …)         ; st = StackTrace (Dart doesn't attach it to e)
+(catch dynamic e       …)         ; the "catch-all" (bare catch → dynamic)
+
+;; super call: metadata on `this` at the call site
+(.initState ^super self)          ; e.g. in a State's initState
+
+;; Building a growable Dart list, then .add
+(let [xs #dart ^List []] (.add xs 1) xs)
+
+;; #dart map literal (fork feature): Map<K,V>.fromEntries under the hood
+^{:tag [String int]} #dart {"a" 1}
+```
+
+### Host vs device — what runs where (lived, rank 1–2)
+
+| Capability | Device (runtime) | Host (compiler/REPL) |
+|---|---|---|
+| `cljd.core` fns, protocols, multimethods (partial) | ✅ | ✅ |
+| `read-string` | **only `cljd.edn/read-string`** (not in core) | `clojure.core/read-string` |
+| `eval` / `resolve` / `macroexpand` / `slurp` / `spit` | ❌ (no runtime var ns) | ✅ |
+| Macro expansion (`^:macro-support` to be reachable) | ❌ (runs on host) | ✅ |
+| The compiler, `nses` symbol table, REPL ops | ❌ | ✅ |
+
+- **Lazy `def` init** — `def`s initialize **by-need, not top-to-bottom** (Dart tree-shaking / fast startup). Order-dependent top-level side effects silently break. `differences.md:92`.
+- **Compiler dynamic bindings don't cross into `future`s** — a bare `future` drops `binding [compiler/*hosted* …]`; the REPL's `eval!`/`with-compiler-context`/`call!` re-establish it (why the `cljd.booted`/pick futures wrap themselves).
+
 ## Notes
 - `doc/differences.md` is partly stale (says "no `instance?`", lists multimethods as flat-missing); `core.cljd` (rank 3) shows `instance?` exists inline-only and multimethods are partial. Trust the code.
-- Unverified: whether the fork's REPL eval path exposes a device `read-string`/`eval` beyond `cljd.edn` — read the host `.clj` fn names, not the runtime wiring.
+- Device `read-string` is `cljd.edn/read-string` — core can't alias it (edn requires core → circular), so document, don't alias. The REPL's host-side ops read EDN with `clojure.core/read-string` (host), never the device.

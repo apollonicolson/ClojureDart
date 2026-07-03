@@ -255,16 +255,19 @@ device — inline + amber handle + exact loc — instead of silently keeping old
   `cljd.trace`) fold into a single `+cljd-timeline+` keyed by `:t`, tagged `:kind`; `(timeline)` /
   `(timeline :kind …)`. Causal ordering across taps, logs, errors, state, and traces — one event log.
 
-- **Cross-restart auto-replay ("hard rollback").** The change-log survives device restart (host-side);
-  wire replay-on-reconnect: detect a fresh app via **isolate-id** (a heartbeat gap only *triggers the
-  check* — it can't distinguish restart from backgrounding/GC), **settle-poll** the `[loc sym]` id-set
-  across ~2 reads before `write-state` (mid-rebuild reads tear), **opt-in**. Can't restore: nav-stack,
-  native/platform, in-flight async, focus/scroll (not `[loc sym]` atoms).
+- **Cross-restart auto-replay ("hard rollback") — SHIPPED (see above).** Built 2026-07-03: the tx-log
+  survives device restart (host-side); `(restart!)` + the device `cljd.booted` event trigger
+  `replay-settle!`, which refreshes the isolate id, retries `write-state` until every live id matches,
+  and re-arms recording — opt-in via `(record)`. Still can't restore: nav-stack, native/platform,
+  in-flight async, focus/scroll (not `[loc sym]` atoms).
 
-- **Riverpod into the state channel.** A dev-mode `ProviderObserver` (Riverpod 3.0: single
-  `ProviderObserverContext`) streams provider changes as `cljd.state-change` → `read-state`/`write-state`/
-  `record`/`seek` cover providers. Constraint is **addressability**: named `StateProvider`/`Notifier`
-  are clean & symmetric (write via `.notifier`); anonymous/derived/async providers are read-only.
+- **Riverpod into the state channel — DEFERRED (low value / core cost).** A dev-mode `ProviderObserver`
+  (kora is on Riverpod 2.6.1: `didUpdateProvider(provider, prev, new, container)`) could stream provider
+  changes as transactions. But kora has only **3 named-able `StateProvider`s** (journal.cljd), and
+  capturing them means adding external reader/writer registries to `read-state`/`write-state` — re-
+  complicating the just-cleaned core state fns, or coupling them to Riverpod, for 3 providers. Deferred
+  until provider usage grows or journal time-travel is specifically needed. Constraint if built:
+  **addressability** — the providers must be `.name`d to get a stable id (`["riverpod" name]`).
 
 **Suggested sequence:** `tap>` + unified timeline (cheapest, consolidates the channels) → `(trace 'form)`
 (marquee, retires the source-map wall) → cross-restart + Riverpod (design-ready).
@@ -327,11 +330,16 @@ reactnative.dev/docs/react-native-devtools · radon.swmansion.com · developer.a
 
 ## 8. Open questions — rank 5
 
-- Does hot-reload preserve nav-stack + input state, or only widget-tree state? (gates how #4 leans on it)
-- #4 restore: are the atom *identities* harvested from repl-point envs stable across an epoch restore
-  (so `reset!` targets the atom the live widget still watches), or does a rebuild swap them out?
+- **ANSWERED (2026-07-03):** hot-reload (reassemble) preserves State — so `:managed` atoms survive,
+  while `:let`/build-locals reset. A hot *restart* (R) resets everything (new isolate); that's what
+  cross-restart replay handles. Nav-stack is not a `[loc sym]` atom, so it doesn't restore either way.
+- **ANSWERED (2026-07-03):** the `:managed` atom *identity* is stable across a reassemble (measured:
+  same atom object 425123511 before/after), and `write-state` re-walks live-state each call so it
+  targets whatever atom the live widget currently watches — identity stability isn't even required.
 - `toImageSync` per-frame cost for a frame ring-buffer on a real device — throttle/shrink region?
-- Reverse-edit (#5) needs the source-map invertible enough to locate the exact form; unproven.
+  (still open — profiling research, only the perf front needs it.)
+- Reverse-edit (#5) needs the source-map invertible enough to locate the exact form; unproven
+  (still open — research-grade, tied to bidirectional edit-back).
 - Ancestor TREE tap-to-re-target — SHIPPED: `capture-ancestors` retains each ancestor's live `:el`
   (guarded by mounted at tap time), TREE rows are tappable (`detail-section` wraps a row that carries an
   on-tap), and a tap `pick-element!`s that ancestor. Compiles clean; needs an on-device tap to confirm
