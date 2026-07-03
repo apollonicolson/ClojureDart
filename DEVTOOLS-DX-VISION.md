@@ -185,33 +185,33 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
   addressed by a stable id** `[loc sym]`: `read-state` → `{[loc sym] → value}` (a pure READ of every
   live repl-point atom — `live-state` walks from `::app-root`), `write-state` DIRECTs the app back
   (resolve id → live atom → `reset!`). The **host** holds ONE timeline — the change-log — and epochs
-  are named cut-points into it: `(epoch!)` drops a full-state keyframe + marks its index, `(restore-epoch N)`
+  are named cut-points into it: `(epoch!)` drops a full-state keyframe + marks its index, `(restore-epoch! N)`
   seeks to that mark, `(states)` reads current state. No device-side store and no parallel snapshot
   store — the durable memory is the host, so the recording survives device restart, and ids re-resolve
   against whatever atoms are live. Validated: `(states)` returns the whole app state (nav index +
   journal entries + `#inst` dates as EDN); epoch → change → restore reverts; `(q epochs)` resolves each
   cut-point to its state map. Limits: only EDN-round-trippable values restore; a read taken *mid-rebuild*
   races (settle first); Riverpod providers still out of scope.
-  **Transaction stream — SHIPPED:** `(record)` add-watches every atom (re-armed on the heartbeat to
+  **Transaction stream — SHIPPED:** `(record!)` add-watches every atom (re-armed on the heartbeat to
   catch newly-mounted repl-points); changes accumulate into a per-turn buffer and flush as ONE
   `cljd.tx` event on a microtask — all changes from one event handler / host eval = one transaction
   (re-frame/redux style, not per-atom). Host `+cljd-tx-log+` entries are `{:tx :t :delta :cause}`;
-  `(seek N)` merges deltas 0..N → `write-state`; `(txs)` counts them. A microtask (not a post-frame
+  `(seek! N)` merges deltas 0..N → `write-state`; `(txs)` counts them. A microtask (not a post-frame
   callback) always runs, so recording never depends on the render loop. `+cljd-replaying+` suppresses
   the echo while a host `write-state` applies (a restore must not re-record itself). Validated:
-  two resets in one eval → one 2-entry tx; host write-state adds no tx; record → mutate → `(seek 0)`
+  two resets in one eval → one 2-entry tx; host write-state adds no tx; record → mutate → `(seek! 0)`
   reverts; restart replays a non-default target and re-arms recording. So the state channel is a
   Datomic-style transaction log — discrete epochs AND continuous record/seek are the SAME tx-log
   (epochs = markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates**
   (value-flow tracing) — a compiler-emit change, its own spike.
-- **#5 form-level edit-back — SHIPPED (2026-07-04).** `(edit-back .prop VALUE)` writes VALUE back to
+- **#5 form-level edit-back — SHIPPED (2026-07-04).** `(edit-back! .prop VALUE)` writes VALUE back to
   source as the named property of the *active pick's* widget form, then the watcher recompiles + hot-
   reloads. It's a **consolidation** — the pick already resolves widget → `.cljd file:line:col`
   (`resolve-wloc`); edit-back extends that arrow one hop to write. Reuses the compiler reader for
   positions: `form-at line:col` finds the picked form, and `child-spans` reads spans from the reader's
   *own* position so **bare literals** (numbers/strings/keywords, not `IMeta`) are spanned too — then a
   value's span → char-offset → text splice. Validated on device: picked an InkWell → resolved to
-  `nav.cljd:47:5` (a ListView) → `(edit-back .padding (m/EdgeInsets.all 40.0))` rewrote its `.padding`
+  `nav.cljd:47:5` (a ListView) → `(edit-back! .padding (m/EdgeInsets.all 40.0))` rewrote its `.padding`
   in source → hot-reloaded in **1.08 s** → reverted byte-identical. Only unconstrained *gestural* edit-
   back (drag → infer arbitrary source change) stays research; named-property edit-back is deterministic.
 
@@ -266,7 +266,7 @@ device — inline + amber handle + exact loc — instead of silently keeping old
 - **Cross-restart auto-replay ("hard rollback") — SHIPPED (see above).** Built 2026-07-03: the tx-log
   survives device restart (host-side); `(restart!)` + the device `cljd.booted` event trigger
   `replay-settle!`, which refreshes the isolate id, retries `write-state` until every live id matches,
-  and re-arms recording — opt-in via `(record)`. Still can't restore: nav-stack, native/platform,
+  and re-arms recording — opt-in via `(record!)`. Still can't restore: nav-stack, native/platform,
   in-flight async, focus/scroll (not `[loc sym]` atoms).
 
 - **Riverpod into the state channel — DEFERRED (low value / core cost).** A dev-mode `ProviderObserver`
