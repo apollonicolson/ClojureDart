@@ -202,8 +202,9 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
   two resets in one eval → one 2-entry tx; host write-state adds no tx; record → mutate → `(seek! 0)`
   reverts; restart replays a non-default target and re-arms recording. So the state channel is a
   Datomic-style transaction log — discrete epochs AND continuous record/seek are the SAME tx-log
-  (epochs = markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates**
-  (value-flow tracing) — a compiler-emit change, its own spike.
+  (epochs = markers), all host-recorded, id-addressed. Value-flow tracing (once framed as a
+  "compile-with-coordinates" emit change) is SHIPPED as `(trace 'form)` v1 — a host-side form-rewrite
+  that deliberately avoids emit surgery (see below), so no emit-level spike is needed.
 - **#5 form-level edit-back — SHIPPED (2026-07-04).** `(edit-back! .prop VALUE)` writes VALUE back to
   source as the named property of the *active pick's* widget form, then the watcher recompiles + hot-
   reloads. It's a **consolidation** — the pick already resolves widget → `.cljd file:line:col`

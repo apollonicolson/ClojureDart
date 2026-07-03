@@ -21,15 +21,15 @@
 - ✅ **Void-return trap** — see #1. Fixed in `magicast`; the manual trailing-`nil` workaround is no longer needed.
 - ✅ **Untyped member access** — see #3. Diagnostic now carries a type-hint suggestion.
 - ✅ **No `#dart {}` map literal** — FIXED (`8072cba`): `emit-dart-map-literal` emits `Map<K,V>.fromEntries([MapEntry …])`, ending the `jsonEncode`→`jsonDecode` round-trip for interop Maps. `^{:tag [K V]}` types it.
-- **`catch` needs an extra stacktrace binding** `(catch E e st …)`; **records need 3 ctor args** `(R. a nil {} -1)`; **`super` needs `^super`** on `this` (`doc/differences.md`). Shape papercuts — document prominently.
-- **Building Dart collections** — `#dart ^T []` + `.add` for growable lists; the idiom isn't discoverable.
+- ✅ **`catch`/record/`super` shape papercuts** — `(catch E e st …)`, `(R. a nil {} -1)`, `^super` on `this`. **DOCUMENTED** in §E (copy-paste shapes cheat-sheet), verified against `doc/differences.md`.
+- ✅ **Building Dart collections** — `#dart ^T []` + `.add`; in the §E cheat-sheet.
 
 ### B. Core / semantic gaps vs JVM Clojure
 - ✅ **`format` absent** — #2. Added `cljd.core/format` (Formatter-accurate subset).
 - ✅ **`instance?` inline-only** — #4. HOF failure is now self-explaining.
-- **No device `read-string`** — it's `cljd.edn/read-string`, not core (lived; bit `write-state`). *Fix:* alias or document.
-- **No device `eval`/`resolve`/`macroexpand`/`slurp`/`spit`** — no runtime var namespace on device (host-only). Expected; document the host/device table.
-- **Lazy `def` init** (`differences.md`) — defs initialize **by-need, not top-to-bottom** (tree-shaking); order-dependent top-level side effects silently break. Semantic gotcha — document loudly.
+- ✅ **No device `read-string`** — it's `cljd.edn/read-string`, not core. **DOCUMENTED** (§E host/device table + Notes): core can't alias it (edn requires core → circular), so document, don't alias.
+- ✅ **No device `eval`/`resolve`/`macroexpand`/`slurp`/`spit`** — host-only. **DOCUMENTED** in §E's host-vs-device capability table.
+- ✅ **Lazy `def` init** — defs initialize by-need, not top-to-bottom (tree-shaking); order-dependent top-level side effects silently break. **DOCUMENTED** in §E.
 
 ### C. Reload / tooling (all lived)
 - ✅ **`:watch`/`:managed` binding changes and `defonce` removals don't rebind on hot-reload** — element keeps the stale subscription (surfaced as `ISeqable for int`); needs a restart, no signal. **Warning shipped** (`3175320`): `build.clj` seeds each file's fragile-binding signature at launch and prints a restart-needed advisory (with before/after diff) when a reload-triggering edit changes it. The reload *semantics* are unchanged — the gap is now legible, not silent.
