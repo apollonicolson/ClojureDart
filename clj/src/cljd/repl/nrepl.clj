@@ -151,6 +151,30 @@
             line (get-in rng [:coverage :hits])]
         (str uri ":" line)))))
 
+;; ── Value-flow tracing: instrument a form (host-side rewrite) ─────────────────
+;; (trace 'form) macroexpands, then wraps each plain fn-call in (record! coord …), so the device
+;; streams every intermediate value with its form-tree coordinate — FlowStorm-style, no emit change.
+;; v0: instruments fn-calls; special forms + interop pass through un-descended (the skip-list is the
+;; correctness surface — wrapping a non-value position would break the form). Widens in later passes.
+(def ^:private +trace-special+
+  '#{quote fn fn* let let* loop loop* letfn letfn* if do def deftype deftype* defprotocol defprotocol*
+     reify reify* try catch finally throw new set! . .. var recur case case* monitor-enter monitor-exit
+     ns in-ns dart:async dart})
+(defn- trace-member? [h] (and (symbol? h) (.startsWith (name h) ".")))
+(defn- instrument
+  ([form] (instrument [] form))
+  ([coord form]
+   (let [f (try (compiler/macroexpand {} form) (catch Throwable _ form))]
+     (if (and (seq? f) (seq f) (symbol? (first f))
+              (not (contains? +trace-special+ (first f)))
+              (not (trace-member? (first f))))
+       ;; plain fn-call → record its result + recurse into value-position args
+       (list 'cljd.flutter/record! (apply str (interpose "," coord))
+             (cons (first f)
+                   (map-indexed (fn [i a] (instrument (conj coord (inc i)) a)) (rest f))))
+       ;; special form / interop / non-call: pass through; still record the WHOLE result at the top
+       (if (empty? coord) (list 'cljd.flutter/record! "" f) f)))))
+
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
@@ -240,7 +264,12 @@
 
          (= kind "cljd.log")
          (let [v (try (read-string (:edn data)) (catch Throwable _ ::unreadable))]
-           (when (not= v ::unreadable) (record-tl! :log v))))))
+           (when (not= v ::unreadable) (record-tl! :log v)))
+
+         ;; (trace 'form): each instrumented sub-expression streams its coord + value here.
+         (= kind "cljd.trace")
+         (let [v (try (read-string (:value data)) (catch Throwable _ (:value data)))]
+           (record-tl! :trace {:coord (:coord data) :value v})))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -414,6 +443,18 @@
                           dart (try (compiler/form->dart-expr f)
                                     (catch Throwable e (str "compile error: " (errors/format-compile e))))]
                       (send! {:value dart :ns (name @*current-ns)}))
+
+                    ;; (trace 'form): value-flow — instrument the form (wrap each fn-call in record!),
+                    ;; eval it on device; each sub-expression's coord+value streams to (timeline :trace).
+                    ;; Returns the final value. v0 traces fn-calls; see instrument's skip-list.
+                    trace
+                    (let [f (unwrap-quote (second form))
+                          instrumented (try (instrument f) (catch Throwable _ f))
+                          r (repl-eval/eval-form client iso-id instrumented
+                              {:ns-lib-uri (ns->lib-uri @*current-ns) :trigger-reload trigger-reload})]
+                      (if (:error r)
+                        (do (vreset! errored true) (send! {:err (:message r) :ex "cljd.trace-error"}))
+                        (send! {:value (:value r) :ns (name @*current-ns)})))
 
                     ;; state time-travel, HOST-recorded. (states) READs the whole app state as data;
                     ;; (epoch!) records a snapshot into the host timeline; (restore-epoch N) DIRECTS

@@ -1408,6 +1408,14 @@
   [event-map]
   (post-event! "cljd.log" {"edn" (convert/jsonEncode (pr-str event-map))}))
 
+(defn record!
+  "Value-flow probe for `(trace 'form)`: return V unchanged, side-effect a trace event (form-tree
+   COORD + value) to the host over `cljd.trace`. The host-side instrumenter wraps each fn-call in
+   this, so the device streams every intermediate value with its coordinate — FlowStorm-style."
+  [coord v]
+  (post-event! "cljd.trace" {"coord" (convert/jsonEncode coord) "value" (convert/jsonEncode (pr-str v))})
+  v)
+
 (defn report-error!
   "Push an error onto the ONE cljd error stream (`cljd.error` on the VM-Service Extension stream) so it
    flows through the host plumbing (nREPL `(errors)` + live forward). Any cljd code — or any Dart
