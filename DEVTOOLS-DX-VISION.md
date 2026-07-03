@@ -201,8 +201,9 @@ device — inline + amber handle + exact loc — instead of silently keeping old
   **per-script** (whole-isolate crashes the on-device app — see memory `getsourcereport-per-script`),
   mapped through `resolve-wloc`. Zero instrumentation; the line-level layer *below* the coord primitive.
 
-- **Value-flow tracing `(trace 'form)` — the marquee, now de-risked.** A **host-side form-rewrite**,
-  NOT emit surgery: a compile-time walk wraps each sub-expression in `(record! coord expr)` (returns
+- **Value-flow tracing `(trace 'form)` — SHIPPED (v0, rank 1).** Validated: `(trace '(+ (* 2 3)
+  (- 10 4)))` → `12`, `(timeline :trace)` shows coord `"1"`→6, `"2"`→6, `""`→12. A **host-side
+  form-rewrite**, NOT emit surgery: a compile-time walk wraps each sub-expression in `(record! coord expr)` (returns
   the value, side-effects `postEvent "cljd.trace" {coord,value}`), emits the rewritten form, registers
   the form once. `emit` (`compiler.cljc:3716`) stays untouched — decisive de-risk. Coord = form-tree
   path (`"2,1"`), reusing FlowStorm's `{form,coord}` display. **Load-bearing correctness = the skip-list**
@@ -210,16 +211,16 @@ device — inline + amber handle + exact loc — instead of silently keeping old
   type tags). On-demand/opt-in first; measure overhead before any always-on emit pass. **This is the
   real fix for the def-level source-map wall** (CLJD-DX-AUDIT #5) at sub-expression granularity.
 
-- **Clojure-native observability — cheap, `tap>` already exists.** `cljd.core` defines
+- **Clojure-native observability — SHIPPED (`tap>`/`log!`, rank 1).** `cljd.core` defines
   `add-tap`/`tap>` (`core.cljd:9370`). Device→host: `(add-tap #(post-event! "cljd.tap" {:edn (pr-str %)}))`
   + a `cljd.tap` host branch + `(taps)` — ~15 lines (cljd `tap>` runs inline, so keep the fn cheap).
   **Portal** (djblue/portal) in the host JVM (`add-tap #(portal/submit %)`) = near-free data browser,
   zero device change. **datafy/nav** = highest value/line (opaque Dart objects → maps). mulog: port the
   event-map + `with-context` idea, skip its runtime (the Extension stream is the transport).
 
-- **One unified timeline — consolidation.** Fold `cljd.tap`/`cljd.log`/`cljd.error`/`cljd.state-change`
-  into a single `+cljd-timeline+` keyed by `:t`, tagged `:kind`; `(timeline)` / `(timeline :kind …)`.
-  Causal ordering across taps, logs, errors, and state — one event log for the four channels built so far.
+- **One unified timeline — SHIPPED.** `cljd.tap`/`cljd.log`/`cljd.error`/`cljd.state-change` (and
+  `cljd.trace`) fold into a single `+cljd-timeline+` keyed by `:t`, tagged `:kind`; `(timeline)` /
+  `(timeline :kind …)`. Causal ordering across taps, logs, errors, state, and traces — one event log.
 
 - **Cross-restart auto-replay ("hard rollback").** The change-log survives device restart (host-side);
   wire replay-on-reconnect: detect a fresh app via **isolate-id** (a heartbeat gap only *triggers the
