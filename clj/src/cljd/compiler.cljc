@@ -1721,6 +1721,17 @@
    (magicast dart-expr expected-type (:dart/type (infer-type dart-expr)) env))
   ([dart-expr expected-type actual-type env]
    (cond
+     ;; A void-typed expression (e.g. List.add, StringBuffer.write, postEvent)
+     ;; has no value, so Dart rejects it wherever a value is consumed — the #1
+     ;; cljd papercut ("void can't be used"). In Clojure such side-effecting
+     ;; forms yield nil, so honor that: run the call as a statement and yield
+     ;; null. Only fires when the value is actually consumed as non-void; a
+     ;; genuine void tail (expected void) is left untouched below.
+     (and expected-type
+          (= 'void (:canon-qname actual-type))
+          (not= 'void (:canon-qname expected-type)))
+     (list 'dart/let [[nil dart-expr]] nil)
+
      (= 'dc.dynamic (:canon-qname expected-type)) dart-expr ; TODO: should be covered by is-assignable?
 
      (is-assignable? expected-type actual-type) dart-expr   ; <1>
@@ -1883,13 +1894,17 @@
           list-tag (vary-meta 'dart:core/List assoc :type-params [item-tag])])
     (if (:fixed (meta x))
       (if-some [[item & more-items] (seq x)]
-        (let [lsym (dart-local (with-meta 'fl {:tag list-tag}) env)]
+        (let [lsym (dart-local (with-meta 'fl {:tag list-tag}) env)
+              ;; magicast each element to dynamic so a void-typed element (e.g.
+              ;; a bare .add/.write) becomes a statement yielding null rather
+              ;; than an illegal `List.filled(n, voidExpr)`. No-op for non-void.
+              emit-item (fn [item] (magicast (emit quoted item env) dc-dynamic env))]
           (list 'dart/let
             (into
-              [[lsym (with-lifted [item (emit quoted item env)] env
+              [[lsym (with-lifted [item (emit-item item)] env
                        (list 'dart/. (emit-type list-tag env) "filled" (count x) item))]]
               (map-indexed (fn [i item]
-                             [nil (with-lifted [item (emit quoted item env)] env
+                             [nil (with-lifted [item (emit-item item)] env
                                     (list 'dart/. lsym "[]=" (inc i) item))]))
               more-items)
             lsym))
