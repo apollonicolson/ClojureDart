@@ -667,9 +667,13 @@
                                         ;; heartbeat: ping the device ~1/s so its toolbar shows a live
                                         ;; connection dot; when this process dies or the VM detaches,
                                         ;; pings stop and the device watchdog flips it to disconnected.
+                                        ;; Re-resolve the isolate each tick — a hot restart spins a NEW
+                                        ;; isolate, and pinging the dead launch-time one silently fails,
+                                        ;; falsely flipping the dot to disconnected even though eval works.
                                         (daemon
                                           (loop []
-                                            (try (vmservice/call-ext client iso "ext.cljd.ping" {})
+                                            (try (when-some [i (vmservice/main-isolate-id client)]
+                                                   (vmservice/call-ext client i "ext.cljd.ping" {}))
                                                  (catch Throwable _ nil))
                                             (Thread/sleep 1000)
                                             (recur)))
