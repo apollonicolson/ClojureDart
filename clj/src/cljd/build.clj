@@ -661,6 +661,7 @@
                                                       :ns-lib-uri "cljd/core.dart" :port 0
                                                       :trigger-reload trigger-reload
                                                       :trigger-restart trigger-restart
+                                                      :source-dirs dirs   ; for (edit-back): cljd loc → src file
                                                       :await? (boolean await-ok)
                                                       :pick? (boolean pick-ok)
                                                       :remember? (boolean await-ok)})]
