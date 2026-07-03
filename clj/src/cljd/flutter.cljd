@@ -1278,9 +1278,18 @@
 ;; state time-travel now lives HOST-side: read-state serialises the app's state to {id→value} data,
 ;; the host records the timeline, write-state directs the device back to any recorded point. No
 ;; device-side epoch store — the durable memory is the host (survives hot-reload AND restart).
-;; +cljd-recording+: when on, every state atom streams its changes to the host (cljd.state-change),
-;; so the host builds a CONTINUOUS timeline automatically — restore becomes seek(t).
+;;
+;; Recording batches changes into TRANSACTIONS at the event boundary: all atom changes from one
+;; synchronous handler (or one host eval) land in the same event-loop turn, so a microtask flushes
+;; them as ONE `cljd.tx` event — the event is the tx, like re-frame/redux. A microtask (not a
+;; post-frame callback) always runs, so recording never depends on the render loop pumping a frame.
+;; +cljd-replaying+ suppresses the echo when the HOST drives a write-state (its reset!s fire these
+;; same watches; a restore must not re-record as fresh changes).
 (defonce ^:private +cljd-recording+ (atom false))
+(defonce ^:private +cljd-tx-buffer+ (atom {}))            ; id → value, pending this turn
+(defonce ^:private +cljd-tx-flush-scheduled+ (atom false))
+(defonce ^:private +cljd-replaying+ (atom false))         ; true while a host write-state applies
+(defonce ^:private +cljd-tx-cause+ (atom nil))            ; optional label attached to the next tx
 
 (def ^:private +pick-colors+
   [0xFF00E676 0xFF40C4FF 0xFFFFAB40 0xFFFF4081 0xFFB388FF 0xFFFFEB3B])
@@ -1606,38 +1615,58 @@
    the atom's :watch → setState during build/layout → 'Build scheduled during frame'; and the
    live-state walk (Element.visitChildElements) is itself illegal during build — so defer BOTH to a
    post-frame callback. Returns the number of ids actually matched+written (idle path) or requested
-   (deferred path, where the match count isn't known yet)."
+   (deferred path, where the match count isn't known yet). Wraps the reset!s in +cljd-replaying+ so
+   the atom watches don't re-record a host restore as fresh device changes (echo)."
   [snap]
   (let [wb (widgets/WidgetsBinding.instance)
         apply! (fn []
-                 (let [live (live-state)]
-                   (reduce (fn [n e]
-                             (if-some [a (get live (key e))] (do (reset! a (val e)) (inc n)) n))
-                           0 snap)))]
+                 (try
+                   (reset! +cljd-replaying+ true)
+                   (let [live (live-state)]
+                     (reduce (fn [n e]
+                               (if-some [a (get live (key e))] (do (reset! a (val e)) (inc n)) n))
+                             0 snap))
+                   (finally (reset! +cljd-replaying+ false))))]
     (if (= (.-schedulerPhase wb) scheduler/SchedulerPhase.idle)
       (apply!)
       (do (.addPostFrameCallback wb (fn [_] (apply!) nil))
           (.scheduleFrame wb)
           (count snap)))))
 
-(defn- stream-change!
-  "Stream one atom change to the host as data (cljd.state-change): id + pr-str'd new value (EDN,
-   so #inst/maps/vectors round-trip)."
+(defn- flush-tx!
+  "Post the accumulated buffer to the host as ONE cljd.tx event (delta {id→value} + cause), then
+   clear it. Runs on a microtask at end-of-turn. A no-op when nothing accumulated."
+  []
+  (reset! +cljd-tx-flush-scheduled+ false)
+  (let [delta @+cljd-tx-buffer+]
+    (reset! +cljd-tx-buffer+ {})
+    (when (seq delta)
+      (post-event! "cljd.tx"
+        {"delta" (convert/jsonEncode (pr-str delta))
+         "cause" (convert/jsonEncode (pr-str @+cljd-tx-cause+))}))))
+
+(defn- record-change!
+  "A watched atom changed: fold it into the pending transaction buffer and schedule ONE microtask to
+   flush at end-of-turn. All changes from one synchronous event handler (or one host eval) land in the
+   same turn → one transaction — the event is the tx boundary, like re-frame/redux. A microtask (not a
+   post-frame callback) always runs, so recording doesn't depend on the render loop pumping a frame —
+   the bug the post-frame version hit on an idle app. Skipped while replaying, or when recording off."
   [id new]
-  (post-event! "cljd.state-change"
-    {"id" (convert/jsonEncode (pr-str id))
-     "value" (convert/jsonEncode (pr-str new))}))
+  (when (and @+cljd-recording+ (not @+cljd-replaying+))
+    (swap! +cljd-tx-buffer+ assoc id new)
+    (when (compare-and-set! +cljd-tx-flush-scheduled+ false true)
+      (dart:async/scheduleMicrotask (fn [] (flush-tx!) nil)))))
 
 (defn arm-recording!
-  "When ON, add-watch every live state atom so each change streams to the host → continuous timeline.
-   Idempotent (add-watch replaces per atom+key), so re-arming — e.g. on the heartbeat — picks up atoms
-   from newly-mounted repl-points. OFF just flips the flag (watchers no-op via the flag check)."
+  "When ON, add-watch every live state atom so each change folds into the frame's transaction (→ host
+   as cljd.tx). Idempotent (add-watch replaces per atom+key), so re-arming — e.g. on the heartbeat —
+   picks up atoms from newly-mounted repl-points. OFF just flips the flag (watchers no-op via it)."
   [on?]
   (reset! +cljd-recording+ (boolean on?))
   (when on?
     (doseq [e (live-state)]
       (let [id (key e)]
-        (add-watch (val e) id (fn [_ _ _ new] (when @+cljd-recording+ (stream-change! id new)) nil)))))
+        (add-watch (val e) id (fn [_ _ _ new] (record-change! id new) nil)))))
   (boolean on?))
 
 (defn- make-pick

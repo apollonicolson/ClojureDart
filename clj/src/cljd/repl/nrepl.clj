@@ -211,12 +211,12 @@
          (cons (first f)
            (map-indexed (fn [i a] (instrument (conj coord (inc i)) a)) (rest f))))))))
 
-(defn- change-snapshot
-  "Collapse an ordered change-log ({:id :value} seq) into the state map {id → value}, last write
-   winning per id. The basis for replay and time-travel: (seek n) snapshots a prefix, (replay)/boot
-   snapshots the whole log."
-  [changes]
-  (reduce (fn [m c] (assoc m (:id c) (:value c))) {} changes))
+(defn- tx-snapshot
+  "Collapse an ordered transaction seq into the state map {id → value} by merging each tx's :delta,
+   later txs winning per id. The basis for replay and time-travel: (seek n) snapshots a prefix,
+   (replay)/boot snapshots the whole log."
+  [txs]
+  (reduce (fn [m tx] (merge m (:delta tx))) {} txs))
 
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :trigger-restart :await? :pick? :remember?}"
@@ -244,18 +244,19 @@
         ;; host-recorded state timeline: each entry is a read-state snapshot (EDN {id→value}). The
         ;; DEVICE holds no epoch/history store — the durable memory is HERE, so it survives a device
         ;; restart (replay into a fresh app, addressed by stable [loc sym]). +cljd-epochs+ holds named
-        ;; cut-points (indices) into the change-log: an epoch is just a labeled position in the ONE
+        ;; cut-points (indices) into the tx-log: an epoch is just a labeled position in the ONE
         ;; timeline — (epoch!) drops a full-state keyframe + marks it; no separate snapshot store.
         +cljd-epochs+ (atom [])
-        ;; continuous change-stream: while recording, each device atom change arrives here as
-        ;; {:id :value} in order. seek(N) replays 0..N into a state snapshot → write-state.
-        +cljd-change-log+ (atom [])
+        ;; the transaction log: while recording, each frame's batched atom changes arrive as one
+        ;; {:tx n :t ms :delta {id→value} :cause c} (device cljd.tx event). seek(N) merges deltas
+        ;; 0..N into a state snapshot → write-state. Host-durable, so it survives a device restart.
+        +cljd-tx-log+ (atom [])
         ;; recording armed? — gates cross-restart auto-replay (only restore state when the user
         ;; asked for a durable recording; a plain hot-restart otherwise starts clean).
         +cljd-recording?+ (atom false)
         ;; last coverage snapshot (set of dart uri:line) — (ran) diffs against it.
         +cljd-coverage-snap+ (atom #{})
-        ;; the UNIFIED timeline: every device event (tap / log / error / state-change) appended in
+        ;; the UNIFIED timeline: every device event (tap / log / error / tx) appended in
         ;; causal order, tagged :kind — one ordered log across all four channels. `record-tl!` clocks
         ;; each entry ((tl-now) is set per-eval below to avoid Date.now in this file's macros).
         +cljd-timeline+ (atom [])
@@ -283,12 +284,12 @@
                                   (list 'cljd.flutter/write-state snap)
                                   {:ns-lib-uri "cljd/flutter.dart"}))
                         (catch Throwable _ nil)))
-        ;; replay!: re-apply the whole recorded change-log (last value wins per id) onto the device's
-        ;; live atoms. The change-log lives HERE (host), so this survives a device hot-restart — the
+        ;; replay!: re-apply the whole recorded tx-log (last value wins per id) onto the device's
+        ;; live atoms. The tx-log lives HERE (host), so this survives a device hot-restart — the
         ;; isolate/atoms are fresh, addressed by stable [loc sym]. {:atoms n :wrote m} or nil if empty.
         replay!
         (fn []
-          (let [snap (change-snapshot @+cljd-change-log+)]
+          (let [snap (tx-snapshot @+cljd-tx-log+)]
             (when (seq snap) {:atoms (count snap) :wrote (write-snap! snap)})))
         ;; replay-settle!: the boot-time replay (fired on cljd.booted after a restart). Runs on the
         ;; WS-listener future, which lacks the compiler bindings, so it establishes the context
@@ -299,7 +300,7 @@
         replay-settle!
         (fn []
           (repl-eval/with-compiler-context ctx @*current-ns
-            (let [snap (change-snapshot @+cljd-change-log+)
+            (let [snap (tx-snapshot @+cljd-tx-log+)
                   read-live #(try (read-string (:value (repl-eval/eval-form client @*iso
                                                          '(cljd.flutter/read-state)
                                                          {:ns-lib-uri "cljd/flutter.dart" :await? true})))
@@ -350,13 +351,15 @@
              (f "Stderr" (str "⚠ [" (:phase e) "] " (:message e)
                               (when (seq (:stack e)) (str "\n" (:stack e))) "\n"))))
 
-         ;; a device atom change (recording on): parse the EDN id+value → change-log + timeline
-         (= kind "cljd.state-change")
-         (let [id (try (read-string (:id data)) (catch Throwable _ nil))
-               v  (try (read-string (:value data)) (catch Throwable _ ::unreadable))]
-           (when (and id (not= v ::unreadable))
-             (swap! +cljd-change-log+ conj {:id id :value v})
-             (record-tl! :state {:id id :value v})))
+         ;; a frame's batched changes (recording on): parse the EDN delta {id→value} + cause → append
+         ;; ONE transaction to the log (indexed by position) + the timeline.
+         (= kind "cljd.tx")
+         (let [delta (try (read-string (:delta data)) (catch Throwable _ nil))
+               cause (try (read-string (:cause data)) (catch Throwable _ nil))]
+           (when (and (map? delta) (seq delta))
+             (let [tx {:tx (count @+cljd-tx-log+) :t (System/currentTimeMillis) :delta delta :cause cause}]
+               (swap! +cljd-tx-log+ conj tx)
+               (record-tl! :tx tx))))
 
          ;; Clojure-native observability: (tap> x) and (log! m) on the device → the unified timeline.
          (= kind "cljd.tap")
@@ -513,7 +516,7 @@
                         (send! {:value (pr-str @+cljd-errors+) :ns (name @*current-ns)}))
 
                     ;; (q FORM): evaluate FORM on the HOST over the collected introspection data
-                    ;; as plain values — the bound symbols `errors` `timeline` `changes` `epochs`
+                    ;; as plain values — the bound symbols `errors` `timeline` `txs` `epochs`
                     ;; `coverage` are the current stores, so ops compose like any Clojure:
                     ;;   (q (count errors))
                     ;;   (q (frequencies (map :kind timeline)))
@@ -523,9 +526,9 @@
                     q
                     (let [data {'errors @+cljd-errors+
                                 'timeline @+cljd-timeline+
-                                'changes @+cljd-change-log+
+                                'txs @+cljd-tx-log+
                                 ;; epochs resolve to the state map AT each cut-point (not the raw index)
-                                'epochs (mapv #(change-snapshot (take (inc %) @+cljd-change-log+)) @+cljd-epochs+)
+                                'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+)) @+cljd-epochs+)
                                 'coverage @+cljd-coverage-snap+}
                           r (try
                               (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data))
@@ -593,10 +596,10 @@
                         (send! {:value (:value r) :ns (name @*current-ns)})))
 
                     ;; state time-travel, HOST-recorded, ONE timeline. (states) READs the whole app
-                    ;; state as data. (epoch!) drops a full-state keyframe into the change-log and
+                    ;; state as data. (epoch!) drops a full-state keyframe into the tx-log and
                     ;; marks its position; (epochs) lists the markers; (restore-epoch N) seeks the
                     ;; device back to epoch N's cut-point. Epochs are discrete save points; (seek)
-                    ;; is continuous — both navigate the same change-log, addressed by stable [loc sym].
+                    ;; is continuous — both navigate the same tx-log, addressed by stable [loc sym].
                     states
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart" :await? true})]
@@ -606,60 +609,62 @@
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart" :await? true})
                           state (try (read-string (:value r)) (catch Throwable _ {}))]
-                      ;; append the full snapshot as a keyframe, then mark the index of its last entry.
-                      (swap! +cljd-change-log+ into (map (fn [[id v]] {:id id :value v})) state)
-                      (swap! +cljd-epochs+ conj (dec (count @+cljd-change-log+)))
+                      ;; append the full snapshot as a keyframe transaction, then mark its index.
+                      (swap! +cljd-tx-log+ conj {:tx (count @+cljd-tx-log+) :t (System/currentTimeMillis)
+                                                 :delta state :cause :epoch})
+                      (swap! +cljd-epochs+ conj (dec (count @+cljd-tx-log+)))
                       (send! {:value (str "epoch " (dec (count @+cljd-epochs+)) " recorded ("
-                                       (count state) " atoms → change-log)")
+                                       (count state) " atoms → tx-log)")
                               :ns (name @*current-ns)}))
 
                     epochs
-                    (send! {:value (str (count @+cljd-epochs+) " epochs (markers into the change-log)")
+                    (send! {:value (str (count @+cljd-epochs+) " epochs (markers into the tx-log)")
                             :ns (name @*current-ns)})
 
                     restore-epoch
                     (let [i (second form)
                           idx (nth @+cljd-epochs+ i nil)]
                       (if (some? idx)
-                        (let [wrote (write-snap! (change-snapshot (take (inc idx) @+cljd-change-log+)))]
+                        (let [wrote (write-snap! (tx-snapshot (take (inc idx) @+cljd-tx-log+)))]
                           (send! {:value (str "directed device to epoch " i " (" wrote " atoms)")
                                   :ns (name @*current-ns)}))
                         (send! {:err (str "no epoch " i) :ex "cljd.no-epoch"})))
 
-                    ;; continuous recording: (record) starts a fresh timeline with a base keyframe
-                    ;; (the full state now) + arms device atom-watchers; (record false) stops.
+                    ;; continuous recording: (record) starts a fresh timeline with a base keyframe tx
+                    ;; (the full state now) + arms device frame-batched recording; (record false) stops.
                     record
                     (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
                       (if on?
                         (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                                    {:ns-lib-uri "cljd/flutter.dart" :await? true})
                               base (try (read-string (:value r0)) (catch Throwable _ {}))]
-                          (reset! +cljd-change-log+ (mapv (fn [[id v]] {:id id :value v}) base))
+                          (reset! +cljd-tx-log+ [{:tx 0 :t (System/currentTimeMillis)
+                                                  :delta base :cause :record/base}])
                           (reset! +cljd-epochs+ [])   ; fresh timeline → old epoch markers are stale
                           (reset! +cljd-recording?+ true)
                           (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
                             {:ns-lib-uri "cljd/flutter.dart"})
-                          (send! {:value (str "recording on (" (count @+cljd-change-log+) " base atoms)")
+                          (send! {:value (str "recording on (" (count base) " base atoms)")
                                   :ns (name @*current-ns)}))
                         (do (reset! +cljd-recording?+ false)
                             (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! false)
                               {:ns-lib-uri "cljd/flutter.dart"})
                             (send! {:value "recording off" :ns (name @*current-ns)}))))
 
-                    changes
-                    (send! {:value (str (count @+cljd-change-log+) " changes recorded") :ns (name @*current-ns)})
+                    txs
+                    (send! {:value (str (count @+cljd-tx-log+) " transactions recorded") :ns (name @*current-ns)})
 
-                    ;; (seek N): DIRECT the device to the state as of change N — replay 0..N into a
-                    ;; snapshot (last value wins per id) → write-state. Continuous time-travel.
+                    ;; (seek N): DIRECT the device to the state as of transaction N — merge deltas
+                    ;; 0..N into a snapshot (later txs win per id) → write-state. Continuous time-travel.
                     seek
                     (let [n (second form)
-                          snap (change-snapshot (take (inc n) @+cljd-change-log+))]
+                          snap (tx-snapshot (take (inc n) @+cljd-tx-log+))]
                       (if (seq snap)
-                        (send! {:value (str "sought to change " n " (" (write-snap! snap) " atoms)")
+                        (send! {:value (str "sought to tx " n " (" (write-snap! snap) " atoms)")
                                 :ns (name @*current-ns)})
-                        (send! {:err (str "no changes up to " n " (record first?)") :ex "cljd.no-change"})))
+                        (send! {:err (str "no transactions up to " n " (record first?)") :ex "cljd.no-tx"})))
 
-                    ;; (replay): re-apply the WHOLE recorded change-log onto the live atoms — the
+                    ;; (replay): re-apply the WHOLE recorded tx-log onto the live atoms — the
                     ;; latest state, not a point in time. Same write-state mechanism as (seek); used
                     ;; to restore after a hot restart (fired automatically — see (restart!)). Manual
                     ;; call is the testable core of cross-restart replay.
