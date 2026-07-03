@@ -161,19 +161,55 @@
      reify reify* try catch finally throw new set! . .. var recur case case* monitor-enter monitor-exit
      ns in-ns dart:async dart})
 (defn- trace-member? [h] (and (symbol? h) (.startsWith (name h) ".")))
+;; v1: fn-calls + the value positions of let*/if/do are instrumented; the other
+;; special forms + interop still pass through (they don't have simple value-flow
+;; sub-positions, or wrapping them would break the form). Binding SYMBOLS,
+;; recur/set! targets, quote/fn bodies etc. are never wrapped — that skip-list is
+;; the correctness surface.
+(defn- record-at [coord x]
+  (list 'cljd.flutter/record! (apply str (interpose "," coord)) x))
 (defn- instrument
   ([form] (instrument [] form))
   ([coord form]
-   (let [f (try (compiler/macroexpand {} form) (catch Throwable _ form))]
-     (if (and (seq? f) (seq f) (symbol? (first f))
-              (not (contains? +trace-special+ (first f)))
-              (not (trace-member? (first f))))
+   (let [f (try (compiler/macroexpand {} form) (catch Throwable _ form))
+         top (fn [x] (if (empty? coord) (record-at [] x) x))]
+     (cond
+       ;; leaf (not a symbol-headed call): record whole result only at the top
+       (not (and (seq? f) (seq f) (symbol? (first f))))
+       (top f)
+
+       ;; let/let*/loop/loop*: instrument each binding VALUE (keep the symbol/pattern)
+       ;; + body exprs. Handle both raw and macroexpanded heads — macroexpand may
+       ;; not fire outside a full compile context.
+       (contains? '#{let let* loop loop*} (first f))
+       (let [[op bindings & body] f
+             bindings' (vec (mapcat (fn [i [sym val]]
+                                      [sym (instrument (conj coord (str "let" i)) val)])
+                              (range) (partition 2 bindings)))
+             body' (map-indexed (fn [i e] (instrument (conj coord (str "b" i)) e)) body)]
+         (top (list* op bindings' body')))
+
+       ;; if: test + both branches are value positions
+       (= 'if (first f))
+       (let [[_ test then else] f]
+         (top (list 'if
+                (instrument (conj coord "if?") test)
+                (instrument (conj coord "then") then)
+                (if (> (count f) 3) (instrument (conj coord "else") else) else))))
+
+       ;; do: every form is a value position (last is the result)
+       (= 'do (first f))
+       (top (list* 'do (map-indexed (fn [i e] (instrument (conj coord (str "do" i)) e)) (rest f))))
+
+       ;; other special form / interop: pass through, record the whole result at top
+       (or (contains? +trace-special+ (first f)) (trace-member? (first f)))
+       (top f)
+
        ;; plain fn-call → record its result + recurse into value-position args
-       (list 'cljd.flutter/record! (apply str (interpose "," coord))
-             (cons (first f)
-                   (map-indexed (fn [i a] (instrument (conj coord (inc i)) a)) (rest f))))
-       ;; special form / interop / non-call: pass through; still record the WHOLE result at the top
-       (if (empty? coord) (list 'cljd.flutter/record! "" f) f)))))
+       :else
+       (record-at coord
+         (cons (first f)
+           (map-indexed (fn [i a] (instrument (conj coord (inc i)) a)) (rest f))))))))
 
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
@@ -396,6 +432,26 @@
                     errors
                     (do (when (= :clear (second form)) (reset! +cljd-errors+ []))
                         (send! {:value (pr-str @+cljd-errors+) :ns (name @*current-ns)}))
+
+                    ;; (q FORM): evaluate FORM on the HOST over the collected introspection data
+                    ;; as plain values — the bound symbols `errors` `timeline` `changes` `epochs`
+                    ;; `coverage` are the current stores, so ops compose like any Clojure:
+                    ;;   (q (count errors))
+                    ;;   (q (frequencies (map :kind timeline)))
+                    ;;   (q (filter #(= "flutter" (:phase %)) errors))
+                    ;; Fixes the "ops aren't values" gap: the stores live host-side, so this is a
+                    ;; pure host eval — no device round-trip, no dump-and-grep.
+                    q
+                    (let [data {'errors @+cljd-errors+
+                                'timeline @+cljd-timeline+
+                                'changes @+cljd-change-log+
+                                'epochs @+cljd-state-log+
+                                'coverage @+cljd-coverage-snap+}
+                          r (try
+                              (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data))
+                                      (second form)))
+                              (catch Throwable e {:q-error (.getMessage e)}))]
+                      (send! {:value (pr-str r) :ns (name @*current-ns)}))
 
                     ;; (picks-do FORM): run FORM in the scope of EVERY pick at once — `*env` is
                     ;; rebound to each pick's lexical map in turn. Returns a vector of results.
