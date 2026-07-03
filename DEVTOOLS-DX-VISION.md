@@ -192,12 +192,18 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
   journal entries + `#inst` dates as EDN); epoch → change → restore reverts; `(q epochs)` resolves each
   cut-point to its state map. Limits: only EDN-round-trippable values restore; a read taken *mid-rebuild*
   races (settle first); Riverpod providers still out of scope.
-  **Continuous stream — SHIPPED:** `(record)` add-watches every atom (re-armed on the heartbeat to
-  catch newly-mounted repl-points) so each change streams to the host (`cljd.state-change`) as an
-  ordered timeline; `(seek N)` replays 0..N → `write-state`. Validated: record → mutate → `(seek 0)`
-  reverts. So the state channel is complete — discrete epochs AND continuous record/seek are the SAME
-  change-log (epochs = keyframes + markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates** (value-flow tracing)
-  — a compiler-emit change, its own spike.
+  **Transaction stream — SHIPPED:** `(record)` add-watches every atom (re-armed on the heartbeat to
+  catch newly-mounted repl-points); changes accumulate into a per-turn buffer and flush as ONE
+  `cljd.tx` event on a microtask — all changes from one event handler / host eval = one transaction
+  (re-frame/redux style, not per-atom). Host `+cljd-tx-log+` entries are `{:tx :t :delta :cause}`;
+  `(seek N)` merges deltas 0..N → `write-state`; `(txs)` counts them. A microtask (not a post-frame
+  callback) always runs, so recording never depends on the render loop. `+cljd-replaying+` suppresses
+  the echo while a host `write-state` applies (a restore must not re-record itself). Validated:
+  two resets in one eval → one 2-entry tx; host write-state adds no tx; record → mutate → `(seek 0)`
+  reverts; restart replays a non-default target and re-arms recording. So the state channel is a
+  Datomic-style transaction log — discrete epochs AND continuous record/seek are the SAME tx-log
+  (epochs = markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates**
+  (value-flow tracing) — a compiler-emit change, its own spike.
 - **#5 form-level edit-back** — `update-in` a form + re-emit (compiler owns provenance); reverse-
   *inference* (Sketch-n-Sketch style) is research-grade.
 
