@@ -1577,9 +1577,22 @@
 
 (defn read-state
   "The whole app's live state as DATA: {[loc sym] → value}. A pure READ of every repl-point atom —
-   the host records this (an epoch is one read-state; a timeline is a series of them)."
+   the host records this (an epoch is one read-state; a timeline is a series of them).
+
+   Phase-aware like write-state: the live-state walk (Element.visitChildElements) is illegal during
+   build ('visitChildElements() called during build'), so when a read lands mid-frame — e.g. right
+   after a write-state scheduled a rebuild — defer the walk to the next post-frame callback and return
+   a Future<Map>; when idle (the common case), walk now and return the map. Callers that may race a
+   build await the result (:await? on the eval), so both shapes come back the same."
   []
-  (into {} (map (fn [e] [(key e) @(val e)])) (live-state)))
+  (let [snapshot (fn [] (into {} (map (fn [e] [(key e) @(val e)])) (live-state)))
+        wb (widgets/WidgetsBinding.instance)]
+    (if (= (.-schedulerPhase wb) scheduler/SchedulerPhase.idle)
+      (snapshot)
+      (let [c (dart:async/Completer.)]
+        (.addPostFrameCallback wb (fn [_] (.complete c (snapshot)) nil))
+        (.scheduleFrame wb)
+        (.-future c)))))
 
 (defn write-state
   "DIRECT the app to a recorded state: SNAP is {[loc sym] → value} (arrives as a compiled literal,

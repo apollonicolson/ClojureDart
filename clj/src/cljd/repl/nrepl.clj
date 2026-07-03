@@ -302,7 +302,7 @@
             (let [snap (change-snapshot @+cljd-change-log+)
                   read-live #(try (read-string (:value (repl-eval/eval-form client @*iso
                                                          '(cljd.flutter/read-state)
-                                                         {:ns-lib-uri "cljd/flutter.dart"})))
+                                                         {:ns-lib-uri "cljd/flutter.dart" :await? true})))
                                   (catch Throwable _ nil))
                   ;; landed? every recorded id that is CURRENTLY live equals its recorded value.
                   ;; (Ids for not-yet-mounted widgets are skipped — can't restore what isn't there.)
@@ -599,12 +599,12 @@
                     ;; is continuous — both navigate the same change-log, addressed by stable [loc sym].
                     states
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                              {:ns-lib-uri "cljd/flutter.dart"})]
+                              {:ns-lib-uri "cljd/flutter.dart" :await? true})]
                       (send! {:value (:value r) :ns (name @*current-ns)}))
 
                     epoch!
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                              {:ns-lib-uri "cljd/flutter.dart"})
+                              {:ns-lib-uri "cljd/flutter.dart" :await? true})
                           state (try (read-string (:value r)) (catch Throwable _ {}))]
                       ;; append the full snapshot as a keyframe, then mark the index of its last entry.
                       (swap! +cljd-change-log+ into (map (fn [[id v]] {:id id :value v})) state)
@@ -632,7 +632,7 @@
                     (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
                       (if on?
                         (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                                   {:ns-lib-uri "cljd/flutter.dart"})
+                                   {:ns-lib-uri "cljd/flutter.dart" :await? true})
                               base (try (read-string (:value r0)) (catch Throwable _ {}))]
                           (reset! +cljd-change-log+ (mapv (fn [[id v]] {:id id :value v}) base))
                           (reset! +cljd-epochs+ [])   ; fresh timeline → old epoch markers are stale
