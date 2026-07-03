@@ -632,7 +632,7 @@
                                                         (do (reset! +cljd-repl-fbox+ nil)
                                                             (-> v
                                                                 (.then (fn [x] (+cljd-repl-remember x) (reset! +cljd-repl-fbox+ (pr-str x))))
-                                                                (.catchError (fn [e] (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
+                                                                (.catchError (fn [e] (set! +cljd-repl-e+ e) (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
                                                             "__cljd_future_pending__")
                                                         (do (+cljd-repl-remember v) (pr-str v)))))
                                                  {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
