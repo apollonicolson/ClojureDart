@@ -395,6 +395,20 @@
   [& {:keys [watch namespaces flutter] :or {watch false}}]
   (let [user-dir (System/getProperty "user.dir")
         analyzer-dir (ensure-cljd-analyzer!)]
+    ;; JVM nREPL on the build process itself, so a Clojure REPL (e.g. clojure-mcp)
+    ;; can hot-reload the compiler in-process: (require 'cljd.compiler :reload)
+    ;; updates every function while preserving the symbol table (compiler/nses is
+    ;; defonce); then touch a .cljd file and the watcher recompiles with the new
+    ;; compiler + device hot-reloads. Skips the ~60s relaunch for compiler edits.
+    ;; Port written to .nrepl-port-jvm (kept separate from the device .nrepl-port).
+    (when (or watch flutter)
+      (try
+        (let [port (:port ((requiring-resolve 'nrepl.server/start-server) :port 0))]
+          (spit ".nrepl-port-jvm" (str port))
+          (println (title "🧬 build JVM nREPL") "on port" port
+            "— (require 'cljd.compiler :reload) to hot-reload the compiler"))
+        (catch Throwable e
+          (println "[build-nrepl] failed to start:" (.getMessage e)))))
     (exec {:in nil :out nil} (some-> *deps* :cljd/opts :kind name) "pub" "get")
     (with-taps
       [(fn [x]

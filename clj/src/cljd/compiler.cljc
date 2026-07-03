@@ -401,7 +401,12 @@
 
 (def ^:dynamic dynamic-warning on-dynamic-fail)
 
-(def nses (atom {:libs {"dart:core" {:dart-alias "dc" :ns nil}
+;; defonce, NOT def: this atom IS the whole compiler symbol table (every compiled
+;; namespace's mappings, aliases, emitted defs). A plain def would re-init it to
+;; empty on `(require 'cljd.compiler :reload)`, wiping the accumulated state; with
+;; defonce, an in-process reload updates every function but preserves the table —
+;; the one piece of needful in-memory state, so the compiler can be hot-reloaded.
+(defonce nses (atom {:libs {"dart:core" {:dart-alias "dc" :ns nil}
                         "dart:async" {:dart-alias "da" :ns nil}} ; dc can't clash with user aliases because they go through dart-global
                  ; map from dart aliases to libs
                  :dart-aliases {"dc" "dart:core"
