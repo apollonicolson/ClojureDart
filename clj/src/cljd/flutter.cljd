@@ -1531,11 +1531,11 @@
                   (assoc :type (str (.-runtimeType (.-widget el))))))))
     (catch Object _ nil)))
 
-(declare pick-element!)   ; forward ref: the TREE rows tap-to-re-target via pick-element!
+(declare pick-element!)   ; forward ref: a TREE ancestor row tap-to-picks it (toggle into +cljd-picks+)
 
 (defn- capture-ancestors
   "App-authored ancestors ABOVE EL, deepest-first — {:type :src :el} per level, for the tree section.
-   :el is the LIVE element (retained for tap-to-re-target; guarded by mounted at tap time). Computed
+   :el is the LIVE element (retained for tap-to-pick; guarded by mounted at tap time). Computed
    at pick time (the element is live then); framework wrappers skipped; capped."
   [^widgets/Element el]
   (let [out (atom []) seen (atom 0)]
@@ -1898,7 +1898,7 @@
      :sections [{:label (str "(" ctor)  :rows props}             ; cljd interop view of the widget
                 {:label "TREE ↑ (tap→pick)"
                  :rows (mapv (fn [a] [(:type a) (or (:cljd a) (:src a))
-                                      ;; tap an ancestor row → pick it (re-target); guarded in case
+                                      ;; tap an ancestor row → pick it (toggle into +cljd-picks+); guarded in case
                                       ;; the retained element has since unmounted.
                                       (when-some [el (:el a)]
                                         (fn [] (try (pick-element! el) (catch Object _ nil)) nil))])

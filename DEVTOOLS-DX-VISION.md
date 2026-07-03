@@ -218,7 +218,7 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
 
 Also shipped this line: **reload-legibility** (a watch-compile failure now `report-error!`s onto the
 device — inline + amber handle + exact loc — instead of silently keeping old code); **`(dart-of 'form)`**
-(the emitted Dart for a form, host-side); **tap-to-re-target** (§8, below).
+(the emitted Dart for a form, host-side); **tap-to-pick** (§8, below).
 ### Explored & ready to build (rank 3/5 — designed via the 2026-07-03 exploration)
 
 - **Line-granular coverage — SHIPPED.** `(coverage)` snapshots which cljd forms executed;
@@ -351,7 +351,7 @@ reactnative.dev/docs/react-native-devtools · radon.swmansion.com · developer.a
   pick resolves widget → `.cljd file:line:col`, and `form-at` + the reader's position tracking locate
   the exact form and every child's span (literals included). So named-property edit-back is deterministic
   (spiked end-to-end). Only *gestural* reverse-inference (drag → arbitrary source edit) stays research.
-- Ancestor TREE tap-to-re-target — SHIPPED: `capture-ancestors` retains each ancestor's live `:el`
+- Ancestor TREE tap-to-pick — SHIPPED: `capture-ancestors` retains each ancestor's live `:el`
   (guarded by mounted at tap time), TREE rows are tappable (`detail-section` wraps a row that carries an
   on-tap), and a tap `pick-element!`s that ancestor. Compiles clean; needs an on-device tap to confirm
   the interaction end-to-end (can't synthesize a tap from the REPL).
