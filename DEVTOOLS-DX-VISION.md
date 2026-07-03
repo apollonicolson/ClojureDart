@@ -204,8 +204,17 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
   Datomic-style transaction log — discrete epochs AND continuous record/seek are the SAME tx-log
   (epochs = markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates**
   (value-flow tracing) — a compiler-emit change, its own spike.
-- **#5 form-level edit-back** — `update-in` a form + re-emit (compiler owns provenance); reverse-
-  *inference* (Sketch-n-Sketch style) is research-grade.
+- **#5 form-level edit-back** — **DE-RISKED (2026-07-04, spiked end-to-end).** Editing a picked
+  widget's named property back to source is *deterministic*, not research-grade — the "research" label
+  only fits unconstrained gestural/pixel inference (Sketch-n-Sketch). Proven pieces: (a) the cljd reader
+  attaches exact `:line/:column/:end-line/:end-column` to collection forms, and querying the reader's own
+  position around each `read` yields spans for **bare literals** too (numbers/strings/keywords, which
+  aren't `IMeta`); (b) `form-at line:col` finds the picked widget form (the pick already resolves
+  widget→`.cljd file:line:col` via `resolve-wloc`); (c) a value's span → char-offset → text splice →
+  save → the watcher recompiled clean in **1.3 s** (measured: changed `nav.cljd`'s `.padding` value,
+  hot-reloaded, reverted byte-identical). The active pick exposes `:cljd`, so `(edit-back prop value)`
+  can auto-target. Remaining to ship the op: file-path resolution (relative cljd loc → src file),
+  leading-whitespace trim on literal spans, and a device-pick validation. **Ready to build, not research.**
 
 Also shipped this line: **reload-legibility** (a watch-compile failure now `report-error!`s onto the
 device — inline + amber handle + exact loc — instead of silently keeping old code); **`(dart-of 'form)`**
@@ -338,8 +347,10 @@ reactnative.dev/docs/react-native-devtools · radon.swmansion.com · developer.a
   targets whatever atom the live widget currently watches — identity stability isn't even required.
 - `toImageSync` per-frame cost for a frame ring-buffer on a real device — throttle/shrink region?
   (still open — profiling research, only the perf front needs it.)
-- Reverse-edit (#5) needs the source-map invertible enough to locate the exact form; unproven
-  (still open — research-grade, tied to bidirectional edit-back).
+- **RESOLVED (2026-07-04):** for anything you can *pick*, the source-map is invertible enough — the
+  pick resolves widget → `.cljd file:line:col`, and `form-at` + the reader's position tracking locate
+  the exact form and every child's span (literals included). So named-property edit-back is deterministic
+  (spiked end-to-end). Only *gestural* reverse-inference (drag → arbitrary source edit) stays research.
 - Ancestor TREE tap-to-re-target — SHIPPED: `capture-ancestors` retains each ancestor's live `:el`
   (guarded by mounted at tap time), TREE rows are tappable (`detail-section` wraps a row that carries an
   on-tap), and a tap `pick-element!`s that ancestor. Compiles clean; needs an on-device tap to confirm
