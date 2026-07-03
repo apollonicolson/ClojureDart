@@ -167,8 +167,14 @@ mostly framework frames that don't source-map, and the framework frames are the 
   (the nREPL compile-catch already tags `:phase "compile"`); tagging ~15 sites = a full recompile for an
   unread field. (`:3477` bare-`Exception`→`ex-info` was worth it for consistency; the rest are `ex-info`.)
 
-**Minor open:** demunge the fn name for top-level defn frames (`kora_boom`→`kora-boom`); on-device error
-*list* already shipped (§7a Errors tab, then inlined — errors render below picks, no tabs).
+**Done since:** top-level-defn fn-name demunge (`kora_boom`→`kora-boom`, validated); on-device error
+*list* (errors render inline below picks, no tabs). **Line-granular coverage** also shipped
+(`(coverage)`/`(ran)` — per-script `getSourceReport`; whole-isolate crashes the app, see memory
+`getsourcereport-per-script`). Next execution-visibility step is value-flow tracing — see
+DEVTOOLS-DX-VISION "Value-flow tracing `(trace 'form)`".
+
+**Optional not done:** `PauseException`/`setIsolatePauseMode` (trap *every* throw, not just framework);
+`dart:developer log` → Logging stream into the unified timeline.
 
 ## Sources
 VM Service: `dart-lang/sdk runtime/vm/service/service.md` v4.22 (`Error`, `ErrorKind`, `evaluate`,

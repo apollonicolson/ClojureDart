@@ -194,6 +194,47 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
 Also shipped this line: **reload-legibility** (a watch-compile failure now `report-error!`s onto the
 device — inline + amber handle + exact loc — instead of silently keeping old code); **`(dart-of 'form)`**
 (the emitted Dart for a form, host-side); **tap-to-re-target** (§8, below).
+### Explored & ready to build (rank 3/5 — designed via the 2026-07-03 exploration)
+
+- **Line-granular coverage — SHIPPED.** `(coverage)` snapshots which cljd forms executed;
+  `(ran)` diffs since the snapshot → cljd locs newly run, via `getSourceReport(Coverage,reportLines)`
+  **per-script** (whole-isolate crashes the on-device app — see memory `getsourcereport-per-script`),
+  mapped through `resolve-wloc`. Zero instrumentation; the line-level layer *below* the coord primitive.
+
+- **Value-flow tracing `(trace 'form)` — the marquee, now de-risked.** A **host-side form-rewrite**,
+  NOT emit surgery: a compile-time walk wraps each sub-expression in `(record! coord expr)` (returns
+  the value, side-effects `postEvent "cljd.trace" {coord,value}`), emits the rewritten form, registers
+  the form once. `emit` (`compiler.cljc:3716`) stays untouched — decisive de-risk. Coord = form-tree
+  path (`"2,1"`), reusing FlowStorm's `{form,coord}` display. **Load-bearing correctness = the skip-list**
+  (don't wrap binding-vec symbols, `quote`/`fn*` params, `.`-member symbols, `recur`/`set!` targets,
+  type tags). On-demand/opt-in first; measure overhead before any always-on emit pass. **This is the
+  real fix for the def-level source-map wall** (CLJD-DX-AUDIT #5) at sub-expression granularity.
+
+- **Clojure-native observability — cheap, `tap>` already exists.** `cljd.core` defines
+  `add-tap`/`tap>` (`core.cljd:9370`). Device→host: `(add-tap #(post-event! "cljd.tap" {:edn (pr-str %)}))`
+  + a `cljd.tap` host branch + `(taps)` — ~15 lines (cljd `tap>` runs inline, so keep the fn cheap).
+  **Portal** (djblue/portal) in the host JVM (`add-tap #(portal/submit %)`) = near-free data browser,
+  zero device change. **datafy/nav** = highest value/line (opaque Dart objects → maps). mulog: port the
+  event-map + `with-context` idea, skip its runtime (the Extension stream is the transport).
+
+- **One unified timeline — consolidation.** Fold `cljd.tap`/`cljd.log`/`cljd.error`/`cljd.state-change`
+  into a single `+cljd-timeline+` keyed by `:t`, tagged `:kind`; `(timeline)` / `(timeline :kind …)`.
+  Causal ordering across taps, logs, errors, and state — one event log for the four channels built so far.
+
+- **Cross-restart auto-replay ("hard rollback").** The change-log survives device restart (host-side);
+  wire replay-on-reconnect: detect a fresh app via **isolate-id** (a heartbeat gap only *triggers the
+  check* — it can't distinguish restart from backgrounding/GC), **settle-poll** the `[loc sym]` id-set
+  across ~2 reads before `write-state` (mid-rebuild reads tear), **opt-in**. Can't restore: nav-stack,
+  native/platform, in-flight async, focus/scroll (not `[loc sym]` atoms).
+
+- **Riverpod into the state channel.** A dev-mode `ProviderObserver` (Riverpod 3.0: single
+  `ProviderObserverContext`) streams provider changes as `cljd.state-change` → `read-state`/`write-state`/
+  `record`/`seek` cover providers. Constraint is **addressability**: named `StateProvider`/`Notifier`
+  are clean & symmetric (write via `.notifier`); anonymous/derived/async providers are read-only.
+
+**Suggested sequence:** `tap>` + unified timeline (cheapest, consolidates the channels) → `(trace 'form)`
+(marquee, retires the source-map wall) → cross-restart + Riverpod (design-ready).
+
 - **Out of scope (do not collapse):** network inspection, perf/recomposition profiling — separate
   instrumentation, arguably a different tool. Design-canvas previews and running-incomplete-programs:
   not our lane.
