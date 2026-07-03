@@ -11,22 +11,22 @@
 |---|---|---|---|
 | 1 | ✅ **FIXED** (`8abfe31`) **Void-return trap** — void call in value position → `"This expression has type void and can't be used"` compile error (lived, ~6×; `.add`/`.cancel`/`postEvent`/`reassembleApplication`/`.visitChildElements`) | `magicast` now coerces a consumed void expr to `(dart/let [[nil expr]] nil)` — run as statement, yield null. Guarded on actual=void so non-void is untouched; `#dart` fixed-list elements routed through magicast too. Measured on device across arg/vector/map/direct positions. | med (compiler) |
 | 2 | ✅ **FIXED** (`9bc402c`) **`format` absent** — very common, used `str`/interp before | `cljd.core/format`: Formatter-accurate subset over Dart primitives; output validated byte-identical to `java.util.Formatter` across a 25-case battery (measured device vs JVM). | low |
-| 3 | **Untyped member access hard-errors** — `.split`/`.-name`/`.-exception` on untyped receiver; needs a hint you can't infer from the form (`compiler.cljc:392,3624`; warn by default, **fail under `^:no-dynamic`**, which the toolkit path hits) | better error: "unresolved member `X` — add a type hint `^T`?" (cljd already improved error DX; this is next) | low–med |
-| 4 | **`instance?` is inline-only** — throws as a HOF, so `(partial instance? T)` breaks (`core.cljd:420`); why we reach for `dart/is?` | document + optionally a runtime fallback arity | low |
+| 3 | ✅ **FIXED** (`8072cba`) **Untyped member access hard-errors** — `.split`/`.-name`/`.-exception` on untyped receiver; needs a hint you can't infer from the form (warn by default, **fail under `^:no-dynamic`**, which the toolkit path hits) | the "can't resolve member" diagnostic now appends an actionable tail via `dynamic-member-hint`: names the cause (dynamic receiver) + the fix (`^Type` hint), at both member-access sites. Validated on device. | low–med |
+| 4 | ✅ **FIXED** (`8c7a16b`) **`instance?` is inline-only** — throws as a HOF, so `(partial instance? T)` breaks (`core.cljd:420`); why we reach for `dart/is?` | HOF failure now explains the Dart constraint (no runtime subtype test) and points at the fixes (`dart/is?`, protocol/multimethod). A runtime fallback is deliberately not added — exact-`runtimeType` would silently break subtype semantics. | low |
 | 5 | **Macro source-map meta loss** — the def-level precision wall (`compiler.cljc:1408-1410,1344-1349,3792-3796`: `propagate-hints` copies `:tag`/`:annotations`, **not `:line`/`:column`**) | **the coord primitive** (`(trace 'form)`, form-tree paths) sidesteps it; the naive "propagate line/col" was tried and falsified — macros reconstruct forms without inner meta | see DEVTOOLS-DX-VISION §coord |
 
 ## By category
 
 ### A. Interop papercuts (daily tax)
 - ✅ **Void-return trap** — see #1. Fixed in `magicast`; the manual trailing-`nil` workaround is no longer needed.
-- **Untyped member access** — see #3.
-- **No `#dart {}` map literal** — `emit-dart-literal` handles only vectors(lists)/seqs(records) (`compiler.cljc:1917-1926`); forced `jsonEncode`→`jsonDecode` round-trips for every `postEvent` Map. *Fix:* support `#dart {}` → a Dart map literal.
+- ✅ **Untyped member access** — see #3. Diagnostic now carries a type-hint suggestion.
+- ✅ **No `#dart {}` map literal** — FIXED (`8072cba`): `emit-dart-map-literal` emits `Map<K,V>.fromEntries([MapEntry …])`, ending the `jsonEncode`→`jsonDecode` round-trip for interop Maps. `^{:tag [K V]}` types it.
 - **`catch` needs an extra stacktrace binding** `(catch E e st …)`; **records need 3 ctor args** `(R. a nil {} -1)`; **`super` needs `^super`** on `this` (`doc/differences.md`). Shape papercuts — document prominently.
 - **Building Dart collections** — `#dart ^T []` + `.add` for growable lists; the idiom isn't discoverable.
 
 ### B. Core / semantic gaps vs JVM Clojure
 - ✅ **`format` absent** — #2. Added `cljd.core/format` (Formatter-accurate subset).
-- **`instance?` inline-only** — #4.
+- ✅ **`instance?` inline-only** — #4. HOF failure is now self-explaining.
 - **No device `read-string`** — it's `cljd.edn/read-string`, not core (lived; bit `write-state`). *Fix:* alias or document.
 - **No device `eval`/`resolve`/`macroexpand`/`slurp`/`spit`** — no runtime var namespace on device (host-only). Expected; document the host/device table.
 - **Lazy `def` init** (`differences.md`) — defs initialize **by-need, not top-to-bottom** (tree-shaking); order-dependent top-level side effects silently break. Semantic gotcha — document loudly.
