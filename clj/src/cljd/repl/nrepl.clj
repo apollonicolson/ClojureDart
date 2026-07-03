@@ -6,6 +6,7 @@
    from there and re-bound per request (dynamic bindings don't cross threads)."
   (:require [nrepl.server :as nrepl-server]
             [nrepl.transport :as transport]
+            [clojure.string :as str]
             [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vm]
             [cljd.repl.eval :as repl-eval]
@@ -296,6 +297,41 @@
                   (when (.exists f) (.getPath f))))
     source-dirs))
 
+;; ── clojure.repl parity: doc / source / dir / apropos / find-doc ──────────────
+;; The compiler's @nses holds every def's :meta (:doc, :arglists, :macro) + provenance, so the
+;; standard Clojure discovery toolkit is a pure host read — same ergonomics as upstream. `source`
+;; reuses the edit-back reader (ns → file → the def form's text).
+
+(def ^:private def-heads '#{def defn defn- defmacro defmulti defonce deftype defrecord defprotocol})
+
+(defn- ns-def-names
+  "Sorted names of the PUBLIC defs in NS-SYM — like clojure.repl/dir, excluding the compiler's
+   generated internals (gensym/arity-munged names carry `__` or `$`, which user defs never do)."
+  [nses ns-sym]
+  (->> (get nses ns-sym) keys (filter symbol?) (map name)
+       (remove #(re-find #"__|\$" %)) sort))
+
+(defn- format-doc
+  "clojure.repl/doc-style rendering of a sym-info map."
+  [i]
+  (when i
+    (str "-------------------------\n"
+         (:ns i) "/" (:name i) "\n"
+         (when (:arglists i) (str (pr-str (:arglists i)) "\n"))
+         (when (:macro? i) "Macro\n")
+         "  " (or (:doc i) "(not documented)"))))
+
+(defn- def-source
+  "The source text of the top-level (def/defn/… NAME …) form in FILE, or nil."
+  [file name-sym]
+  (let [text (slurp file)]
+    (some (fn [f]
+            (when (and (seq? f) (>= (count f) 2) (contains? def-heads (first f)) (= (second f) name-sym))
+              (let [m (meta f)]
+                (subs text (line-column->offset text (:line m) (:column m))
+                           (line-column->offset text (:end-line m) (:end-column m))))))
+      (read-source-forms file))))
+
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :trigger-restart :source-dirs :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload trigger-restart source-dirs await? pick? remember?]
@@ -541,6 +577,52 @@
                             (send! {:err (str "No such namespace: " target
                                               " (only namespaces compiled into the app are available)")
                                     :ex "cljd.no-such-ns"}))))
+
+                    ;; ── clojure.repl parity — same ergonomics as upstream, read from @nses host-side ──
+                    ;; (doc SYM): arglists + docstring.
+                    doc
+                    (send! {:value (or (format-doc (sym-info @compiler/nses @*current-ns
+                                                     (unwrap-quote (second form))))
+                                       (str "nothing known about " (unwrap-quote (second form))))
+                            :ns (name @*current-ns)})
+
+                    ;; (dir NS): sorted names of the defs in a namespace.
+                    dir
+                    (let [nsym (unwrap-quote (second form))]
+                      (if (ns-exists? nsym)
+                        (send! {:value (str/join "\n" (ns-def-names @compiler/nses nsym)) :ns (name @*current-ns)})
+                        (send! {:err (str "No such namespace: " nsym) :ex "cljd.no-such-ns"})))
+
+                    ;; (apropos STR-OR-SYM): all public names (ns-qualified) containing the string.
+                    apropos
+                    (let [pat (str (unwrap-quote (second form)))
+                          nses @compiler/nses
+                          hits (->> (keys nses) (filter symbol?)
+                                    (mapcat (fn [n] (map #(str n "/" %) (ns-def-names nses n))))
+                                    (filter #(.contains ^String % pat)) sort vec)]
+                      (send! {:value (pr-str hits) :ns (name @*current-ns)}))
+
+                    ;; (find-doc STR): defs whose name or docstring contains the string.
+                    find-doc
+                    (let [pat (str (unwrap-quote (second form)))
+                          nses @compiler/nses
+                          hits (for [n (filter symbol? (keys nses))
+                                     nm (filter symbol? (keys (get nses n)))
+                                     :let [i (sym-info nses n nm)]
+                                     :when (and i (or (.contains (str nm) pat)
+                                                      (and (:doc i) (.contains ^String (:doc i) pat))))]
+                                 (format-doc i))]
+                      (send! {:value (str/join "\n" hits) :ns (name @*current-ns)}))
+
+                    ;; (source SYM): the def's source text — ns → file (source-dirs) → the def form.
+                    source
+                    (let [sym (unwrap-quote (second form))
+                          i (sym-info @compiler/nses @*current-ns sym)
+                          path (some-> (:ns i) (str/replace "." "/") (str ".cljd"))
+                          file (when path (resolve-source-file source-dirs path))
+                          txt (when (and file (:name i))
+                                (try (def-source file (symbol (:name i))) (catch Throwable _ nil)))]
+                      (send! {:value (or txt (str "source not found for " sym)) :ns (name @*current-ns)}))
 
                     ;; (pick!) / (pick! false): toggle the on-device widget picker.
                     pick!
