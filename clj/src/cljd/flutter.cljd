@@ -1583,12 +1583,25 @@
 (defn write-state
   "DIRECT the app to a recorded state: SNAP is {[loc sym] → value} (arrives as a compiled literal,
    parsed host-side); for each id present live, reset! its atom. Only EDN-round-trippable state
-   restores. Returns the count applied."
+   restores. Returns the number of ids matched live now.
+
+   Frame-safe: the reset!s run in a post-frame callback, never inline. A host eval can land at any
+   moment, including mid-frame; a synchronous reset! then fires the atom's :watch → setState during
+   build/layout → 'Build scheduled during frame' and a torn rebuild. Deferring lands the state change
+   cleanly between frames (scheduleFrame guarantees the callback runs even when the app is idle).
+   The live-state walk (Element.visitChildElements) also happens inside the callback — walking the
+   tree synchronously mid-frame is itself illegal ('visitChildElements() called during build'), so
+   nothing here touches the element tree until the post-frame point. Returns the count REQUESTED."
   [snap]
-  (let [live (live-state) n (atom 0)]
-    (doseq [e snap]
-      (when-some [a (get live (key e))] (reset! a (val e)) (swap! n inc)))
-    @n))
+  (let [wb (widgets/WidgetsBinding.instance)]
+    (.addPostFrameCallback wb
+      (fn [_]
+        (let [live (live-state)]
+          (doseq [e snap]
+            (when-some [a (get live (key e))] (reset! a (val e)))))
+        nil))
+    (.scheduleFrame wb)
+    (count snap)))
 
 (defn- stream-change!
   "Stream one atom change to the host as data (cljd.state-change): id + pr-str'd new value (EDN,
