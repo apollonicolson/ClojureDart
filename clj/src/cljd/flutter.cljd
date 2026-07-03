@@ -1396,6 +1396,18 @@
         (str "{" (apply str (interpose "," (map (fn [e] (str (convert/jsonEncode (key e)) ":" (val e))) fragments))) "}")))
     nil (catch Object _ nil)))
 
+(defn- tap->host
+  "Tap fn: every (tap> x) on the device streams x to the host as EDN over `cljd.tap`. Installed once
+   via add-tap in register-cljd-devtools!. Cheap (cljd tap> runs inline on the caller's stack)."
+  [x]
+  (post-event! "cljd.tap" {"edn" (convert/jsonEncode (pr-str x))}))
+
+(defn log!
+  "μ/log-style structured event → host over `cljd.log`: (log! {:event ::save :ok true}). Just data over
+   the same channel — lands in the unified host timeline beside taps, errors, and state changes."
+  [event-map]
+  (post-event! "cljd.log" {"edn" (convert/jsonEncode (pr-str event-map))}))
+
 (defn report-error!
   "Push an error onto the ONE cljd error stream (`cljd.error` on the VM-Service Extension stream) so it
    flows through the host plumbing (nREPL `(errors)` + live forward). Any cljd code — or any Dart
@@ -1476,6 +1488,8 @@
       (fn [^Object e ^StackTrace s]
         (report-error! "async" (str e) (str s))
         false))
+    ;; Clojure-native observability: every (tap> x) on the device streams to the host (cljd.tap).
+    (add-tap tap->host)
     nil)                                ; registerExtension returns void → keep the when Null
   nil)
 

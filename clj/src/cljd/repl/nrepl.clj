@@ -175,6 +175,13 @@
         +cljd-change-log+ (atom [])
         ;; last coverage snapshot (set of dart uri:line) — (ran) diffs against it.
         +cljd-coverage-snap+ (atom #{})
+        ;; the UNIFIED timeline: every device event (tap / log / error / state-change) appended in
+        ;; causal order, tagged :kind — one ordered log across all four channels. `record-tl!` clocks
+        ;; each entry ((tl-now) is set per-eval below to avoid Date.now in this file's macros).
+        +cljd-timeline+ (atom [])
+        record-tl! (fn [kind data]
+                     (swap! +cljd-timeline+
+                       (fn [tl] (vec (take-last 500 (conj tl {:kind kind :t (System/currentTimeMillis) :data data}))))))
         ;; coalesce identical consecutive errors (same phase+message) into one entry with a :count,
         ;; so a reassemble burst of the same assertion doesn't flood the store. Returns the NEW error
         ;; (for live-forward) or nil when it coalesced a duplicate (so we don't re-forward it).
@@ -212,17 +219,28 @@
          (= kind "cljd.error")
          (when-some [e (remember-error! {:phase (or (:phase data) "runtime")
                                          :message (:message data) :stack (:stack data)})]
+           (record-tl! :error e)
            ;; only forward NEW errors (remember-error! returns nil for a coalesced duplicate)
            (when-some [f @*eval-sink]
              (f "Stderr" (str "⚠ [" (:phase e) "] " (:message e)
                               (when (seq (:stack e)) (str "\n" (:stack e))) "\n"))))
 
-         ;; a device atom change (recording on): parse the EDN id+value and append to the timeline
+         ;; a device atom change (recording on): parse the EDN id+value → change-log + timeline
          (= kind "cljd.state-change")
          (let [id (try (read-string (:id data)) (catch Throwable _ nil))
                v  (try (read-string (:value data)) (catch Throwable _ ::unreadable))]
            (when (and id (not= v ::unreadable))
-             (swap! +cljd-change-log+ conj {:id id :value v}))))))
+             (swap! +cljd-change-log+ conj {:id id :value v})
+             (record-tl! :state {:id id :value v})))
+
+         ;; Clojure-native observability: (tap> x) and (log! m) on the device → the unified timeline.
+         (= kind "cljd.tap")
+         (let [v (try (read-string (:edn data)) (catch Throwable _ ::unreadable))]
+           (when (not= v ::unreadable) (record-tl! :tap v)))
+
+         (= kind "cljd.log")
+         (let [v (try (read-string (:edn data)) (catch Throwable _ ::unreadable))]
+           (when (not= v ::unreadable) (record-tl! :log v))))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -479,6 +497,17 @@
                           locs (->> fresh (keep #(dart-uri->cljd (:libs @compiler/nses) %)) distinct sort vec)]
                       (reset! +cljd-coverage-snap+ now)
                       (send! {:value (pr-str locs) :ns (name @*current-ns)}))
+
+                    ;; (taps): device (tap> x) values. (timeline [:kind]): the unified event log
+                    ;; (tap/log/error/state) in causal order, optionally filtered by kind.
+                    taps
+                    (send! {:value (pr-str (mapv :data (filter #(= :tap (:kind %)) @+cljd-timeline+)))
+                            :ns (name @*current-ns)})
+
+                    timeline
+                    (let [k (second form)
+                          tl (if k (filterv #(= k (:kind %)) @+cljd-timeline+) @+cljd-timeline+)]
+                      (send! {:value (pr-str tl) :ns (name @*current-ns)}))
 
                     ;; default: not a special op → compile + eval (or reload) the form on the device
                     (let [r (repl-eval/eval-form client iso-id form
