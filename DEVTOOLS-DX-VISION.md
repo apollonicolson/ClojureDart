@@ -184,18 +184,19 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
 - **#4 state time-travel — SHIPPED, HOST-recorded (rank 1).** The device exposes state as **data
   addressed by a stable id** `[loc sym]`: `read-state` → `{[loc sym] → value}` (a pure READ of every
   live repl-point atom — `live-state` walks from `::app-root`), `write-state` DIRECTs the app back
-  (resolve id → live atom → `reset!`). The **host** holds the timeline (`(epoch!)` records a
-  read-state, `(restore-epoch N)` replays it; `(states)` reads current state). No device-side epoch
+  (resolve id → live atom → `reset!`). The **host** holds ONE timeline — the change-log — and epochs
+  are named cut-points into it: `(epoch!)` drops a full-state keyframe + marks its index, `(restore-epoch N)`
+  seeks to that mark, `(states)` reads current state. No device-side store and no parallel snapshot
   store — the durable memory is the host, so the recording survives device restart, and ids re-resolve
   against whatever atoms are live. Validated: `(states)` returns the whole app state (nav index +
-  journal entries + `#inst` dates as EDN); record → change → restore reverts. Limits: only
-  EDN-round-trippable values restore; a read taken *mid-rebuild* races (settle first); Riverpod
-  providers still out of scope.
+  journal entries + `#inst` dates as EDN); epoch → change → restore reverts; `(q epochs)` resolves each
+  cut-point to its state map. Limits: only EDN-round-trippable values restore; a read taken *mid-rebuild*
+  races (settle first); Riverpod providers still out of scope.
   **Continuous stream — SHIPPED:** `(record)` add-watches every atom (re-armed on the heartbeat to
   catch newly-mounted repl-points) so each change streams to the host (`cljd.state-change`) as an
   ordered timeline; `(seek N)` replays 0..N → `write-state`. Validated: record → mutate → `(seek 0)`
-  reverts. So the state channel is complete — discrete epochs AND continuous record/seek, all
-  host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates** (value-flow tracing)
+  reverts. So the state channel is complete — discrete epochs AND continuous record/seek are the SAME
+  change-log (epochs = keyframes + markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates** (value-flow tracing)
   — a compiler-emit change, its own spike.
 - **#5 form-level edit-back** — `update-in` a form + re-emit (compiler owns provenance); reverse-
   *inference* (Sketch-n-Sketch style) is research-grade.

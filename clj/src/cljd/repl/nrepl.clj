@@ -242,8 +242,11 @@
         ;; reads it. Ring-bounded so it can't grow without limit.
         +cljd-errors+ (atom [])
         ;; host-recorded state timeline: each entry is a read-state snapshot (EDN {id→value}). The
-        ;; DEVICE holds no epoch store — the durable memory is here, so it survives device restart.
-        +cljd-state-log+ (atom [])
+        ;; DEVICE holds no epoch/history store — the durable memory is HERE, so it survives a device
+        ;; restart (replay into a fresh app, addressed by stable [loc sym]). +cljd-epochs+ holds named
+        ;; cut-points (indices) into the change-log: an epoch is just a labeled position in the ONE
+        ;; timeline — (epoch!) drops a full-state keyframe + marks it; no separate snapshot store.
+        +cljd-epochs+ (atom [])
         ;; continuous change-stream: while recording, each device atom change arrives here as
         ;; {:id :value} in order. seek(N) replays 0..N into a state snapshot → write-state.
         +cljd-change-log+ (atom [])
@@ -273,19 +276,20 @@
                     (conj (pop es) (update prev :count (fnil inc 1)))
                     (vec (take-last 25 (conj es (assoc e :count 1))))))))
             (when-not dupe? e)))
-        ;; replay!: re-apply the whole recorded change-log (last value wins per id) onto the
-        ;; device's live atoms via write-state. The change-log lives HERE (host), so this
-        ;; survives a device hot-restart — the isolate/atoms are fresh, addressed by stable
-        ;; [loc sym]. Returns {:atoms n :wrote m} or nil when nothing is recorded.
+        ;; write-snap!: push a {id → value} snapshot to the device's live atoms (write-state) and
+        ;; return how many landed. The one device-write shared by replay / seek / restore-epoch.
+        write-snap!
+        (fn [snap] (try (:value (repl-eval/eval-form client @*iso
+                                  (list 'cljd.flutter/write-state snap)
+                                  {:ns-lib-uri "cljd/flutter.dart"}))
+                        (catch Throwable _ nil)))
+        ;; replay!: re-apply the whole recorded change-log (last value wins per id) onto the device's
+        ;; live atoms. The change-log lives HERE (host), so this survives a device hot-restart — the
+        ;; isolate/atoms are fresh, addressed by stable [loc sym]. {:atoms n :wrote m} or nil if empty.
         replay!
         (fn []
           (let [snap (change-snapshot @+cljd-change-log+)]
-            (when (seq snap)
-              (let [wrote (try (:value (repl-eval/eval-form client @*iso
-                                         (list 'cljd.flutter/write-state snap)
-                                         {:ns-lib-uri "cljd/flutter.dart"}))
-                               (catch Throwable _ nil))]
-                {:atoms (count snap) :wrote wrote}))))
+            (when (seq snap) {:atoms (count snap) :wrote (write-snap! snap)})))
         ;; replay-settle!: the boot-time replay (fired on cljd.booted after a restart). Runs on the
         ;; WS-listener future, which lacks the compiler bindings, so it establishes the context
         ;; itself. Retries on a short backoff until every recorded-and-live id matches its value:
@@ -520,7 +524,8 @@
                     (let [data {'errors @+cljd-errors+
                                 'timeline @+cljd-timeline+
                                 'changes @+cljd-change-log+
-                                'epochs @+cljd-state-log+
+                                ;; epochs resolve to the state map AT each cut-point (not the raw index)
+                                'epochs (mapv #(change-snapshot (take (inc %) @+cljd-change-log+)) @+cljd-epochs+)
                                 'coverage @+cljd-coverage-snap+}
                           r (try
                               (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data))
@@ -587,10 +592,11 @@
                         (do (vreset! errored true) (send! {:err (:message r) :ex "cljd.trace-error"}))
                         (send! {:value (:value r) :ns (name @*current-ns)})))
 
-                    ;; state time-travel, HOST-recorded. (states) READs the whole app state as data;
-                    ;; (epoch!) records a snapshot into the host timeline; (restore-epoch N) DIRECTS
-                    ;; the device back to that snapshot. The recording lives on the host → durable
-                    ;; across device restart (replay into a fresh app), addressed by stable [loc sym].
+                    ;; state time-travel, HOST-recorded, ONE timeline. (states) READs the whole app
+                    ;; state as data. (epoch!) drops a full-state keyframe into the change-log and
+                    ;; marks its position; (epochs) lists the markers; (restore-epoch N) seeks the
+                    ;; device back to epoch N's cut-point. Epochs are discrete save points; (seek)
+                    ;; is continuous — both navigate the same change-log, addressed by stable [loc sym].
                     states
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart"})]
@@ -599,27 +605,26 @@
                     epoch!
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart"})
-                          edn (:value r)]
-                      (swap! +cljd-state-log+ conj edn)
-                      (send! {:value (str "epoch " (dec (count @+cljd-state-log+)) " recorded on host")
+                          state (try (read-string (:value r)) (catch Throwable _ {}))]
+                      ;; append the full snapshot as a keyframe, then mark the index of its last entry.
+                      (swap! +cljd-change-log+ into (map (fn [[id v]] {:id id :value v})) state)
+                      (swap! +cljd-epochs+ conj (dec (count @+cljd-change-log+)))
+                      (send! {:value (str "epoch " (dec (count @+cljd-epochs+)) " recorded ("
+                                       (count state) " atoms → change-log)")
                               :ns (name @*current-ns)}))
 
                     epochs
-                    (send! {:value (str (count @+cljd-state-log+) " epochs (host-recorded)")
+                    (send! {:value (str (count @+cljd-epochs+) " epochs (markers into the change-log)")
                             :ns (name @*current-ns)})
 
                     restore-epoch
                     (let [i (second form)
-                          edn (nth @+cljd-state-log+ i nil)
-                          ;; parse HOST-side (device cljd has no read-string) → send the map as a
-                          ;; compiled literal to write-state.
-                          snap (when edn (try (read-string edn) (catch Throwable _ nil)))]
-                      (if snap
-                        (let [r (repl-eval/eval-form client iso-id (list 'cljd.flutter/write-state snap)
-                                  {:ns-lib-uri "cljd/flutter.dart"})]
-                          (send! {:value (str "directed device to epoch " i " (" (:value r) " atoms)")
+                          idx (nth @+cljd-epochs+ i nil)]
+                      (if (some? idx)
+                        (let [wrote (write-snap! (change-snapshot (take (inc idx) @+cljd-change-log+)))]
+                          (send! {:value (str "directed device to epoch " i " (" wrote " atoms)")
                                   :ns (name @*current-ns)}))
-                        (send! {:err (str "no epoch " i " (or unparseable state)") :ex "cljd.no-epoch"})))
+                        (send! {:err (str "no epoch " i) :ex "cljd.no-epoch"})))
 
                     ;; continuous recording: (record) starts a fresh timeline with a base keyframe
                     ;; (the full state now) + arms device atom-watchers; (record false) stops.
@@ -630,6 +635,7 @@
                                    {:ns-lib-uri "cljd/flutter.dart"})
                               base (try (read-string (:value r0)) (catch Throwable _ {}))]
                           (reset! +cljd-change-log+ (mapv (fn [[id v]] {:id id :value v}) base))
+                          (reset! +cljd-epochs+ [])   ; fresh timeline → old epoch markers are stale
                           (reset! +cljd-recording?+ true)
                           (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
                             {:ns-lib-uri "cljd/flutter.dart"})
@@ -649,10 +655,8 @@
                     (let [n (second form)
                           snap (change-snapshot (take (inc n) @+cljd-change-log+))]
                       (if (seq snap)
-                        (let [r (repl-eval/eval-form client iso-id (list 'cljd.flutter/write-state snap)
-                                  {:ns-lib-uri "cljd/flutter.dart"})]
-                          (send! {:value (str "sought to change " n " (" (:value r) " atoms)")
-                                  :ns (name @*current-ns)}))
+                        (send! {:value (str "sought to change " n " (" (write-snap! snap) " atoms)")
+                                :ns (name @*current-ns)})
                         (send! {:err (str "no changes up to " n " (record first?)") :ex "cljd.no-change"})))
 
                     ;; (replay): re-apply the WHOLE recorded change-log onto the live atoms — the
