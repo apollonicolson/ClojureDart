@@ -204,17 +204,16 @@ Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependen
   Datomic-style transaction log — discrete epochs AND continuous record/seek are the SAME tx-log
   (epochs = markers), all host-recorded, id-addressed. Remaining primitive: **compile-with-coordinates**
   (value-flow tracing) — a compiler-emit change, its own spike.
-- **#5 form-level edit-back** — **DE-RISKED (2026-07-04, spiked end-to-end).** Editing a picked
-  widget's named property back to source is *deterministic*, not research-grade — the "research" label
-  only fits unconstrained gestural/pixel inference (Sketch-n-Sketch). Proven pieces: (a) the cljd reader
-  attaches exact `:line/:column/:end-line/:end-column` to collection forms, and querying the reader's own
-  position around each `read` yields spans for **bare literals** too (numbers/strings/keywords, which
-  aren't `IMeta`); (b) `form-at line:col` finds the picked widget form (the pick already resolves
-  widget→`.cljd file:line:col` via `resolve-wloc`); (c) a value's span → char-offset → text splice →
-  save → the watcher recompiled clean in **1.3 s** (measured: changed `nav.cljd`'s `.padding` value,
-  hot-reloaded, reverted byte-identical). The active pick exposes `:cljd`, so `(edit-back prop value)`
-  can auto-target. Remaining to ship the op: file-path resolution (relative cljd loc → src file),
-  leading-whitespace trim on literal spans, and a device-pick validation. **Ready to build, not research.**
+- **#5 form-level edit-back — SHIPPED (2026-07-04).** `(edit-back .prop VALUE)` writes VALUE back to
+  source as the named property of the *active pick's* widget form, then the watcher recompiles + hot-
+  reloads. It's a **consolidation** — the pick already resolves widget → `.cljd file:line:col`
+  (`resolve-wloc`); edit-back extends that arrow one hop to write. Reuses the compiler reader for
+  positions: `form-at line:col` finds the picked form, and `child-spans` reads spans from the reader's
+  *own* position so **bare literals** (numbers/strings/keywords, not `IMeta`) are spanned too — then a
+  value's span → char-offset → text splice. Validated on device: picked an InkWell → resolved to
+  `nav.cljd:47:5` (a ListView) → `(edit-back .padding (m/EdgeInsets.all 40.0))` rewrote its `.padding`
+  in source → hot-reloaded in **1.08 s** → reverted byte-identical. Only unconstrained *gestural* edit-
+  back (drag → infer arbitrary source change) stays research; named-property edit-back is deterministic.
 
 Also shipped this line: **reload-legibility** (a watch-compile failure now `report-error!`s onto the
 device — inline + amber handle + exact loc — instead of silently keeping old code); **`(dart-of 'form)`**
