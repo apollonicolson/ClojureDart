@@ -617,6 +617,9 @@
                                                     (def +cljd-repl-h1+ nil)
                                                     (def +cljd-repl-h2+ nil)
                                                     (def +cljd-repl-h3+ nil)
+                                                    ;; *e: the last thrown Dart error object (bound by
+                                                    ;; the eval wrapper's catch). Read via the *e rewrite.
+                                                    (def +cljd-repl-e+ nil)
                                                     ;; *env: the picked widget's lexical scope map,
                                                     ;; loaded by (picked). Read via the *env rewrite.
                                                     (def +cljd-repl-env+ nil)

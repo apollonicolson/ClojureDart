@@ -14,7 +14,17 @@
   '{*1   cljd.core/+cljd-repl-h1+
     *2   cljd.core/+cljd-repl-h2+
     *3   cljd.core/+cljd-repl-h3+
+    *e   cljd.core/+cljd-repl-e+
     *env cljd.core/+cljd-repl-env+})
+
+(defn- capturing-e
+  "Wrap EXPR so a thrown Dart error is bound to *e (the device holder) before rethrowing — the
+   host still gets the @Error to report, and (println *e)/(ex-message *e) work like upstream. The
+   exception OBJECT lives on the device at the catch site; this catches it before it's lost."
+  [expr]
+  (list 'try expr
+    (list 'catch 'dynamic 'e '_st
+      (list 'do (list 'set! 'cljd.core/+cljd-repl-e+ 'e) (list 'throw 'e)))))
 
 (def ^:private toplevel-ops
   "Form heads (by name, ns-ignored) that introduce/change top-level program code and
@@ -65,6 +75,9 @@
         expr (if (and remember? (not await?))
                (list 'cljd.core/+cljd-repl-remember expr)
                expr)
+        ;; capture a thrown error into *e on BOTH the sync and await paths (await? is on by default,
+        ;; so gating on the sync path alone would never fire). Rethrows so the host still reports it.
+        expr (if remember? (capturing-e expr) expr)
         dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
         lib  (vm/library-id client iso-id ns-lib-uri)
         r    (vm/evaluate client iso-id lib dart)]

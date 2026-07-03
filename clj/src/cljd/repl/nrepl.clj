@@ -214,8 +214,8 @@
 
 (defn- tx-snapshot
   "Collapse an ordered transaction seq into the state map {id → value} by merging each tx's :delta,
-   later txs winning per id. The basis for replay and time-travel: (seek n) snapshots a prefix,
-   (replay)/boot snapshots the whole log."
+   later txs winning per id. The basis for replay and time-travel: (seek! n) snapshots a prefix,
+   (replay!)/boot snapshots the whole log."
   [txs]
   (reduce (fn [m tx] (merge m (:delta tx))) {} txs))
 
@@ -668,12 +668,12 @@
                                  (catch Throwable e {:error (.getMessage e)}))]
                       (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
 
-                    ;; (edit-back PROP VALUE): write VALUE back to source as the named PROP of the
+                    ;; (edit-back! PROP VALUE): write VALUE back to source as the named PROP of the
                     ;; ACTIVE pick's widget form. The pick already resolved widget → .cljd file:line:col;
                     ;; this reads that form, finds PROP's value span, and splices VALUE into the file —
                     ;; the watcher then recompiles + hot-reloads. The app→source arrow run to WRITE.
-                    ;; e.g. (edit-back .padding (m/EdgeInsets.all 40.0))
-                    edit-back
+                    ;; e.g. (edit-back! .padding (m/EdgeInsets.all 40.0))
+                    edit-back!
                     (let [prop (second form)
                           value-str (pr-str (nth form 2 nil))
                           cljd-r (repl-eval/eval-form client iso-id
@@ -798,8 +798,8 @@
 
                     ;; state time-travel, HOST-recorded, ONE timeline. (states) READs the whole app
                     ;; state as data. (epoch!) drops a full-state keyframe into the tx-log and
-                    ;; marks its position; (epochs) lists the markers; (restore-epoch N) seeks the
-                    ;; device back to epoch N's cut-point. Epochs are discrete save points; (seek)
+                    ;; marks its position; (epochs) lists the markers; (restore-epoch! N) seeks the
+                    ;; device back to epoch N's cut-point. Epochs are discrete save points; (seek!)
                     ;; is continuous — both navigate the same tx-log, addressed by stable [loc sym].
                     states
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
@@ -822,7 +822,7 @@
                     (send! {:value (str (count @+cljd-epochs+) " epochs (markers into the tx-log)")
                             :ns (name @*current-ns)})
 
-                    restore-epoch
+                    restore-epoch!
                     (let [i (second form)
                           idx (nth @+cljd-epochs+ i nil)]
                       (if (some? idx)
@@ -831,9 +831,9 @@
                                   :ns (name @*current-ns)}))
                         (send! {:err (str "no epoch " i) :ex "cljd.no-epoch"})))
 
-                    ;; continuous recording: (record) starts a fresh timeline with a base keyframe tx
-                    ;; (the full state now) + arms device frame-batched recording; (record false) stops.
-                    record
+                    ;; continuous recording: (record!) starts a fresh timeline with a base keyframe tx
+                    ;; (the full state now) + arms device frame-batched recording; (record! false) stops.
+                    record!
                     (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
                       (if on?
                         (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
@@ -855,26 +855,26 @@
                     txs
                     (send! {:value (str (count @+cljd-tx-log+) " transactions recorded") :ns (name @*current-ns)})
 
-                    ;; (seek N): DIRECT the device to the state as of transaction N — merge deltas
+                    ;; (seek! N): DIRECT the device to the state as of transaction N — merge deltas
                     ;; 0..N into a snapshot (later txs win per id) → write-state. Continuous time-travel.
-                    seek
+                    seek!
                     (let [n (second form)
                           snap (tx-snapshot (take (inc n) @+cljd-tx-log+))]
                       (if (seq snap)
                         (send! {:value (str "sought to tx " n " (" (write-snap! snap) " atoms)")
                                 :ns (name @*current-ns)})
-                        (send! {:err (str "no transactions up to " n " (record first?)") :ex "cljd.no-tx"})))
+                        (send! {:err (str "no transactions up to " n " (record! first?)") :ex "cljd.no-tx"})))
 
-                    ;; (replay): re-apply the WHOLE recorded tx-log onto the live atoms — the
-                    ;; latest state, not a point in time. Same write-state mechanism as (seek); used
+                    ;; (replay!): re-apply the WHOLE recorded tx-log onto the live atoms — the
+                    ;; latest state, not a point in time. Same write-state mechanism as (seek!); used
                     ;; to restore after a hot restart (fired automatically — see (restart!)). Manual
                     ;; call is the testable core of cross-restart replay.
-                    replay
+                    replay!
                     (let [res (replay!)]
                       (if res
                         (send! {:value (str "replayed " (:atoms res) " atoms → " (:wrote res) " written")
                                 :ns (name @*current-ns)})
-                        (send! {:value "nothing to replay (record first?)" :ns (name @*current-ns)})))
+                        (send! {:value "nothing to replay (record! first?)" :ns (name @*current-ns)})))
 
                     ;; (restart!): hot-restart the app (host writes "R" to flutter, as if typed). When
                     ;; recording is on, the recorded state replays automatically once the fresh isolate
