@@ -163,6 +163,15 @@ Most of the competitive field (§7) collapses onto §2. Done this line of work:
 | **REPL-connection indicator** — host heartbeat → handle colour (HMR-style) | ✅ |
 | **host↔device boundary** — one `context`; `eval!`/`with-compiler-context`/`call!` (future-safe) | ✅ |
 | state reduction — per-pick `:expanded?` (−1 atom), `armed` boolean (was fn-or-nil hook) | ✅ |
+| **frame-safe `write-state`** — host-directed reset!s defer to a post-frame callback (a mid-frame reset! → :watch → setState → "Build scheduled during frame" + torn rebuild) | ✅ |
+| **in-process compiler hot-reload** — build JVM nREPL (`.nrepl-port-jvm`) + `defonce nses`; `:reload` the compiler in **479ms** vs a ~60s relaunch, symbol table preserved | ✅ |
+
+**Dev-velocity note (lived).** The device hot-reload loop is already as fast as CLJS/Flutter (~1s). The
+friction was concentrated in the *host* layer: compiler/tooling edits meant a full ~60s kill+relaunch,
+and non-composable introspection ops (`(errors)`/`(timeline)` are bare host forms, not values). The
+in-process compiler reload removes the first for `compiler.cljc` logic edits; the second (a composable
+`(q FORM)` host-eval over collected errors/timeline/state) is the next cheap win. `nrepl.clj`/`build.clj`
+edits still relaunch (server state lives in closures).
 
 Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependencies):
 
