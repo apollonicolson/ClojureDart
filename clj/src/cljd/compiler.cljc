@@ -389,6 +389,16 @@
 (defn on-dynamic-fail [& args]
   (throw (Exception. (apply print-str "DYNAMIC ERROR:" args))))
 
+(defn dynamic-member-hint
+  "Actionable tail for an unresolved-member diagnostic. The dominant cause is an
+  untyped (dynamic) receiver, which cljd can't resolve a member against — so say
+  so and point at the fix (a type hint) instead of leaving a bare warning."
+  [member-name type!]
+  (if (or (nil? type!) (= 'dc.dynamic (:canon-qname type!)))
+    (str "— receiver type is dynamic; add a type hint so cljd can resolve `"
+      member-name "`, e.g. (. ^SomeType obj " member-name " …) or ^SomeType on the let/arg binding")
+    (str "— `" member-name "` is not a member of " (:element-name type! "that type") "; check the name")))
+
 (def ^:dynamic dynamic-warning on-dynamic-fail)
 
 (def nses (atom {:libs {"dart:core" {:dart-alias "dc" :ns nil}
@@ -1929,11 +1939,43 @@
                 :dart/inferred true})
       (seq bindings) (list 'dart/let bindings))))
 
+(defn emit-dart-map-literal
+  "#dart {k v, …} → a native Dart Map, built as Map<K,V>.fromEntries([MapEntry …]).
+  Removes the jsonEncode→jsonDecode round-trip previously needed to hand a Dart
+  Map to interop (e.g. postEvent). Element types default to dynamic; a 2-vector
+  :tag on the literal (^{:tag [K V]}) sets the key/value types."
+  [quoted x env]
+  (let [t (:tag (meta x))
+        [ktag vtag] (if (and (vector? t) (= 2 (count t)))
+                      t
+                      ['dart:core/dynamic 'dart:core/dynamic])
+        ktype (or (resolve-type ktag (:type-vars env)) dc-dynamic)
+        vtype (or (resolve-type vtag (:type-vars env)) dc-dynamic)
+        map-type (emit-type (vary-meta 'dart:core/Map assoc :type-params [ktag vtag]) env)
+        entry-type (emit-type (vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag]) env)
+        entry-list-tag (vary-meta 'dart:core/List assoc
+                         :type-params [(vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag])])
+        ;; lift every key and value (typed) then re-pair into MapEntry(k, v)
+        [bindings kvs] (lift-args
+                         (mapcat (fn [[k v]] [[nil (emit quoted k env) ktype]
+                                              [nil (emit quoted v env) vtype]])
+                           x)
+                         env)
+        entries (mapv (fn [[dk dv]] (list 'dart/new entry-type dk dv))
+                  (partition 2 kvs))
+        entries-list (with-meta entries
+                       (meta (dart-local (with-meta 'ml {:tag entry-list-tag}) env)))]
+    (cond->> (list 'dart/. map-type "fromEntries" entries-list)
+      (seq bindings) (list 'dart/let bindings))))
+
 (defn emit-dart-literal
   [quoted x env]
   (cond
     (vector? x)
     (emit-dart-list-literal quoted x env)
+
+    (map? x)
+    (emit-dart-map-literal quoted x env)
 
     (list? x)
     (emit-dart-record-literal quoted x env)
@@ -2055,7 +2097,7 @@
               (throw (Exception. (str member-name " is neither a constructor nor a static member of " (:element-name type!) " " (source-info)))))
           _ (when (not member-info)
               (binding [*out* *err*]
-                (dynamic-warning "can't resolve member" member-name "on target type" (:element-name type! "dynamic") "of library" (:lib type! "dart:core") (source-info))))
+                (dynamic-warning "can't resolve member" member-name "on target type" (:element-name type! "dynamic") "of library" (:lib type! "dart:core") (source-info) (dynamic-member-hint member-name type!))))
           special-num-op-sig (case (:canon-qname type!) ; see sections 17.30 and 17.31 of Dart lang spec
                                dc.int (case member-name
                                         ("-" "+" "%" "*")
@@ -2151,7 +2193,7 @@
     (cond
       (not member-info)
       (binding [*out* *err*]
-        (dynamic-warning "can't resolve member" member-name "on target type" (:element-name type! "dynamic") "of library" (:lib type! "dart:core") (source-info)))
+        (dynamic-warning "can't resolve member" member-name "on target type" (:element-name type! "dynamic") "of library" (:lib type! "dart:core") (source-info) (dynamic-member-hint member-name type!)))
       (not= (:kind member-info) :field)
       (throw (Exception. (str member-name " is not a field of " (:element-name type!) " " (source-info)))))
     [dart-obj-bindings dart-obj member-name (or (:setter-type member-info) dc-dynamic)]))
