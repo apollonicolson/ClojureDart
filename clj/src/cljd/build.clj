@@ -16,6 +16,7 @@
             [clojure.tools.deps :as deps]
             [clojure.string :as str]
             [clojure.stacktrace :as st]
+            [clojure.set :as set]
             [clojure.java.io :as io]))
 
 (def ^:dynamic *ansi* false)
@@ -120,6 +121,79 @@
 
 (defn timestamp []
   (.format (java.text.SimpleDateFormat. "@HH:mm:ss" (java.util.Locale/getDefault)) (java.util.Date.)))
+
+;; ── hot-reload binding-shape legibility ──────────────────────────────────────
+;; :managed/:watch bindings and defonce vars are captured by an element the
+;; first time it mounts; hot reload runs the new code but keeps the old
+;; captures, so editing their shape silently leaves stale state (the lived
+;; "ISeqable for int" bug). We can't fix reload semantics, but we can *warn*:
+;; diff the fragile-binding signature of each changed file across reloads and
+;; tell the dev to hot-RESTART (R) when it changed.
+
+(defn- read-cljd-forms
+  "Best-effort read of every top-level form in a .cljd file with the cljd
+  reader. Returns nil on any failure — this is advisory only, never blocks a
+  build."
+  [^java.io.File f]
+  (try
+    (binding [compiler/*current-ns* (or (compiler/peek-ns f) 'cljd.core)]
+      (compiler/with-cljd-reader
+        (with-open [r (clojure.lang.LineNumberingPushbackReader. (io/reader f))]
+          (loop [forms []]
+            (let [form (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)]
+              (if (identical? form ::eof)
+                forms
+                (recur (conj forms form))))))))
+    (catch Throwable _ nil)))
+
+(defn- binding-signature
+  "Set of shape-signatures for hot-reload-fragile constructs in `forms`: every
+  :managed/:watch binding vector and every defonce name. A change to this set
+  across a reload means a restart is needed to apply the edit."
+  [forms]
+  (let [acc (volatile! #{})]
+    (letfn [(scan-pairs [xs]
+              (loop [xs (seq xs)]
+                (when xs
+                  (let [k (first xs) more (next xs)]
+                    (when (and (or (= k :managed) (= k :watch))
+                               more (vector? (first more)))
+                      (vswap! acc conj (pr-str [k (first more)])))
+                    (recur more)))))
+            (walk [x]
+              (cond
+                (and (seq? x) (seq x))
+                (do (when (and (= 'defonce (first x)) (symbol? (second x)))
+                      (vswap! acc conj (pr-str [:defonce (second x)])))
+                    (scan-pairs x)
+                    (run! walk x))
+                (vector? x) (do (scan-pairs x) (run! walk x))
+                (map? x) (run! walk (interleave (keys x) (vals x)))
+                (set? x) (run! walk x)
+                :else nil))]
+      (run! walk forms))
+    @acc))
+
+(defn- binding-signature-of [^java.io.File f]
+  (some-> (read-cljd-forms f) binding-signature))
+
+(defn- warn-binding-shape-change!
+  "If f's fragile-binding signature changed vs `sigs` (an atom of path->sig),
+  print a restart-needed advisory. Updates `sigs`. Returns true iff it warned."
+  [sigs ^java.io.File f]
+  (let [path (.getCanonicalPath f)
+        new-sig (binding-signature-of f)
+        old-sig (@sigs path)]
+    (when new-sig (swap! sigs assoc path new-sig))
+    (when (and new-sig old-sig (not= old-sig new-sig))
+      (let [added (set/difference new-sig old-sig)
+            removed (set/difference old-sig new-sig)]
+        (newline)
+        (println (bright (str ";;;; ⚠ binding-shape change in " (.getName f))))
+        (println (bright ";;;; hot reload keeps stale :managed/:watch/defonce state — press R to hot-restart."))
+        (doseq [s removed] (println (str "     - " s)))
+        (doseq [s added]   (println (str "     + " s))))
+      true)))
 
 (defn exec
   "If first arg is a map, it's an option map.
@@ -354,6 +428,8 @@
               ;; failure onto the DEVICE's error system, so a broken edit shows inline + turns the
               ;; toolbar handle amber, instead of silently keeping the old code and hiding in build.log.
               *reload-error-sink (atom nil)
+              ;; path->fragile-binding-signature baseline, for restart-needed advisories
+              binding-sigs (atom {})
               compile-nses
               (fn [nses]
                 (let [nses (into @dirty-nses nses)]
@@ -375,11 +451,21 @@
                           (try (sink (errors/format-compile e)) (catch Throwable _ nil)))
                         false)))))
               compilation-success (compile-nses namespaces)]
+          ;; seed binding baselines from what's on disk at launch, so the first
+          ;; shape-changing edit (not the second) triggers the restart advisory.
+          (doseq [^java.io.File d dirs
+                  ^java.io.File f (file-seq d)
+                  :when (and (.isFile f) (.endsWith (.getName f) ".cljd"))]
+            (swap! binding-sigs assoc (.getCanonicalPath f)
+              (or (binding-signature-of f) #{})))
           (if (or watch flutter)
             (let [compile-files
                   (fn [^java.io.Writer flutter-stdin]
                     (fn [_ files]
                       (locking *compiler-state
+                        (doseq [^java.io.File f files
+                                :when (.endsWith (.getName f) ".cljd")]
+                          (warn-binding-shape-change! binding-sigs f))
                         (when (some->
                                 (for [^java.io.File f files
                                       :let [fp (.toPath f)]
