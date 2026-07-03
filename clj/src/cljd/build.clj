@@ -10,6 +10,7 @@
   (:require [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vmservice]
             [cljd.repl.eval :as repl-eval]
+            [cljd.repl.errors :as errors]
             [cljd.repl.nrepl :as repl-nrepl]
             [clojure.edn :as edn]
             [clojure.tools.deps :as deps]
@@ -349,6 +350,10 @@
               dirty-nses (volatile! #{})
               *compiler-state (atom {:recompile-count 0
                                      :restart-count 0})
+              ;; set once the VM-Service REPL connects (below): a fn that pushes a reload/compile
+              ;; failure onto the DEVICE's error system, so a broken edit shows inline + turns the
+              ;; toolbar handle amber, instead of silently keeping the old code and hiding in build.log.
+              *reload-error-sink (atom nil)
               compile-nses
               (fn [nses]
                 (let [nses (into @dirty-nses nses)]
@@ -365,6 +370,9 @@
                         (vreset! dirty-nses nses)
                         (println e)
                         #_(print-exception e)
+                        ;; surface the failure on the device too (if the REPL is connected)
+                        (when-some [sink @*reload-error-sink]
+                          (try (sink (errors/format-compile e)) (catch Throwable _ nil)))
                         false)))))
               compilation-success (compile-nses namespaces)]
           (if (or watch flutter)
@@ -525,28 +533,23 @@
                                             ;; inject the widget-picker helper into cljd.flutter (where the
                                             ;; HUD machinery resolves). Only works in a debug build whose
                                             ;; root went through f/run (repl-hud + repl-points present).
+                                            ;; Picker availability probe. The picker is now ONE store:
+                                            ;; the HUD's +cljd-picks+ vector + arm! (in cljd.flutter,
+                                            ;; present when the root went through f/run in a debug build).
+                                            ;; The REPL's (pick!)/(picked)/(picks-do) read that same store —
+                                            ;; no separate +cljd-repl-picked+/+cljd-repl-pick! system anymore.
                                             pick-ok
                                             (try
-                                              (:success
-                                               (binding [compiler/*current-ns* 'cljd.flutter]
-                                                 (repl-eval/eval-form client iso
-                                                   '(do
-                                                      (def +cljd-repl-picked+ (atom nil))
-                                                      (defn +cljd-repl-pick! [on?]
-                                                        (let [hud (-> (global-key :cljd.flutter/app-root) .-currentContext
-                                                                      (peek-of :cljd.flutter.repl-impl/hud-enabled))]
-                                                          (reset! hud
-                                                            (when on?
-                                                              (fn [state]
-                                                                (let [w (.-widget (.-context state))]
-                                                                  (reset! +cljd-repl-picked+
-                                                                    {:loc (.-source_loc w)
-                                                                     :env ((.-get_envmap w))
-                                                                     :env-keys (vec (keys ((.-get_envmap w))))})))))
-                                                          (if on? "picker ON — tap a widget on the device" "picker off"))))
-                                                   {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload})))
+                                              ;; arm! is an EXPRESSION → eval path returns {:value …}
+                                              ;; (no :success — that's only on the reload path). Picker
+                                              ;; is available iff the symbol resolves without error.
+                                              (let [r (binding [compiler/*current-ns* 'cljd.flutter]
+                                                        (repl-eval/eval-form client iso
+                                                          'cljd.flutter/arm!
+                                                          {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload}))]
+                                                (boolean (and r (not (:error r)))))
                                               (catch Throwable e
-                                                (println "[VMREPL] pick init failed:" (.getMessage e)) false))
+                                                (println "[VMREPL] pick probe failed:" (.getMessage e)) false))
                                             server (repl-nrepl/start!
                                                      {:client client :iso-id iso :analyzer analyzer
                                                       :dart-version dartv :*current-ns (atom 'cljd.core)
@@ -555,6 +558,26 @@
                                                       :await? (boolean await-ok)
                                                       :pick? (boolean pick-ok)
                                                       :remember? (boolean await-ok)})]
+                                        ;; heartbeat: ping the device ~1/s so its toolbar shows a live
+                                        ;; connection dot; when this process dies or the VM detaches,
+                                        ;; pings stop and the device watchdog flips it to disconnected.
+                                        (daemon
+                                          (loop []
+                                            (try (vmservice/call-ext client iso "ext.cljd.ping" {})
+                                                 (catch Throwable _ nil))
+                                            (Thread/sleep 1000)
+                                            (recur)))
+                                        ;; reload-legibility: a watch-compile failure now shows on the
+                                        ;; device (report-error! "reload") — inline + amber handle — via
+                                        ;; the still-running old code (the failed compile left it intact).
+                                        (let [rctx (repl-eval/context {:client client :iso-id iso
+                                                                       :analyzer analyzer :dart-version dartv})]
+                                          (reset! *reload-error-sink
+                                            (fn [msg]
+                                              (try (repl-eval/eval! rctx
+                                                     (list 'cljd.flutter/report-error! "reload" msg nil)
+                                                     {:ns 'cljd.flutter :ns-lib-uri "cljd/flutter.dart"})
+                                                   (catch Throwable _ nil)))))
                                         (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
                                           (str "(await " (if await-ok "on" "off")
                                                ", pick " (if pick-ok "on" "off")

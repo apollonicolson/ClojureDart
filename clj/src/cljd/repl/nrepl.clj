@@ -77,6 +77,17 @@
   [libs ^String path]
   (some (fn [[k v]] (let [ks (str k)] (when (or (= ks path) (.endsWith ks (str "/" path))) v))) libs))
 
+(defn- short-cljd-path
+  "Normalize a source-map :file to a consistent project-relative form: strip any file:// scheme
+   and trim to after the last '/src/'. So 'file:///…/ClojureDart/clj/src/cljd/flutter.cljd' and
+   the already-relative 'kora/nav.cljd' both render short ('cljd/flutter.cljd', 'kora/nav.cljd').
+   The compiler stores :file inconsistently — app files relative, dep/ClojureDart files as URIs —
+   so device wloc (short) and resolved cljd (was raw :file) matched only for app picks."
+  [^String file]
+  (let [f (if (.startsWith file "file://") (subs file 7) file)
+        i (.lastIndexOf f "/src/")]
+    (if (neg? i) f (subs f (+ i 5)))))
+
 (defn resolve-wloc
   "A device pick's Dart wloc 'kora/nav.dart:249' -> its .cljd source 'kora/nav.cljd:78:12'
    via the host source map. Coherent — any Dart line resolves to the nearest preceding real
@@ -90,36 +101,128 @@
               entry (find-lib libs path)]
           (when (and line (:smap entry))
             (when-some [info (dart-line->cljd (flatten-smap (:smap entry)) line)]
-              (str (:file info) ":" (:line info)
+              (str (short-cljd-path (:file info)) ":" (:line info)
                    (when (:column info) (str ":" (:column info)))))))))))
 
 (defn- resolve-and-push!
-  "Resolve a device pick's Dart wloc SRC to .cljd and push it back via the ext.cljd.set-cljd
-   service extension (matches the pick by src). Pure data over the channel — no `evaluate`,
-   so no compiler bindings, no form compilation. The device's repl-selections/pick-highlight
-   WATCH +cljd-picks+, so they rebuild reactively; no reassemble needed."
-  [client iso-id ^String src]
-  ;; ALWAYS push a result so the device can distinguish pending from resolved: a cljd loc
-  ;; when it's cljd source, or "" to confirm it's non-cljd Dart (show the Dart wloc, no flash).
-  (let [cljd (resolve-wloc (:libs @compiler/nses) src)]
-    (vm/call-ext client iso-id "ext.cljd.set-cljd" {:src src :cljd (or cljd "")})))
+  "Resolve a device pick's Dart wloc + its ancestor wlocs (the tree) to .cljd and push them back
+   via ext.cljd.set-cljd (matches the pick by src; :tree is the ancestors' cljd locs, \\n-joined,
+   index-aligned). Pure data over the channel — no `evaluate`, no compilation, so it's safe on the
+   event future (which lacks the compiler's dynamic bindings). *env focus is done separately."
+  [ctx data]
+  (let [libs (:libs @compiler/nses)
+        src  (:src data)
+        ;; ALWAYS push a result so the device can distinguish pending from resolved: a cljd loc
+        ;; for cljd source, or "" to confirm non-cljd Dart (show the Dart wloc, no flash).
+        cljd (resolve-wloc libs src)
+        tree (apply str (interpose "\n" (map #(or (resolve-wloc libs %) "") (:ancestors data))))]
+    (repl-eval/call! ctx "ext.cljd.set-cljd" {:src src :cljd (or cljd "") :tree tree})))
+
+;; Load the ACTIVE (last) pick's LIVE env into the device *env holder. `pick-env` re-reads the
+;; scope from the retained ReplState, so value locals are current (not frozen at pick time).
+;; Compiles a set!, so evaluating it needs the compiler's dynamic bindings. Shared by (picked)
+;; and the on-device-pick auto-focus so there's ONE definition of "focus *env on the pick".
+(def ^:private focus-active-env-form
+  '(set! cljd.core/+cljd-repl-env+
+         (cljd.flutter/pick-env (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+)))))
+
+;; ── Coverage (execution visibility, no instrumentation) ──────────────────────
+;; getSourceReport(Coverage, reportLines) → which Dart lines executed, mapped through the source map
+;; → which cljd forms ran. MUST be called PER-SCRIPT: a whole-isolate Coverage call (libraryFilters,
+;; no scriptId) OOMs/crashes the on-device app (measured 2026-07-03). Per-script is bounded + safe.
+(defn- dart-uri->cljd
+  "package:pkg/cljd-out/kora/nav.dart:42 → cljd loc via the source map, or nil."
+  [libs uri-line]
+  (let [marker "cljd-out/" i (.indexOf ^String uri-line marker)]
+    (when (>= i 0) (resolve-wloc libs (subs uri-line (+ i (count marker)))))))
+
+(defn- cljd-coverage
+  "Set of 'package-uri:line' that executed, aggregated over our scripts one getSourceReport at a time."
+  [client iso-id]
+  (let [scripts (->> (:scripts (try (vm/rpc client "getScripts" {:isolateId iso-id}) (catch Throwable _ nil)))
+                     (filter (fn [s] (.contains ^String (str (:uri s)) "cljd-out/kora"))))]
+    (into #{}
+      (for [s scripts
+            :let [rep (try (vm/rpc client "getSourceReport"
+                             {:isolateId iso-id :reports ["Coverage"] :reportLines true :scriptId (:id s)})
+                           (catch Throwable _ nil))
+                  uri (str (:uri s))]
+            rng (:ranges rep)
+            line (get-in rng [:coverage :hits])]
+        (str uri ":" line)))))
 
 (defn make-handler
   "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :await? :pick? :remember?}"
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload await? pick? remember?]
-    :or {ns-lib-uri "cljd/core.dart"}}]
+    :or {ns-lib-uri "cljd/core.dart"}
+    :as cfg}]
+  ;; ctx: the host↔device boundary, bundled once. Every crossing goes through repl-eval's
+  ;; eval! / with-compiler-context / call! — no site re-writes the compiler binding block or
+  ;; threads client/iso-id by hand. (default-ns 'cljd.core matches the *current-ns atom's start.)
   ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
   ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
-  (let [*eval-sink (atom nil)]
+  (let [ctx (repl-eval/context (assoc cfg :default-ns 'cljd.core))
+        *eval-sink (atom nil)
+        ;; the ONE error store: EVERY error — device-pushed (framework/async/report-error!) AND
+        ;; eval-path (runtime @Error, compile) — lands here as data via remember-error!. `(errors)`
+        ;; reads it. Ring-bounded so it can't grow without limit.
+        +cljd-errors+ (atom [])
+        ;; host-recorded state timeline: each entry is a read-state snapshot (EDN {id→value}). The
+        ;; DEVICE holds no epoch store — the durable memory is here, so it survives device restart.
+        +cljd-state-log+ (atom [])
+        ;; continuous change-stream: while recording, each device atom change arrives here as
+        ;; {:id :value} in order. seek(N) replays 0..N into a state snapshot → write-state.
+        +cljd-change-log+ (atom [])
+        ;; last coverage snapshot (set of dart uri:line) — (ran) diffs against it.
+        +cljd-coverage-snap+ (atom #{})
+        ;; coalesce identical consecutive errors (same phase+message) into one entry with a :count,
+        ;; so a reassemble burst of the same assertion doesn't flood the store. Returns the NEW error
+        ;; (for live-forward) or nil when it coalesced a duplicate (so we don't re-forward it).
+        remember-error!
+        (fn [e]
+          (let [prev (peek @+cljd-errors+)
+                dupe? (and prev (= (:phase prev) (:phase e)) (= (:message prev) (:message e)))]
+            (swap! +cljd-errors+
+              (fn [es]
+                (let [prev (peek es)]
+                  (if (and prev (= (:phase prev) (:phase e)) (= (:message prev) (:message e)))
+                    (conj (pop es) (update prev :count (fnil inc 1)))
+                    (vec (take-last 25 (conj es (assoc e :count 1))))))))
+            (when-not dupe? e)))]
    ;; stdout sink just forwards REPL output to the active eval's transport (no marker scanning).
    (vm/set-sink! client (fn [stream text] (when-some [f @*eval-sink] (f stream text))))
-   ;; pick resolution fires on the STRUCTURED Extension event (postEvent), off the WS
+   ;; ONE structured-event intake off the Extension stream. `cljd.pick` resolves the pick; any
+   ;; `cljd.error` event (from report-error!, the chained FlutterError hook, or any Dart extension
+   ;; that adopts the convention) funnels into the one error store + live-forwards. Runs off the WS
    ;; listener thread (a future — a synchronous rpc on the listener thread would deadlock).
    (vm/set-event-sink! client
      (fn [kind data]
-       (when (= kind "cljd.pick")
-         (future (try (resolve-and-push! client iso-id (:src data))
-                      (catch Throwable _ nil))))))
+       (cond
+         (= kind "cljd.pick")
+         (future
+           (try
+             (resolve-and-push! ctx data)                        ; resolve main + tree, compilation-free
+             ;; focus *env on the just-picked widget so an ON-DEVICE pick is immediately usable in
+             ;; the REPL (parity with (picked)). eval! carries the compiler context itself, so this
+             ;; is safe on the bare event future — no hand-written binding block to forget.
+             (repl-eval/eval! ctx focus-active-env-form
+               {:ns 'cljd.flutter :ns-lib-uri "cljd/flutter.dart"})
+             (catch Throwable _ nil)))
+
+         (= kind "cljd.error")
+         (when-some [e (remember-error! {:phase (or (:phase data) "runtime")
+                                         :message (:message data) :stack (:stack data)})]
+           ;; only forward NEW errors (remember-error! returns nil for a coalesced duplicate)
+           (when-some [f @*eval-sink]
+             (f "Stderr" (str "⚠ [" (:phase e) "] " (:message e)
+                              (when (seq (:stack e)) (str "\n" (:stack e))) "\n"))))
+
+         ;; a device atom change (recording on): parse the EDN id+value and append to the timeline
+         (= kind "cljd.state-change")
+         (let [id (try (read-string (:id data)) (catch Throwable _ nil))
+               v  (try (read-string (:value data)) (catch Throwable _ ::unreadable))]
+           (when (and id (not= v ::unreadable))
+             (swap! +cljd-change-log+ conj {:id id :value v}))))))
    (fn [{:keys [op transport id session code] :as msg}]
     (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
@@ -164,11 +267,10 @@
                     :status ["done"]})
             (send! {:status ["done" "no-eldoc"]})))
         "eval"
-        (binding [compiler/*hosted* true
-                  compiler/*dart-version* dart-version
-                  compiler/analyzer-info analyzer
-                  compiler/dynamic-warning compiler/on-dynamic-warn
-                  compiler/*current-ns* @*current-ns]
+        ;; the ONE crossing that changes *current-ns* across several forms (in-ns mid-batch),
+        ;; so it owns a single binding frame; switch-ns! set!s within it. Inner device calls
+        ;; below run inside this frame (eval-form directly), not eval! (which starts its own).
+        (repl-eval/with-compiler-context ctx @*current-ns
           ;; forward the app's Stdout/Stderr WriteEvents to this eval's transport
           ;; while it runs (println output etc.), then detach the sink.
           (reset! *eval-sink (fn [stream text]
@@ -203,26 +305,30 @@
                                   :ex "cljd.no-picker"}))
                       (let [on? (if (>= (count form) 2) (not (false? (second form))) true)
                             r (repl-eval/eval-form client iso-id
-                                (list 'cljd.flutter/+cljd-repl-pick! on?)
+                                (list 'cljd.flutter/arm! on?)
                                 {:ns-lib-uri "cljd/flutter.dart"})]
                         (send! {:value (:value r) :ns (name @*current-ns)})))
 
-                    ;; (picked): report the last picked widget and jump the REPL into its ns.
+                    ;; (picked): report the ACTIVE pick (most recent in the HUD's +cljd-picks+
+                    ;; vector — the single pick store) and jump the REPL into its ns, loading its
+                    ;; scope into *env. `(peek +cljd-picks+)` is the last-picked widget.
                     (= 'picked head)
-                    (let [;; fetch the small :loc on its own — the full map's gensym env-keys
-                          ;; can defeat read-string, which would block the ns jump.
+                    (let [;; small scope-loc first — the full pick's gensym env keys can defeat
+                          ;; read-string, which would block the ns jump.
                           loc-r (repl-eval/eval-form client iso-id
-                                  '(:ns (:loc (cljd.core/deref cljd.flutter/+cljd-repl-picked+)))
+                                  '(:ns (:scope-loc (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))))
                                   {:ns-lib-uri "cljd/flutter.dart"})
                           target (try (read-string (:value loc-r)) (catch Throwable _ nil))
+                          ;; a clean summary (omit env/:rect — not read-string-friendly)
                           full-r (repl-eval/eval-form client iso-id
-                                   '(cljd.core/deref cljd.flutter/+cljd-repl-picked+)
+                                   '(let [p (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))]
+                                      {:scope-loc (:scope-loc p) :type (:type p)
+                                       :src (:src (:widget-loc p)) :cljd (:cljd p)
+                                       :env-keys (cljd.core/vec (cljd.core/keys (cljd.flutter/pick-env p)))})
                                    {:ns-lib-uri "cljd/flutter.dart"})
-                          ;; load the picked widget's scope map into *env (cljd.core holder)
-                          ;; so `*env` / `(get *env "local")` resolve in subsequent evals.
-                          _ (repl-eval/eval-form client iso-id
-                              '(set! cljd.core/+cljd-repl-env+
-                                     (:env (cljd.core/deref cljd.flutter/+cljd-repl-picked+)))
+                          ;; load the active pick's LIVE scope into *env (cljd.core holder) so
+                          ;; `*env` / `(get *env 'local)` resolve in subsequent evals.
+                          _ (repl-eval/eval-form client iso-id focus-active-env-form
                               {:ns-lib-uri "cljd/flutter.dart"})]
                       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
                       (send! {:value (:value full-r) :ns (name @*current-ns)}))
@@ -234,6 +340,35 @@
                     (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
                                  (catch Throwable e {:error (.getMessage e)}))]
                       (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
+
+                    ;; (errors): recent device errors as structured DATA — everything the device
+                    ;; pushed onto the one cljd.error stream (framework/async/explicit). (errors :clear)
+                    ;; empties the store.
+                    (= 'errors head)
+                    (do (when (= :clear (second form)) (reset! +cljd-errors+ []))
+                        (send! {:value (pr-str @+cljd-errors+) :ns (name @*current-ns)}))
+
+                    ;; (picks-do FORM): run FORM in the scope of EVERY pick at once — `*env` is
+                    ;; rebound to each pick's lexical map in turn. Returns a vector of results.
+                    ;; e.g. (picks-do (swap! (*env 'expanded?) not)) toggles all selected widgets.
+                    (= 'picks-do head)
+                    (if-not pick?
+                      (do (vreset! errored true)
+                          (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
+                                  :ex "cljd.no-picker"}))
+                      (let [user-form (second form)
+                            ;; set! *env's holder to each pick's LIVE env, then eval the (rewritten)
+                            ;; user form; mapv collects. `remember?` makes eval rewrite *env→holder.
+                            wrapped (list 'cljd.core/mapv
+                                          (list 'cljd.core/fn ['p]
+                                                (list 'set! 'cljd.core/+cljd-repl-env+ (list 'cljd.flutter/pick-env 'p))
+                                                user-form)
+                                          '(cljd.core/deref cljd.flutter/+cljd-picks+))
+                            r (repl-eval/eval-form client iso-id wrapped
+                                {:ns-lib-uri "cljd/flutter.dart" :remember? remember?})]
+                        (if (:error r)
+                          (do (vreset! errored true) (send! {:err (:message r) :ex "cljd.eval-error"}))
+                          (send! {:value (:value r) :ns (name @*current-ns)}))))
 
                     ;; (cljd-src "kora/nav.dart" 249) -> "kora/nav.cljd:78:12". The coherent
                     ;; Dart->cljd source map: works for ANY Dart line in a compiled lib.
@@ -251,6 +386,98 @@
                                       compiler/macroexpand-1 compiler/macroexpand) {} f)]
                       (send! {:value (pr-str expanded) :ns (name @*current-ns)}))
 
+                    ;; (dart-of '(...)): the Dart the compiler emits for a form — "what will this
+                    ;; become on device". Host-side (form->dart-expr), no device round-trip. A compile
+                    ;; error (e.g. unknown symbol) is shown as such instead of the Dart.
+                    (= 'dart-of head)
+                    (let [f (unwrap-quote (second form))
+                          dart (try (compiler/form->dart-expr f)
+                                    (catch Throwable e (str "compile error: " (errors/format-compile e))))]
+                      (send! {:value dart :ns (name @*current-ns)}))
+
+                    ;; state time-travel, HOST-recorded. (states) READs the whole app state as data;
+                    ;; (epoch!) records a snapshot into the host timeline; (restore-epoch N) DIRECTS
+                    ;; the device back to that snapshot. The recording lives on the host → durable
+                    ;; across device restart (replay into a fresh app), addressed by stable [loc sym].
+                    (= 'states head)
+                    (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
+                              {:ns-lib-uri "cljd/flutter.dart"})]
+                      (send! {:value (:value r) :ns (name @*current-ns)}))
+
+                    (= 'epoch! head)
+                    (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
+                              {:ns-lib-uri "cljd/flutter.dart"})
+                          edn (:value r)]
+                      (swap! +cljd-state-log+ conj edn)
+                      (send! {:value (str "epoch " (dec (count @+cljd-state-log+)) " recorded on host")
+                              :ns (name @*current-ns)}))
+
+                    (= 'epochs head)
+                    (send! {:value (str (count @+cljd-state-log+) " epochs (host-recorded)")
+                            :ns (name @*current-ns)})
+
+                    (= 'restore-epoch head)
+                    (let [i (second form)
+                          edn (nth @+cljd-state-log+ i nil)
+                          ;; parse HOST-side (device cljd has no read-string) → send the map as a
+                          ;; compiled literal to write-state.
+                          snap (when edn (try (read-string edn) (catch Throwable _ nil)))]
+                      (if snap
+                        (let [r (repl-eval/eval-form client iso-id (list 'cljd.flutter/write-state snap)
+                                  {:ns-lib-uri "cljd/flutter.dart"})]
+                          (send! {:value (str "directed device to epoch " i " (" (:value r) " atoms)")
+                                  :ns (name @*current-ns)}))
+                        (send! {:err (str "no epoch " i " (or unparseable state)") :ex "cljd.no-epoch"})))
+
+                    ;; continuous recording: (record) starts a fresh timeline with a base keyframe
+                    ;; (the full state now) + arms device atom-watchers; (record false) stops.
+                    (= 'record head)
+                    (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
+                      (if on?
+                        (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
+                                   {:ns-lib-uri "cljd/flutter.dart"})
+                              base (try (read-string (:value r0)) (catch Throwable _ {}))]
+                          (reset! +cljd-change-log+ (mapv (fn [[id v]] {:id id :value v}) base))
+                          (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
+                            {:ns-lib-uri "cljd/flutter.dart"})
+                          (send! {:value (str "recording on (" (count @+cljd-change-log+) " base atoms)")
+                                  :ns (name @*current-ns)}))
+                        (do (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! false)
+                              {:ns-lib-uri "cljd/flutter.dart"})
+                            (send! {:value "recording off" :ns (name @*current-ns)}))))
+
+                    (= 'changes head)
+                    (send! {:value (str (count @+cljd-change-log+) " changes recorded") :ns (name @*current-ns)})
+
+                    ;; (seek N): DIRECT the device to the state as of change N — replay 0..N into a
+                    ;; snapshot (last value wins per id) → write-state. Continuous time-travel.
+                    (= 'seek head)
+                    (let [n (second form)
+                          snap (reduce (fn [m c] (assoc m (:id c) (:value c))) {}
+                                 (take (inc n) @+cljd-change-log+))]
+                      (if (seq snap)
+                        (let [r (repl-eval/eval-form client iso-id (list 'cljd.flutter/write-state snap)
+                                  {:ns-lib-uri "cljd/flutter.dart"})]
+                          (send! {:value (str "sought to change " n " (" (:value r) " atoms)")
+                                  :ns (name @*current-ns)}))
+                        (send! {:err (str "no changes up to " n " (record first?)") :ex "cljd.no-change"})))
+
+                    ;; (coverage): snapshot which cljd forms have executed (line-granular, per-script
+                    ;; getSourceReport). (ran): after an interaction, the cljd locs NEWLY executed
+                    ;; since the last snapshot — "what code this action touched", no instrumentation.
+                    (= 'coverage head)
+                    (let [cov (cljd-coverage client iso-id)]
+                      (reset! +cljd-coverage-snap+ cov)
+                      (send! {:value (str (count cov) " dart lines covered — snapshot taken; interact then (ran)")
+                              :ns (name @*current-ns)}))
+
+                    (= 'ran head)
+                    (let [now (cljd-coverage client iso-id)
+                          fresh (remove @+cljd-coverage-snap+ now)
+                          locs (->> fresh (keep #(dart-uri->cljd (:libs @compiler/nses) %)) distinct sort vec)]
+                      (reset! +cljd-coverage-snap+ now)
+                      (send! {:value (pr-str locs) :ns (name @*current-ns)}))
+
                     :else
                     (let [r (repl-eval/eval-form client iso-id form
                                                  {:ns-lib-uri (ns->lib-uri @*current-ns)
@@ -262,15 +489,20 @@
                                     (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
                         :eval   (if (:error r)
                                   (do (vreset! errored true)
-                                      ;; runtime Dart exception: clean message + demunged user frames
-                                      (send! {:err (errors/format-runtime (:message r))
-                                              :ex "dart.runtime-exception"}))
+                                      ;; runtime Dart exception: clean message + demunged user frames.
+                                      ;; :dart-kind (from the @Error) tags phase: LanguageError→compile.
+                                      (let [msg (errors/format-runtime (:message r)
+                                                  (fn [dl] (resolve-wloc (:libs @compiler/nses) dl)))
+                                            phase (if (= "LanguageError" (:dart-kind r)) "compile" "runtime")]
+                                        (remember-error! {:phase phase :message msg :stack nil})
+                                        (send! {:err msg :ex "dart.runtime-exception"})))
                                   (send! {:value (:value r) :ns (name @*current-ns)})))))))
               (send! {:status (if @errored ["done" "error"] ["done"])})
               (catch Throwable e
                 ;; compile-time error from turning the form into Dart
-                (send! {:err (errors/format-compile e)
-                        :ex (str (class e)) :status ["done" "error"]}))
+                (let [msg (errors/format-compile e)]
+                  (remember-error! {:phase "compile" :message msg :stack nil})
+                  (send! {:err msg :ex (str (class e)) :status ["done" "error"]})))
               (finally (reset! *eval-sink nil)))))
         (send! {:status ["done" "error" "unknown-op"]}))))))
 

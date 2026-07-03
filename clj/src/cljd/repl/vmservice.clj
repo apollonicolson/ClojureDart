@@ -98,6 +98,23 @@
   [client iso-id obj-id]
   (rpc client "getObject" {:isolateId iso-id :objectId obj-id}))
 
+(defn get-string-full
+  "The full value of a String instance (OBJ-ID), paged past `evaluate`'s 128-char
+   valueAsString cap. getObject on a String honours offset/count; reassemble up to LENGTH
+   code units. Used when an eval result's :valueAsStringIsTruncated is set."
+  [client iso-id obj-id length]
+  (if (or (nil? length) (<= length 0))
+    ""
+    (loop [off 0 sb (StringBuilder.)]
+      (if (>= off length)
+        (.toString sb)
+        (let [r (rpc client "getObject"
+                     {:isolateId iso-id :objectId obj-id :offset off :count (- length off)})
+              s (:valueAsString r)]
+          (if (or (nil? s) (zero? (count s)))
+            (.toString sb)                    ; no progress → stop (avoid spin)
+            (recur (+ off (count s)) (doto sb (.append ^String s)))))))))
+
 (defn call-ext
   "Call a registered Dart service extension (method like \"ext.cljd.picks\", registered
    device-side via dart:developer registerExtension). PARAMS values must be strings.

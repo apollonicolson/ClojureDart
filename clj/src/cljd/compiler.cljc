@@ -3474,7 +3474,8 @@
                                        :dart/signature actual-function-type}))
               :class (with-meta (:qname v) {:dart/class v})
               :field (with-meta (:qname v) {:dart/type (:type v)}))
-      (throw (Exception. (str "Unknown symbol: " x (source-info)))))))
+      (throw (ex-info (str "Unknown symbol: " x (source-info))
+               {:cljd.error/phase :compile :cljd.error/symbol x})))))
 
 (defn emit-var [[_ s] env]
   (let [[tag info] (resolve-symbol s {})]

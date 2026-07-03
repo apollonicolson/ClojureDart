@@ -46,7 +46,7 @@
       (let [r (vm/evaluate client iso-id lib deref-dart)
             v (:valueAsString r)]
         (cond
-          (= (:type r) "@Error")    {:kind :eval :error true :message (:message r) :ref r}
+          (= (:type r) "@Error")    {:kind :eval :error true :message (:message r) :dart-kind (:kind r) :ref r}
           (or (nil? v) (= v "null"))
           (if (< (System/currentTimeMillis) deadline)
             (do (Thread/sleep 100) (recur))
@@ -70,11 +70,17 @@
         r    (vm/evaluate client iso-id lib dart)]
     (cond
       (= (:type r) "@Error")
-      {:kind :eval :error true :message (:message r) :ref r}
+      {:kind :eval :error true :message (:message r) :dart-kind (:kind r) :ref r}
       (and await? (= "__cljd_future_pending__" (:valueAsString r)))
       (poll-future client iso-id lib await-timeout-ms)
       :else
-      {:kind :eval :value (:valueAsString r) :ref r})))
+      ;; evaluate caps a String's valueAsString at 128 code units (:valueAsStringIsTruncated);
+      ;; the REPL pr-strs results to Strings, so page the full value back via getObject.
+      {:kind :eval
+       :value (if (and (= "String" (:kind r)) (:valueAsStringIsTruncated r))
+                (vm/get-string-full client iso-id (:id r) (:length r))
+                (:valueAsString r))
+       :ref r})))
 
 (defn- existing-def?
   "True if NAME already resolves to a global var (a :def) in the current ns."
@@ -126,3 +132,56 @@
     ;; --- expression ---
     :else
     (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms remember?)))
+
+;; ── The host↔device boundary ─────────────────────────────────────────────────
+;; Everything that crosses from the host JVM compiler into the device Dart VM goes
+;; through here, so no caller has to reason about the boundary. TWO things must be
+;; true at every crossing that COMPILES a form: (1) the compiler's dynamic vars are
+;; bound — form->dart / recompile-form read them, and a bare `future` does NOT inherit
+;; them (the recurring silent bug); (2) the transport coordinates (client, iso-id) are
+;; supplied. `context` bundles both once; the crossings are:
+;;   • (eval! ctx form opts) — a self-contained device eval, safe from ANY thread.
+;;   • (with-compiler-context ctx ns & body) — the binding frame, for the ONE case that
+;;     changes *current-ns* across several forms (the multi-form eval batch).
+;;   • (call! ctx method params) — a structured service-extension call (no compilation).
+
+(defn context
+  "Bundle the boundary coordinates once (from the nREPL cfg): the vmservice CLIENT +
+   ISO-ID, the ANALYZER + DART-VERSION the compiler needs, the default evaluate scope
+   (NS-LIB-URI) and the default compile ns (DEFAULT-NS). Pass to eval! / call! /
+   with-compiler-context — nothing else should touch client/iso-id or the binding block."
+  [{:keys [client iso-id analyzer dart-version ns-lib-uri default-ns]
+    :or {ns-lib-uri "cljd/core.dart" default-ns 'cljd.core}}]
+  {:client client :iso-id iso-id :analyzer analyzer :dart-version dart-version
+   :ns-lib-uri ns-lib-uri :default-ns default-ns})
+
+(defmacro with-compiler-context
+  "Establish the compiler dynamic bindings from CTX (current-ns = NS-SYM) around BODY —
+   THE single definition of that binding block, safe from any thread/future. Inside,
+   `(set! cljd.compiler/*current-ns* …)` persists for the rest of BODY (a real binding
+   frame), which is why the multi-form eval batch wraps itself in one of these."
+  [ctx ns-sym & body]
+  `(let [c# ~ctx]
+     (binding [compiler/*hosted* true
+               compiler/*dart-version* (:dart-version c#)
+               compiler/analyzer-info (:analyzer c#)
+               compiler/dynamic-warning compiler/on-dynamic-warn
+               compiler/*current-ns* ~ns-sym]
+       ~@body)))
+
+(defn eval!
+  "THE host→device eval. Self-contained: establishes the compiler context (so it is safe
+   from any thread, including a bare future) and threads CTX's transport coordinates — the
+   caller passes only FORM (+ opts). opts :ns sets the compile-time current-ns (default
+   ctx's); the usual eval-form opts (:ns-lib-uri, :await?, :remember?, :trigger-reload …)
+   pass through, defaulting :ns-lib-uri to ctx's."
+  ([ctx form] (eval! ctx form nil))
+  ([ctx form {:keys [ns] :as opts}]
+   (with-compiler-context ctx (or ns (:default-ns ctx))
+     (eval-form (:client ctx) (:iso-id ctx) form
+                (merge {:ns-lib-uri (:ns-lib-uri ctx)} (dissoc opts :ns))))))
+
+(defn call!
+  "A device service-extension call (structured, compilation-free); coordinates from CTX."
+  [ctx method params]
+  (vm/call-ext (:client ctx) (:iso-id ctx) method params))

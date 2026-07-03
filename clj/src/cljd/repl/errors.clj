@@ -56,38 +56,46 @@
 (defn- clean-frame
   "Rewrite a user Dart frame into cljd terms: demunge the fn name and show the
    ns path + line.  e.g. `#3 ifn_foo_M__1$1.$_invoke$2 (package:kora/cljd-out/kora/app.dart:42:3)`
-   -> `kora.app/foo (kora/app.dart:42)`."
-  [frame]
+   -> `kora.app/foo (kora/app.cljd:78:12)`.  RESOLVE-LOC maps a Dart `path:line` to the cljd
+   `path:line:col` (via the compiler source map) or nil; the shown location is the cljd source when
+   resolvable, else the Dart loc."
+  [frame resolve-loc]
   (let [fnname (or (cljd-fn-name frame)
-                   (second (re-find #"#\d+\s+(\S+)" frame)))
+                   ;; top-level defn frames don't match the ifn_…_M__ method pattern, so the fallback
+                   ;; grabs the raw Dart symbol — demunge it too (user frames are cljd-compiled, so a
+                   ;; plain `_` is always a munged `-`; real underscores arrive as $UNDERSCORE_).
+                   (some-> (second (re-find #"#\d+\s+(\S+)" frame)) demunge-name))
         loc    (second (re-find #"cljd-out/([^\s):]+\.dart:\d+)" frame))
+        shown  (or (some-> loc resolve-loc) loc)
         ns'    (some-> loc (str/replace #"\.dart:\d+$" "") (str/replace "/" "."))]
     (cond
-      (and ns' fnname) (str "  " ns' "/" fnname "  (" loc ")")
-      loc              (str "  (" loc ")")
+      (and ns' fnname) (str "  " ns' "/" fnname "  (" shown ")")
+      shown            (str "  (" shown ")")
       :else            (str "  " (str/trim frame)))))
 
 (defn- clean-trace
   "From a multi-line Dart error blob, return [message user-frames] — the message
    lines (sans the \"Unhandled exception:\" banner) and only the user's frames,
-   demunged.  cljd.core / dart: / async-zone / Eval-IIFE frames are dropped."
-  [blob]
+   demunged + source-mapped.  cljd.core / dart: / async-zone / Eval-IIFE frames are dropped."
+  [blob resolve-loc]
   (let [lines (str/split-lines (or blob ""))
         [msg-lines frames] (split-with (complement frame-line?) lines)
         msg (->> msg-lines
                  (remove #(re-matches #"(?i)\s*unhandled exception:?\s*" %))
                  (str/join "\n") str/trim)
-        user (->> frames (filter user-frame?) (map clean-frame))]
+        user (->> frames (filter user-frame?) (map #(clean-frame % resolve-loc)))]
     [msg user]))
 
 ;; --- public formatters -------------------------------------------------------
 
 (defn format-runtime
-  "Format a runtime `@Error` :message into clean REPL text."
-  [message]
-  (let [[msg frames] (clean-trace message)]
-    (str (if (str/blank? msg) "Unhandled exception" msg)
-         (when (seq frames) (str "\n" (str/join "\n" frames))))))
+  "Format a runtime `@Error` :message into clean REPL text. RESOLVE-LOC (optional) maps Dart frame
+   locs to cljd source; without it, frames show the Dart loc."
+  ([message] (format-runtime message (constantly nil)))
+  ([message resolve-loc]
+   (let [[msg frames] (clean-trace message resolve-loc)]
+     (str (if (str/blank? msg) "Unhandled exception" msg)
+          (when (seq frames) (str "\n" (str/join "\n" frames)))))))
 
 (defn- causes [^Throwable e]
   (take-while some? (iterate #(.getCause ^Throwable %) e)))
