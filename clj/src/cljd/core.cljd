@@ -7687,6 +7687,120 @@
     (with-out-str
      (apply println xs)))
 
+(defn- ^String -fmt-group
+  "Insert ',' every three digits into an unsigned integer digit-string."
+  [^String s]
+  (let [n (.-length s)
+        head (if (zero? (mod n 3)) 3 (mod n 3))]
+    (if (<= n 3)
+      s
+      (loop [i head acc (subs s 0 head)]
+        (if (>= i n)
+          acc
+          (recur (+ i 3) (str acc "," (subs s i (+ i 3)))))))))
+
+(defn- ^String -fmt-sign [neg? ^String flags]
+  (cond neg? "-"
+        (.contains flags "+") "+"
+        (.contains flags " ") " "
+        :else ""))
+
+(defn- ^String -fmt-pad
+  "Attach sign, then pad body to width honoring '-' (left) and '0' (zero, kept
+  between sign and digits) flags."
+  [^String sign ^String body ^String flags width]
+  (let [s (str sign body)]
+    (if (or (nil? width) (<= ^int width (.-length s)))
+      s
+      (cond
+        (.contains flags "-") (.padRight s ^int width " ")
+        (.contains flags "0") (str sign (.padLeft body (- ^int width (.-length sign)) "0"))
+        :else (.padLeft s ^int width " ")))))
+
+(def ^:private -fmt-re
+  #"%(?:(\d+)\$)?([-+ 0,#]*)(\d+)?(?:\.(\d+))?([a-zA-Z%])")
+
+(defn ^String format
+  "Formats args into a string using a java.util.Formatter-style pattern.
+  Output matches java.util.Formatter (what clojure.core/format delegates to)
+  for the supported conversions.
+
+  Supported conversions: %s %S %d %f %e %E %x %X %o %c %b %B %n %%
+  Flags: '-' left-justify, '0' zero-pad, '+' always show sign, ' ' leading
+  space for positives, ',' digit grouping (%d). Width and .precision are
+  honored (precision truncates %s and sets fraction digits for %f/%e).
+
+  Deliberate deviations from JVM (documented, not accidental):
+  - %d coerces real args by truncation; JVM throws IllegalFormatConversion.
+  - %c accepts any int (Dart has one int type); JVM %c rejects Long.
+  - %x/%o print a leading '-' for negatives; JVM prints two's complement.
+  - %g/%G, '(' flag and argument indexing (\"%2$s\") are unsupported and pass
+    through literally rather than being applied. Use str + explicit helpers."
+  [^String fmt & args]
+  (let [args (vec args)
+        ai (volatile! 0)]
+    (.replaceAllMapped fmt -fmt-re
+      (fn ^String [^Match mm]
+        (let [conv (.group mm 5)]
+          (cond
+            (= conv "%") "%"
+            (= conv "n") "\n"
+            :else
+            (let [flags (or (.group mm 2) "")
+                  ws (.group mm 3)
+                  width (when ws (int/parse ^String ws))
+                  ps (.group mm 4)
+                  prec (when ps (int/parse ^String ps))
+                  idx (.group mm 1)
+                  k (if idx
+                      (dec (int/parse ^String idx))
+                      (let [k @ai] (vswap! ai inc) k))
+                  arg (when (< k (count args)) (nth args k))
+                  lc (.toLowerCase ^String conv)
+                  up? (not= lc conv)
+                  out
+                  (cond
+                    (= lc "s")
+                    (let [s (if (nil? arg) "null" (str arg))
+                          s (if (and prec (< ^int prec (.-length s))) (subs s 0 prec) s)]
+                      (-fmt-pad "" s flags width))
+
+                    (= lc "b")
+                    (-fmt-pad "" (if arg (if (= arg false) "false" "true") "false") flags width)
+
+                    (= lc "c")
+                    (-fmt-pad "" (if (dart/is? arg int) (String/fromCharCode ^int arg) (str arg)) flags width)
+
+                    (= lc "d")
+                    (let [v (if (dart/is? arg num) (.toInt ^num arg) 0)
+                          neg? (< v 0)
+                          digits (str (.abs ^int v))
+                          digits (if (.contains flags ",") (-fmt-group digits) digits)]
+                      (-fmt-pad (-fmt-sign neg? flags) digits flags width))
+
+                    (or (= lc "x") (= lc "o"))
+                    (let [v (if (dart/is? arg num) (.toInt ^num arg) 0)]
+                      (-fmt-pad "" (.toRadixString ^int v (if (= lc "x") 16 8)) flags width))
+
+                    (= lc "f")
+                    (let [v (if (dart/is? arg num) (.toDouble ^num arg) 0.0)
+                          neg? (< v 0)]
+                      (-fmt-pad (-fmt-sign neg? flags) (.toStringAsFixed (.abs ^double v) (or prec 6)) flags width))
+
+                    (= lc "e")
+                    (let [v (if (dart/is? arg num) (.toDouble ^num arg) 0.0)
+                          neg? (< v 0)
+                          ;; Java pads the exponent to >= 2 digits (e+03); Dart
+                          ;; emits minimal digits (e+3) — pad to match Formatter.
+                          body (.replaceAllMapped
+                                 (.toStringAsExponential (.abs ^double v) (or prec 6))
+                                 #"e([+-])(\d)$"
+                                 (fn ^String [^Match m] (str "e" (.group m 1) "0" (.group m 2))))]
+                      (-fmt-pad (-fmt-sign neg? flags) body flags width))
+
+                    :else (str "%" conv))]
+              (if up? (.toUpperCase ^String out) out))))))))
+
 (defn re-groups
   "Returns the groups from a match. If there are no
   nested groups, returns a string of the entire match. If there are
