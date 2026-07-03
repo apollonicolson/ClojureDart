@@ -284,10 +284,12 @@
             (try
               (doseq [form (read-forms code)]
                 (let [head (and (seq? form) (first form))]
-                  (cond
+                  ;; dispatch the REPL's special ops as a table (case on the form head); anything
+                  ;; not an op falls through to the default — compile + eval/reload on the device.
+                  (case head
                     ;; (in-ns 'x): switch the eval/compile context to an existing ns —
                     ;; no recompile; its defs + required aliases become resolvable.
-                    (= 'in-ns head)
+                    in-ns
                     (let [target (unwrap-quote (second form))]
                       (if (ns-exists? target)
                         (do (switch-ns! target)
@@ -298,7 +300,7 @@
                                     :ex "cljd.no-such-ns"}))))
 
                     ;; (pick!) / (pick! false): toggle the on-device widget picker.
-                    (= 'pick! head)
+                    pick!
                     (if-not pick?
                       (do (vreset! errored true)
                           (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
@@ -312,7 +314,7 @@
                     ;; (picked): report the ACTIVE pick (most recent in the HUD's +cljd-picks+
                     ;; vector — the single pick store) and jump the REPL into its ns, loading its
                     ;; scope into *env. `(peek +cljd-picks+)` is the last-picked widget.
-                    (= 'picked head)
+                    picked
                     (let [;; small scope-loc first — the full pick's gensym env keys can defeat
                           ;; read-string, which would block the ns jump.
                           loc-r (repl-eval/eval-form client iso-id
@@ -336,7 +338,7 @@
                     ;; ext.cljd.picks service extension — one call, JSON, no `evaluate`, no
                     ;; 128-char cap, no per-field reads. :cljd is already resolved by the
                     ;; Extension-event auto-resolver, so this op is now a pure read.
-                    (= 'picks head)
+                    picks
                     (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
                                  (catch Throwable e {:error (.getMessage e)}))]
                       (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
@@ -344,14 +346,14 @@
                     ;; (errors): recent device errors as structured DATA — everything the device
                     ;; pushed onto the one cljd.error stream (framework/async/explicit). (errors :clear)
                     ;; empties the store.
-                    (= 'errors head)
+                    errors
                     (do (when (= :clear (second form)) (reset! +cljd-errors+ []))
                         (send! {:value (pr-str @+cljd-errors+) :ns (name @*current-ns)}))
 
                     ;; (picks-do FORM): run FORM in the scope of EVERY pick at once — `*env` is
                     ;; rebound to each pick's lexical map in turn. Returns a vector of results.
                     ;; e.g. (picks-do (swap! (*env 'expanded?) not)) toggles all selected widgets.
-                    (= 'picks-do head)
+                    picks-do
                     (if-not pick?
                       (do (vreset! errored true)
                           (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
@@ -372,7 +374,7 @@
 
                     ;; (cljd-src "kora/nav.dart" 249) -> "kora/nav.cljd:78:12". The coherent
                     ;; Dart->cljd source map: works for ANY Dart line in a compiled lib.
-                    (= 'cljd-src head)
+                    cljd-src
                     (let [path (str (second form))
                           line (nth form 2)
                           cljd (resolve-wloc (:libs @compiler/nses) (str path ":" line))]
@@ -380,7 +382,7 @@
 
                     ;; (macroexpand '(...)) / (macroexpand-1 '(...)): host-side via the
                     ;; compiler, not shipped to the device (cljd macros are compile-time).
-                    (#{'macroexpand 'macroexpand-1} head)
+                    (macroexpand macroexpand-1)
                     (let [f (unwrap-quote (second form))
                           expanded ((if (= 'macroexpand-1 head)
                                       compiler/macroexpand-1 compiler/macroexpand) {} f)]
@@ -389,7 +391,7 @@
                     ;; (dart-of '(...)): the Dart the compiler emits for a form — "what will this
                     ;; become on device". Host-side (form->dart-expr), no device round-trip. A compile
                     ;; error (e.g. unknown symbol) is shown as such instead of the Dart.
-                    (= 'dart-of head)
+                    dart-of
                     (let [f (unwrap-quote (second form))
                           dart (try (compiler/form->dart-expr f)
                                     (catch Throwable e (str "compile error: " (errors/format-compile e))))]
@@ -399,12 +401,12 @@
                     ;; (epoch!) records a snapshot into the host timeline; (restore-epoch N) DIRECTS
                     ;; the device back to that snapshot. The recording lives on the host → durable
                     ;; across device restart (replay into a fresh app), addressed by stable [loc sym].
-                    (= 'states head)
+                    states
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart"})]
                       (send! {:value (:value r) :ns (name @*current-ns)}))
 
-                    (= 'epoch! head)
+                    epoch!
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart"})
                           edn (:value r)]
@@ -412,11 +414,11 @@
                       (send! {:value (str "epoch " (dec (count @+cljd-state-log+)) " recorded on host")
                               :ns (name @*current-ns)}))
 
-                    (= 'epochs head)
+                    epochs
                     (send! {:value (str (count @+cljd-state-log+) " epochs (host-recorded)")
                             :ns (name @*current-ns)})
 
-                    (= 'restore-epoch head)
+                    restore-epoch
                     (let [i (second form)
                           edn (nth @+cljd-state-log+ i nil)
                           ;; parse HOST-side (device cljd has no read-string) → send the map as a
@@ -431,7 +433,7 @@
 
                     ;; continuous recording: (record) starts a fresh timeline with a base keyframe
                     ;; (the full state now) + arms device atom-watchers; (record false) stops.
-                    (= 'record head)
+                    record
                     (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
                       (if on?
                         (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
@@ -446,12 +448,12 @@
                               {:ns-lib-uri "cljd/flutter.dart"})
                             (send! {:value "recording off" :ns (name @*current-ns)}))))
 
-                    (= 'changes head)
+                    changes
                     (send! {:value (str (count @+cljd-change-log+) " changes recorded") :ns (name @*current-ns)})
 
                     ;; (seek N): DIRECT the device to the state as of change N — replay 0..N into a
                     ;; snapshot (last value wins per id) → write-state. Continuous time-travel.
-                    (= 'seek head)
+                    seek
                     (let [n (second form)
                           snap (reduce (fn [m c] (assoc m (:id c) (:value c))) {}
                                  (take (inc n) @+cljd-change-log+))]
@@ -465,20 +467,20 @@
                     ;; (coverage): snapshot which cljd forms have executed (line-granular, per-script
                     ;; getSourceReport). (ran): after an interaction, the cljd locs NEWLY executed
                     ;; since the last snapshot — "what code this action touched", no instrumentation.
-                    (= 'coverage head)
+                    coverage
                     (let [cov (cljd-coverage client iso-id)]
                       (reset! +cljd-coverage-snap+ cov)
                       (send! {:value (str (count cov) " dart lines covered — snapshot taken; interact then (ran)")
                               :ns (name @*current-ns)}))
 
-                    (= 'ran head)
+                    ran
                     (let [now (cljd-coverage client iso-id)
                           fresh (remove @+cljd-coverage-snap+ now)
                           locs (->> fresh (keep #(dart-uri->cljd (:libs @compiler/nses) %)) distinct sort vec)]
                       (reset! +cljd-coverage-snap+ now)
                       (send! {:value (pr-str locs) :ns (name @*current-ns)}))
 
-                    :else
+                    ;; default: not a special op → compile + eval (or reload) the form on the device
                     (let [r (repl-eval/eval-form client iso-id form
                                                  {:ns-lib-uri (ns->lib-uri @*current-ns)
                                                   :trigger-reload trigger-reload
