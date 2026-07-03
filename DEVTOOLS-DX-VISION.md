@@ -169,9 +169,9 @@ Most of the competitive field (§7) collapses onto §2. Done this line of work:
 **Dev-velocity note (lived).** The device hot-reload loop is already as fast as CLJS/Flutter (~1s). The
 friction was concentrated in the *host* layer: compiler/tooling edits meant a full ~60s kill+relaunch,
 and non-composable introspection ops (`(errors)`/`(timeline)` are bare host forms, not values). The
-in-process compiler reload removes the first for `compiler.cljc` logic edits; the second (a composable
-`(q FORM)` host-eval over collected errors/timeline/state) is the next cheap win. `nrepl.clj`/`build.clj`
-edits still relaunch (server state lives in closures).
+in-process compiler reload removes the first for `compiler.cljc` logic edits; the second is now closed by
+`(q FORM)` (host-eval over the collected stores as values). `nrepl.clj`/`build.clj` edits still relaunch
+(server state lives in closures) — a restartable device-nREPL server would close that too.
 
 Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependencies):
 
@@ -210,15 +210,23 @@ device — inline + amber handle + exact loc — instead of silently keeping old
   **per-script** (whole-isolate crashes the on-device app — see memory `getsourcereport-per-script`),
   mapped through `resolve-wloc`. Zero instrumentation; the line-level layer *below* the coord primitive.
 
-- **Value-flow tracing `(trace 'form)` — SHIPPED (v0, rank 1).** Validated: `(trace '(+ (* 2 3)
+- **Value-flow tracing `(trace 'form)` — SHIPPED (v1, rank 1).** Validated: `(trace '(+ (* 2 3)
   (- 10 4)))` → `12`, `(timeline :trace)` shows coord `"1"`→6, `"2"`→6, `""`→12. A **host-side
   form-rewrite**, NOT emit surgery: a compile-time walk wraps each sub-expression in `(record! coord expr)` (returns
   the value, side-effects `postEvent "cljd.trace" {coord,value}`), emits the rewritten form, registers
   the form once. `emit` (`compiler.cljc:3716`) stays untouched — decisive de-risk. Coord = form-tree
   path (`"2,1"`), reusing FlowStorm's `{form,coord}` display. **Load-bearing correctness = the skip-list**
   (don't wrap binding-vec symbols, `quote`/`fn*` params, `.`-member symbols, `recur`/`set!` targets,
-  type tags). On-demand/opt-in first; measure overhead before any always-on emit pass. **This is the
-  real fix for the def-level source-map wall** (CLJD-DX-AUDIT #5) at sub-expression granularity.
+  type tags). **v1 (`90e6c3c`)** widens past fn-calls into the value positions of `let`/`let*`/`loop`/
+  `loop*` (binding values + body), `if` (test + both branches), and `do` — validated on device:
+  `(trace '(let [x 5 y (* x 2)] (+ x y)))` streams `let1`=10, `b0`=15, `""`=15. On-demand/opt-in first;
+  measure overhead before any always-on emit pass. **The real fix for the def-level source-map wall**
+  (CLJD-DX-AUDIT #5) at sub-expression granularity.
+
+- **Composable introspection `(q FORM)` — SHIPPED (`90e6c3c`).** The stores (`errors` `timeline`
+  `changes` `epochs` `coverage`) live host-side, so `(q FORM)` evaluates FORM there with them bound as
+  plain values: `(q (frequencies (map :kind timeline)))`, `(q (filter #(= "flutter" (:phase %)) errors))`.
+  Closes the "ops aren't values" gap — no more dump-and-grep.
 
 - **Clojure-native observability — SHIPPED (`tap>`/`log!`, rank 1).** `cljd.core` defines
   `add-tap`/`tap>` (`core.cljd:9370`). Device→host: `(add-tap #(post-event! "cljd.tap" {:edn (pr-str %)}))`
