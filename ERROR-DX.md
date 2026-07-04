@@ -145,14 +145,16 @@ Everything now flows into the **one timeline** with a consistent `{:phase :messa
   *every* error. Validated: `runtime`, `compile`, `flutter`, and pushed errors coexist in `(errors)`.
 - **phase from `@Error` kind** — `eval.clj` carries `:dart-kind`; a `LanguageError` tags `:compile`,
   else `:runtime`.
-- **compiler consistency** — the bare `Exception.` at `compiler.cljc:3477` is now `ex-info` with
-  `:cljd.error/phase :compile` (→ clean `"Unknown symbol: …"` in `(errors)`).
+- **compiler consistency** — the Unknown-symbol throw (`compiler.cljc:3539`) is `ex-info` with
+  `:cljd.error/phase :compile` (→ clean `"Unknown symbol: …"` in `(errors)`), not a bare `Exception.`.
 - **async hook** — `PlatformDispatcher.onError` → `report-error! "async"` (returns `false`, non-invasive).
 - **coalescing** — identical consecutive errors collapse to one entry with `:count N` (a reassemble
   burst of the `'!locked'` gesture assertion no longer floods; duplicate live-forwards suppressed).
   Validated: 5× identical → `{:count 5}`.
-- **on-device badge** — `report-error!` bumps `+cljd-error-count+`; the toolbar shows a red `⚠ N` badge
-  (tap to clear) when device-originated errors land.
+- **on-device error list** — `report-error!` coalesces onto `+cljd-errors-local+` (a bounded vector,
+  same `:count` coalescing as the host); the DevTools surface renders those errors inline as a list
+  below the picks (tap the header to clear). (No `⚠ N` counter badge was built — the inline list
+  superseded that design; see §7b's "errors render inline below picks" note.)
 
 ### 7b. resolve-wloc frames — SHIPPED (rank 1, validated)
 
@@ -167,7 +169,7 @@ mostly framework frames that don't source-map, and the framework frames are the 
   now source-mapped; `getObject` on the exception/stacktrace refs returns the same strings +2 RPCs.
 - **compiler phase-tags on all throw sites** — nothing reads the compiler-internal `:cljd.error/phase`
   (the nREPL compile-catch already tags `:phase "compile"`); tagging ~15 sites = a full recompile for an
-  unread field. (`:3477` bare-`Exception`→`ex-info` was worth it for consistency; the rest are `ex-info`.)
+  unread field. (`:3539` bare-`Exception`→`ex-info` was worth it for consistency; the rest are `ex-info`.)
 
 **Done since:** top-level-defn fn-name demunge (`kora_boom`→`kora-boom`, validated); on-device error
 *list* (errors render inline below picks, no tabs). **Line-granular coverage** also shipped
