@@ -170,8 +170,13 @@ Most of the competitive field (§7) collapses onto §2. Done this line of work:
 friction was concentrated in the *host* layer: compiler/tooling edits meant a full ~60s kill+relaunch,
 and non-composable introspection ops (`(errors)`/`(timeline)` are bare host forms, not values). The
 in-process compiler reload removes the first for `compiler.cljc` logic edits; the second is now closed by
-`(q FORM)` (host-eval over the collected stores as values). `nrepl.clj`/`build.clj` edits still relaunch
-(server state lives in closures) — a restartable device-nREPL server would close that too.
+`(q FORM)` (host-eval over the collected stores as values). **`nrepl.clj` now hot-reloads too** (shipped):
+the durable stores are top-level `defonce`, the per-connection context lives in a `defonce +state+`, and the
+sinks + request dispatch are `#'var` trampolines into top-level `handle-request`/`event-sink` — so
+`(require 'cljd.repl.nrepl :reload)` on the build's JVM nREPL swaps every op's code while the WS
+connection, isolate, and socket stay live (measured: **93 ms**, state preserved, op behaviour swapped on
+device — no relaunch). Only `build.clj` still relaunches (its watch loop / triggers own the flutter stdin),
+and a `nrepl.clj` edit that adds a NEW cfg-shape key needs a relaunch to thread it through `+state+`.
 
 Frontier (each cheaper *here* than the non-Lisp baseline, but with real dependencies):
 

@@ -345,113 +345,93 @@
                            (line-column->offset text (:end-line m) (:end-column m))))))
       (read-source-forms file))))
 
-(defn make-handler
-  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :trigger-restart :source-dirs :await? :pick? :remember?}"
-  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload trigger-restart source-dirs await? pick? remember?]
-    :or {ns-lib-uri "cljd/core.dart"}
-    :as cfg}]
-  ;; ctx: the host↔device boundary, bundled once. Every crossing goes through repl-eval's
-  ;; eval! / with-compiler-context / call! — no site re-writes the compiler binding block or
-  ;; threads client/iso-id by hand. (default-ns 'cljd.core matches the *current-ns atom's start.)
-  ;; *eval-sink: the swappable per-eval stdout forwarder. The persistent pick-resolver sink
-  ;; (installed once) both auto-resolves CLJD_PICK markers and forwards through *eval-sink.
-  (let [;; *iso: the CURRENT main isolate id. A Flutter hot restart (R) spins a NEW isolate, so the
-        ;; id captured at launch goes stale and every eval fails ("Expression compilation error").
-        ;; refresh-iso! re-resolves it (fired on the device's cljd.booted event); ctx + the eval op
-        ;; deref this, so the whole REPL survives a restart.
-        *iso (atom iso-id)
-        refresh-iso! (fn [] (when-some [i (try (vm/main-isolate-id client) (catch Throwable _ nil))]
-                              (reset! *iso i)))
-        ctx (repl-eval/context (assoc cfg :*iso *iso :default-ns 'cljd.core))
-        *eval-sink (atom nil)
-        ;; the transaction log: while recording, each frame's batched atom changes arrive as one
-        ;; {:tx n :t ms :delta {id→value} :cause c} (device cljd.tx event). seek(N) merges deltas
-        ;; 0..N into a state snapshot → write-state. Host-durable, so it survives a device restart.
-        ;; Epochs are just the :cause :epoch keyframes in here (epoch-indices derives their positions —
-        ;; no parallel index atom). (epoch!) appends a full-state keyframe; the DEVICE holds no history.
-        +cljd-tx-log+ (atom [])
-        ;; recording armed? — gates cross-restart auto-replay (only restore state when the user
-        ;; asked for a durable recording; a plain hot-restart otherwise starts clean).
-        +cljd-recording?+ (atom false)
-        ;; last coverage snapshot (set of dart uri:line) — (ran) diffs against it.
-        +cljd-coverage-snap+ (atom #{})
-        ;; the UNIFIED timeline: every device event (tap / log / error / tx) appended in
-        ;; causal order, tagged :kind — one ordered log across all four channels. `record-tl!` clocks
-        ;; each entry ((tl-now) is set per-eval below to avoid Date.now in this file's macros).
-        +cljd-timeline+ (atom [])
-        record-tl! (fn [kind data]
-                     (swap! +cljd-timeline+
-                       (fn [tl] (vec (take-last 500 (conj tl {:kind kind :t (System/currentTimeMillis) :data data}))))))
-        ;; the ONE error intake: EVERY error — device-pushed (framework/async/report-error!) AND
-        ;; eval-path (runtime @Error, compile) — lands as a :kind :error entry in the unified timeline
-        ;; (errors-view reads them back). Coalesces a consecutive same phase+message into the previous
-        ;; entry's :count (so a reassemble burst of one assertion doesn't flood the timeline). Returns
-        ;; the NEW error (for live-forward) or nil when it coalesced a duplicate (so we don't re-forward).
-        remember-error!
-        (fn [e]
-          (let [prev (peek @+cljd-timeline+)
-                dupe? (and (= :error (:kind prev))
-                           (= (:phase (:data prev)) (:phase e))
-                           (= (:message (:data prev)) (:message e)))]
-            (if dupe?
-              (do (swap! +cljd-timeline+
-                    (fn [tl] (conj (pop tl) (update (peek tl) :data update :count (fnil inc 1)))))
-                  nil)
-              (do (record-tl! :error (assoc e :count 1))
-                  e))))
-        ;; write-snap!: push a {id → value} snapshot to the device's live atoms (write-state) and
-        ;; return how many landed. The one device-write shared by replay / seek / restore-epoch.
-        write-snap!
-        (fn [snap] (try (:value (repl-eval/eval-form client @*iso
-                                  (list 'cljd.flutter/write-state snap)
-                                  {:ns-lib-uri "cljd/flutter.dart"}))
-                        (catch Throwable _ nil)))
-        ;; replay!: re-apply the whole recorded tx-log (last value wins per id) onto the device's
-        ;; live atoms. The tx-log lives HERE (host), so this survives a device hot-restart — the
-        ;; isolate/atoms are fresh, addressed by stable [loc sym]. {:atoms n :wrote m} or nil if empty.
-        replay!
-        (fn []
-          (let [snap (tx-snapshot @+cljd-tx-log+)]
-            (when (seq snap) {:atoms (count snap) :wrote (write-snap! snap)})))
-        ;; replay-settle!: the boot-time replay (fired on cljd.booted after a restart). Runs on the
-        ;; WS-listener future, which lacks the compiler bindings, so it establishes the context
-        ;; itself. Retries on a short backoff until every recorded-and-live id matches its value:
-        ;; startup pumps frames, and a mid-frame write-state defers (and may not land on an idle
-        ;; app), so one shot isn't enough. Re-arms device recording after, so capture continues
-        ;; across the restart. Returns the {:tries :ok} verdict (also logged to the timeline).
-        replay-settle!
-        (fn []
-          (repl-eval/with-compiler-context ctx @*current-ns
-            (let [snap (tx-snapshot @+cljd-tx-log+)
-                  read-live #(try (read-string (:value (repl-eval/eval-form client @*iso
-                                                         '(cljd.flutter/read-state)
-                                                         {:ns-lib-uri "cljd/flutter.dart" :await? true})))
-                                  (catch Throwable _ nil))
-                  ;; landed? every recorded id that is CURRENTLY live equals its recorded value.
-                  ;; (Ids for not-yet-mounted widgets are skipped — can't restore what isn't there.)
-                  landed? (fn [live] (and live (every? (fn [[id v]]
-                                                         (or (not (contains? live id)) (= v (get live id))))
-                                                       snap)))
-                  result (loop [tries 0]
-                           (Thread/sleep (min 800 (+ 250 (* tries 200))))
-                           (replay!)
-                           (let [live (read-live)]
-                             (if (or (landed? live) (>= tries 6))
-                               {:tries tries :ok (boolean (landed? live))}
-                               (recur (inc tries)))))]
-              (record-tl! :log (merge {:cljd/replayed (count snap)} result))
-              (try (repl-eval/eval-form client @*iso '(cljd.flutter/arm-recording! true)
-                     {:ns-lib-uri "cljd/flutter.dart"})
-                   (catch Throwable _ nil))
-              result)))]
-   ;; stdout sink just forwards REPL output to the active eval's transport (no marker scanning).
-   (vm/set-sink! client (fn [stream text] (when-some [f @*eval-sink] (f stream text))))
-   ;; ONE structured-event intake off the Extension stream. `cljd.pick` resolves the pick; any
-   ;; `cljd.error` event (from report-error!, the chained FlutterError hook, or any Dart extension
-   ;; that adopts the convention) funnels into the one error store + live-forwards. Runs off the WS
-   ;; listener thread (a future — a synchronous rpc on the listener thread would deadlock).
-   (vm/set-event-sink! client
-     (fn [kind data]
+;; ── Durable introspection state + the live connection cell ────────────────────
+;; These are top-level `defonce` so `(require 'cljd.repl.nrepl :reload)` swaps the CODE below
+;; (helpers, sinks, request dispatch — all reached through #'vars) while PRESERVING this state and
+;; the live VM-Service connection. The running nREPL server holds only a trampoline into #'handle-request,
+;; so a reload updates every op without a ~60s app relaunch (the compiler/nses-is-defonce trick, applied
+;; to the socket handler). +state+ holds the per-connection context, populated by make-handler.
+(defonce ^:private +cljd-tx-log+ (atom []))         ; the transaction log (seek/replay/epochs); :cause :epoch keyframes
+(defonce ^:private +cljd-recording?+ (atom false))  ; recording armed? — gates cross-restart auto-replay
+(defonce ^:private +cljd-coverage-snap+ (atom #{}))  ; last coverage snapshot — (ran) diffs against it
+(defonce ^:private +cljd-timeline+ (atom []))       ; the UNIFIED timeline (tap/log/error/tx/trace), tagged :kind
+(defonce ^:private +state+ (atom nil))              ; {:client :*iso :ctx :*eval-sink :*current-ns + cfg flags}
+
+;; record-tl!: clock + append one entry onto the unified timeline (bounded ring).
+(defn- record-tl! [kind data]
+  (swap! +cljd-timeline+
+    (fn [tl] (vec (take-last 500 (conj tl {:kind kind :t (System/currentTimeMillis) :data data}))))))
+
+;; remember-error!: the ONE error intake (device-pushed AND eval-path) → a :kind :error timeline entry.
+;; Coalesces a consecutive same phase+message into the previous entry's :count (so a reassemble burst of
+;; one assertion doesn't flood). Returns the NEW error (live-forward) or nil when it coalesced a dup.
+(defn- remember-error! [e]
+  (let [prev (peek @+cljd-timeline+)
+        dupe? (and (= :error (:kind prev))
+                   (= (:phase (:data prev)) (:phase e))
+                   (= (:message (:data prev)) (:message e)))]
+    (if dupe?
+      (do (swap! +cljd-timeline+
+            (fn [tl] (conj (pop tl) (update (peek tl) :data update :count (fnil inc 1)))))
+          nil)
+      (do (record-tl! :error (assoc e :count 1))
+          e))))
+
+;; write-snap!: push a {id → value} snapshot to the device's live atoms (write-state), return how many
+;; landed. The one device-write shared by replay / seek / restore-epoch. Reads the live connection from +state+.
+(defn- write-snap! [snap]
+  (let [{:keys [client *iso]} @+state+]
+    (try (:value (repl-eval/eval-form client @*iso
+                   (list 'cljd.flutter/write-state snap)
+                   {:ns-lib-uri "cljd/flutter.dart"}))
+         (catch Throwable _ nil))))
+
+;; replay!: re-apply the whole recorded tx-log (last value wins per id) onto the device's live atoms.
+(defn- replay! []
+  (let [snap (tx-snapshot @+cljd-tx-log+)]
+    (when (seq snap) {:atoms (count snap) :wrote (write-snap! snap)})))
+
+;; refresh-iso!: re-resolve the CURRENT main isolate id after a hot restart spun a new one.
+(defn- refresh-iso! []
+  (let [{:keys [client *iso]} @+state+]
+    (when-some [i (try (vm/main-isolate-id client) (catch Throwable _ nil))]
+      (reset! *iso i))))
+
+;; replay-settle!: the boot-time replay (fired on cljd.booted). Runs on the WS-listener future, which
+;; lacks compiler bindings, so it establishes the context itself; retries until every recorded-and-live
+;; id matches (startup pumps frames), then re-arms device recording.
+(defn- replay-settle! []
+  (let [{:keys [ctx *current-ns client *iso]} @+state+]
+    (repl-eval/with-compiler-context ctx @*current-ns
+      (let [snap (tx-snapshot @+cljd-tx-log+)
+            read-live #(try (read-string (:value (repl-eval/eval-form client @*iso
+                                                   '(cljd.flutter/read-state)
+                                                   {:ns-lib-uri "cljd/flutter.dart" :await? true})))
+                            (catch Throwable _ nil))
+            landed? (fn [live] (and live (every? (fn [[id v]]
+                                                   (or (not (contains? live id)) (= v (get live id))))
+                                                 snap)))
+            result (loop [tries 0]
+                     (Thread/sleep (min 800 (+ 250 (* tries 200))))
+                     (replay!)
+                     (let [live (read-live)]
+                       (if (or (landed? live) (>= tries 6))
+                         {:tries tries :ok (boolean (landed? live))}
+                         (recur (inc tries)))))]
+        (record-tl! :log (merge {:cljd/replayed (count snap)} result))
+        (try (repl-eval/eval-form client @*iso '(cljd.flutter/arm-recording! true)
+               {:ns-lib-uri "cljd/flutter.dart"})
+             (catch Throwable _ nil))
+        result))))
+
+;; stdout-sink: forward device REPL output to the active eval's transport.
+(defn- stdout-sink [state stream text]
+  (when-some [f @(:*eval-sink state)] (f stream text)))
+
+;; event-sink: ONE structured-event intake off the Extension stream (cljd.pick / error / tx / tap /
+;; log / trace / booted). Runs off the WS listener thread (futures — a sync rpc there would deadlock).
+(defn event-sink [state kind data]
+  (let [{:keys [ctx *eval-sink]} state]
        (cond
          (= kind "cljd.pick")
          (future
@@ -506,8 +486,13 @@
              (refresh-iso!)
              (when @+cljd-recording?+ (replay-settle!))
              (catch Throwable _ nil))))))
-   (fn [{:keys [op transport id session code] :as msg}]
-    (let [send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
+;; handle-request: the nREPL request dispatch. A top-level defn reached through a #'var trampoline, so
+;; a (require 'cljd.repl.nrepl :reload) swaps every op's code while the server socket + connection stay up.
+;; The per-connection context arrives as `state` and is destructured to the same local names the case
+;; body already used (client/*iso/ctx/…) — so the dispatch below is unchanged.
+(defn handle-request [state {:keys [op transport id session code] :as msg}]
+  (let [{:keys [client *iso ctx *current-ns *eval-sink trigger-reload trigger-restart source-dirs ns-lib-uri await? pick? remember?]} state
+        send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
       (case op
         "clone"       (transport/send transport {:id id :new-session (str (UUID/randomUUID)) :status ["done"]})
         "ls-sessions" (send! {:sessions [] :status ["done"]})
@@ -950,7 +935,32 @@
                   (remember-error! {:phase "compile" :message msg :stack nil})
                   (send! {:err msg :ex (str (class e)) :status ["done" "error"]})))
               (finally (reset! *eval-sink nil)))))
-        (send! {:status ["done" "error" "unknown-op"]}))))))
+        (send! {:status ["done" "error" "unknown-op"]}))))
+
+;; make-handler is defined LAST — it only WIRES the pieces above (helpers, sinks, handle-request)
+;; through #'var trampolines, so no forward declaration is needed. Called once by start!.
+(defn make-handler
+  "cfg: {:client :iso-id :analyzer :dart-version :*current-ns :ns-lib-uri :trigger-reload :trigger-restart :source-dirs :await? :pick? :remember?}"
+  [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload trigger-restart source-dirs await? pick? remember?]
+    :or {ns-lib-uri "cljd/core.dart"}
+    :as cfg}]
+  (let [;; *iso: the CURRENT main isolate id. A Flutter hot restart (R) spins a NEW isolate, so the
+        ;; id captured at launch goes stale; refresh-iso! re-resolves it on the cljd.booted event.
+        *iso (atom iso-id)
+        ctx (repl-eval/context (assoc cfg :*iso *iso :default-ns 'cljd.core))
+        *eval-sink (atom nil)
+        ;; the per-connection context every top-level fn/sink/op reads. Stashed in the +state+ defonce
+        ;; so reloading this ns keeps the live connection while swapping the code around it.
+        state {:client client :*iso *iso :ctx ctx :*eval-sink *eval-sink
+               :*current-ns *current-ns :ns-lib-uri ns-lib-uri
+               :trigger-reload trigger-reload :trigger-restart trigger-restart
+               :source-dirs source-dirs :await? await? :pick? pick? :remember? remember?}]
+    (reset! +state+ state)
+    ;; sinks + request handler are var-trampolines into top-level defns, so (require ... :reload)
+    ;; swaps their code while this connection stays live (single-slot set-*-sink! → no dup listeners).
+    (vm/set-sink! client (fn [stream text] (#'stdout-sink @+state+ stream text)))
+    (vm/set-event-sink! client (fn [kind data] (#'event-sink @+state+ kind data)))
+    (fn [msg] (#'handle-request @+state+ msg))))
 
 (defn start!
   "Start the nREPL server. Returns the nrepl server (has :port). Writes .nrepl-port."
