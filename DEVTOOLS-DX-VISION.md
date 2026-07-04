@@ -351,9 +351,15 @@ reactnative.dev/docs/react-native-devtools · radon.swmansion.com · developer.a
   full-res frame** (W·H·4), so a scrub ring is memory-bound — 1 s @ 15 fps ≈ 129 MB, 2 s @ 30 fps ≈ 518 MB.
   Surprising: **lowering `pixelRatio` does NOT cut capture time** (quarter-res measured 0.41–1.16 ms ≥
   full) — a non-native ratio forces a re-raster that swamps the pixel savings; it only cuts *memory*
-  (quarter ≈ 0.54 MB/frame, so a 60-frame ring ≈ 32 MB) at a fidelity cost (252×561). **Verdict:** a frame
-  ring-buffer is time-feasible but memory-bound — viable only as a SHALLOW full-res ring (a handful of
-  frames) or a longer REDUCED-res ring (accepting fidelity loss). Not free continuous time-travel.
+  (quarter ≈ 0.54 MB/frame, so a 60-frame ring ≈ 32 MB) at a fidelity cost (252×561).
+  **Verdict: DON'T build it — the pixel ring is largely redundant with the state tx-log.** We already
+  record the *cause* of each frame (the `[loc sym]` transactions); `seek!`/`replay!` reset the atoms and
+  the app RE-RENDERS the real widgets — scrubbable visual time-travel at *bytes/transaction*, queryable
+  and editable, none of which a bitmap is. Recording 8.6 MB pixels/frame when the state that regenerates
+  them is already logged is the waste. The ONLY thing pixels add is *un-modeled* visual state (mid-flight
+  animation, native/platform, scroll/focus — the "can't restore" slice of §5), a narrow cosmetic niche not
+  worth the memory. Revisit only if that specific niche becomes a felt need; the tx-log is the right
+  time-travel primitive.
 - **RESOLVED (2026-07-04):** for anything you can *pick*, the source-map is invertible enough — the
   pick resolves widget → `.cljd file:line:col`, and `form-at` + the reader's position tracking locate
   the exact form and every child's span (literals included). So named-property edit-back is deterministic
