@@ -128,18 +128,20 @@ consuming each vendor channel separately.
   (`{phase, message, stack}`). `register-cljd-devtools!` **chains onto `FlutterError.onError`** (calling
   the previous handler, so DevTools' `structuredErrors`/red-screen still work), so every framework error
   auto-funnels into the same `report-error!` → `cljd.error`.
-- **Host (`cljd.repl.nrepl`):** the existing Extension event-sink gained one `cljd.error` branch → a
-  ring-bounded `+cljd-errors+` store; it **live-forwards** to the active eval's `:err` and is read as
-  data via the **`(errors)`** op (`(errors :clear)` empties it).
+- **Host (`cljd.repl.nrepl`):** the existing Extension event-sink gained one `cljd.error` branch →
+  `remember-error!`, which appends a `:kind :error` entry onto the **unified `+cljd-timeline+`** (there is
+  no separate error store); it **live-forwards** to the active eval's `:err` and is read back as data via
+  the **`(errors)`** op — a derived `errors-view` over the timeline's `:error` entries (`(errors :clear)`
+  drops them).
 - **Validated:** a `report-error!` probe and a synthetic `FlutterError.reportError` both flowed through
   and appear in `(errors)` as `{:phase … :message … :stack …}`. "Any extension pushes errors" = adopt the
   `cljd.error` convention (or call `report-error!`).
 
 ### 7a. Unification round 2 — SHIPPED (rank 1, validated)
 
-Everything now flows into the **one store** with a consistent `{:phase :message :stack :count}` shape:
-- **eval-path folded in** — runtime `@Error` and compile errors now go through `remember-error!` into
-  `+cljd-errors+` too (not just the synchronous `:err`), so `(errors)` is the single source of truth for
+Everything now flows into the **one timeline** with a consistent `{:phase :message :stack :count}` shape:
+- **eval-path folded in** — runtime `@Error` and compile errors now go through `remember-error!` onto the
+  unified timeline too (not just the synchronous `:err`), so `(errors)` is the single source of truth for
   *every* error. Validated: `runtime`, `compile`, `flutter`, and pushed errors coexist in `(errors)`.
 - **phase from `@Error` kind** — `eval.clj` carries `:dart-kind`; a `LanguageError` tags `:compile`,
   else `:runtime`.

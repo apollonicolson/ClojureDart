@@ -219,6 +219,19 @@
   [txs]
   (reduce (fn [m tx] (merge m (:delta tx))) {} txs))
 
+(defn- epoch-indices
+  "The epoch cut-points, DERIVED from the tx-log: each keyframe tx carries :cause :epoch, so the
+   markers ARE the log — no parallel index atom to keep in sync. (epoch!) appends such a tx; this
+   reads the positions back out."
+  [tx-log]
+  (vec (keep-indexed (fn [i tx] (when (= :epoch (:cause tx)) i)) tx-log)))
+
+(defn- errors-view
+  "The error channel, DERIVED from the unified timeline: the :error entries' data (already coalesced
+   at intake — consecutive same phase+message carry a :count). One store; (errors) is a read over it."
+  [timeline]
+  (mapv :data (filter #(= :error (:kind %)) timeline)))
+
 ;; ── Edit-back: pick → source form → surgical value splice ─────────────────────
 ;; Not a new subsystem — it extends the pick's existing app→source arrow one hop to WRITE.
 ;; The pick already resolves a widget to its .cljd file:line:col (resolve-wloc); edit-back reads
@@ -351,19 +364,11 @@
                               (reset! *iso i)))
         ctx (repl-eval/context (assoc cfg :*iso *iso :default-ns 'cljd.core))
         *eval-sink (atom nil)
-        ;; the ONE error store: EVERY error — device-pushed (framework/async/report-error!) AND
-        ;; eval-path (runtime @Error, compile) — lands here as data via remember-error!. `(errors)`
-        ;; reads it. Ring-bounded so it can't grow without limit.
-        +cljd-errors+ (atom [])
-        ;; host-recorded state timeline: each entry is a read-state snapshot (EDN {id→value}). The
-        ;; DEVICE holds no epoch/history store — the durable memory is HERE, so it survives a device
-        ;; restart (replay into a fresh app, addressed by stable [loc sym]). +cljd-epochs+ holds named
-        ;; cut-points (indices) into the tx-log: an epoch is just a labeled position in the ONE
-        ;; timeline — (epoch!) drops a full-state keyframe + marks it; no separate snapshot store.
-        +cljd-epochs+ (atom [])
         ;; the transaction log: while recording, each frame's batched atom changes arrive as one
         ;; {:tx n :t ms :delta {id→value} :cause c} (device cljd.tx event). seek(N) merges deltas
         ;; 0..N into a state snapshot → write-state. Host-durable, so it survives a device restart.
+        ;; Epochs are just the :cause :epoch keyframes in here (epoch-indices derives their positions —
+        ;; no parallel index atom). (epoch!) appends a full-state keyframe; the DEVICE holds no history.
         +cljd-tx-log+ (atom [])
         ;; recording armed? — gates cross-restart auto-replay (only restore state when the user
         ;; asked for a durable recording; a plain hot-restart otherwise starts clean).
@@ -377,20 +382,23 @@
         record-tl! (fn [kind data]
                      (swap! +cljd-timeline+
                        (fn [tl] (vec (take-last 500 (conj tl {:kind kind :t (System/currentTimeMillis) :data data}))))))
-        ;; coalesce identical consecutive errors (same phase+message) into one entry with a :count,
-        ;; so a reassemble burst of the same assertion doesn't flood the store. Returns the NEW error
-        ;; (for live-forward) or nil when it coalesced a duplicate (so we don't re-forward it).
+        ;; the ONE error intake: EVERY error — device-pushed (framework/async/report-error!) AND
+        ;; eval-path (runtime @Error, compile) — lands as a :kind :error entry in the unified timeline
+        ;; (errors-view reads them back). Coalesces a consecutive same phase+message into the previous
+        ;; entry's :count (so a reassemble burst of one assertion doesn't flood the timeline). Returns
+        ;; the NEW error (for live-forward) or nil when it coalesced a duplicate (so we don't re-forward).
         remember-error!
         (fn [e]
-          (let [prev (peek @+cljd-errors+)
-                dupe? (and prev (= (:phase prev) (:phase e)) (= (:message prev) (:message e)))]
-            (swap! +cljd-errors+
-              (fn [es]
-                (let [prev (peek es)]
-                  (if (and prev (= (:phase prev) (:phase e)) (= (:message prev) (:message e)))
-                    (conj (pop es) (update prev :count (fnil inc 1)))
-                    (vec (take-last 25 (conj es (assoc e :count 1))))))))
-            (when-not dupe? e)))
+          (let [prev (peek @+cljd-timeline+)
+                dupe? (and (= :error (:kind prev))
+                           (= (:phase (:data prev)) (:phase e))
+                           (= (:message (:data prev)) (:message e)))]
+            (if dupe?
+              (do (swap! +cljd-timeline+
+                    (fn [tl] (conj (pop tl) (update (peek tl) :data update :count (fnil inc 1)))))
+                  nil)
+              (do (record-tl! :error (assoc e :count 1))
+                  e))))
         ;; write-snap!: push a {id → value} snapshot to the device's live atoms (write-state) and
         ;; return how many landed. The one device-write shared by replay / seek / restore-epoch.
         write-snap!
@@ -459,8 +467,7 @@
          (= kind "cljd.error")
          (when-some [e (remember-error! {:phase (or (:phase data) "runtime")
                                          :message (:message data) :stack (:stack data)})]
-           (record-tl! :error e)
-           ;; only forward NEW errors (remember-error! returns nil for a coalesced duplicate)
+           ;; remember-error! already logged it; only forward NEW errors (nil = coalesced duplicate)
            (when-some [f @*eval-sink]
              (f "Stderr" (str "⚠ [" (:phase e) "] " (:message e)
                               (when (seq (:stack e)) (str "\n" (:stack e))) "\n"))))
@@ -709,12 +716,13 @@
                                            path ":" ln)
                                     :ex "cljd.no-prop"})))))
 
-                    ;; (errors): recent device errors as structured DATA — everything the device
-                    ;; pushed onto the one cljd.error stream (framework/async/explicit). (errors :clear)
-                    ;; empties the store.
+                    ;; (errors): recent errors as structured DATA — the :error entries of the unified
+                    ;; timeline (framework/async/explicit/eval-path), derived via errors-view. No parallel
+                    ;; store. (errors :clear) drops those entries from the timeline.
                     errors
-                    (do (when (= :clear (second form)) (reset! +cljd-errors+ []))
-                        (send! {:value (pr-str @+cljd-errors+) :ns (name @*current-ns)}))
+                    (do (when (= :clear (second form))
+                          (swap! +cljd-timeline+ (fn [tl] (vec (remove #(= :error (:kind %)) tl)))))
+                        (send! {:value (pr-str (errors-view @+cljd-timeline+)) :ns (name @*current-ns)}))
 
                     ;; (q FORM): evaluate FORM on the HOST over the collected introspection data
                     ;; as plain values — the bound symbols `errors` `timeline` `txs` `epochs`
@@ -725,11 +733,12 @@
                     ;; Fixes the "ops aren't values" gap: the stores live host-side, so this is a
                     ;; pure host eval — no device round-trip, no dump-and-grep.
                     q
-                    (let [data {'errors @+cljd-errors+
+                    (let [data {'errors (errors-view @+cljd-timeline+)
                                 'timeline @+cljd-timeline+
                                 'txs @+cljd-tx-log+
                                 ;; epochs resolve to the state map AT each cut-point (not the raw index)
-                                'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+)) @+cljd-epochs+)
+                                'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+))
+                                              (epoch-indices @+cljd-tx-log+))
                                 'coverage @+cljd-coverage-snap+}
                           r (try
                               (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data))
@@ -810,21 +819,20 @@
                     (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
                               {:ns-lib-uri "cljd/flutter.dart" :await? true})
                           state (try (read-string (:value r)) (catch Throwable _ {}))]
-                      ;; append the full snapshot as a keyframe transaction, then mark its index.
+                      ;; append the full snapshot as a :epoch keyframe tx — the marker IS the log entry.
                       (swap! +cljd-tx-log+ conj {:tx (count @+cljd-tx-log+) :t (System/currentTimeMillis)
                                                  :delta state :cause :epoch})
-                      (swap! +cljd-epochs+ conj (dec (count @+cljd-tx-log+)))
-                      (send! {:value (str "epoch " (dec (count @+cljd-epochs+)) " recorded ("
+                      (send! {:value (str "epoch " (dec (count (epoch-indices @+cljd-tx-log+))) " recorded ("
                                        (count state) " atoms → tx-log)")
                               :ns (name @*current-ns)}))
 
                     epochs
-                    (send! {:value (str (count @+cljd-epochs+) " epochs (markers into the tx-log)")
+                    (send! {:value (str (count (epoch-indices @+cljd-tx-log+)) " epochs (markers into the tx-log)")
                             :ns (name @*current-ns)})
 
                     restore-epoch!
                     (let [i (second form)
-                          idx (nth @+cljd-epochs+ i nil)]
+                          idx (nth (epoch-indices @+cljd-tx-log+) i nil)]
                       (if (some? idx)
                         (let [wrote (write-snap! (tx-snapshot (take (inc idx) @+cljd-tx-log+)))]
                           (send! {:value (str "directed device to epoch " i " (" wrote " atoms)")
@@ -841,7 +849,6 @@
                               base (try (read-string (:value r0)) (catch Throwable _ {}))]
                           (reset! +cljd-tx-log+ [{:tx 0 :t (System/currentTimeMillis)
                                                   :delta base :cause :record/base}])
-                          (reset! +cljd-epochs+ [])   ; fresh timeline → old epoch markers are stale
                           (reset! +cljd-recording?+ true)
                           (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
                             {:ns-lib-uri "cljd/flutter.dart"})

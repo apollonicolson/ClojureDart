@@ -1285,7 +1285,7 @@
 ;; post-frame callback) always runs, so recording never depends on the render loop pumping a frame.
 ;; +cljd-replaying+ suppresses the echo when the HOST drives a write-state (its reset!s fire these
 ;; same watches; a restore must not re-record as fresh changes).
-(defonce ^:private +cljd-recording+ (atom false))
+(defonce ^:private +cljd-recording?+ (atom false))
 (defonce ^:private +cljd-tx-buffer+ (atom {}))            ; id → value, pending this turn
 (defonce ^:private +cljd-tx-flush-scheduled+ (atom false))
 (defonce ^:private +cljd-replaying+ (atom false))         ; true while a host write-state applies
@@ -1489,7 +1489,7 @@
           (dart:async/Timer (Duration .seconds 3) (fn [] (reset! +cljd-connected+ false) nil)))
         ;; while recording, re-arm on each heartbeat so atoms from newly-mounted repl-points get
         ;; watched (idempotent). Piggybacks the ~1s ping — no separate timer.
-        (when @+cljd-recording+ (arm-recording! true))
+        (when @+cljd-recording?+ (arm-recording! true))
         (dart:async/Future.value (dev/ServiceExtensionResponse.result "{\"ok\":true}"))))
     ;; own the error intake: chain onto Flutter's framework handler so EVERY framework error funnels
     ;; through report-error! → the one cljd.error stream. We still call the previous handler, so the
@@ -1652,7 +1652,7 @@
    post-frame callback) always runs, so recording doesn't depend on the render loop pumping a frame —
    the bug the post-frame version hit on an idle app. Skipped while replaying, or when recording off."
   [id new]
-  (when (and @+cljd-recording+ (not @+cljd-replaying+))
+  (when (and @+cljd-recording?+ (not @+cljd-replaying+))
     (swap! +cljd-tx-buffer+ assoc id new)
     (when (compare-and-set! +cljd-tx-flush-scheduled+ false true)
       (dart:async/scheduleMicrotask (fn [] (flush-tx!) nil)))))
@@ -1662,7 +1662,7 @@
    as cljd.tx). Idempotent (add-watch replaces per atom+key), so re-arming — e.g. on the heartbeat —
    picks up atoms from newly-mounted repl-points. OFF just flips the flag (watchers no-op via it)."
   [on?]
-  (reset! +cljd-recording+ (boolean on?))
+  (reset! +cljd-recording?+ (boolean on?))
   (when on?
     (doseq [e (live-state)]
       (let [id (key e)]
