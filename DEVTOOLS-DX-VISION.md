@@ -345,8 +345,15 @@ reactnative.dev/docs/react-native-devtools · radon.swmansion.com · developer.a
 - **ANSWERED (2026-07-03):** the `:managed` atom *identity* is stable across a reassemble (measured:
   same atom object 425123511 before/after), and `write-state` re-walks live-state each call so it
   targets whatever atom the live widget currently watches — identity stability isn't even required.
-- `toImageSync` per-frame cost for a frame ring-buffer on a real device — throttle/shrink region?
-  (still open — profiling research, only the perf front needs it.)
+- **MEASURED (2026-07-05, rank 1, Pixel 8 Pro @ dpr 2.25, 1008×2244):** `toImageSync` of the full
+  `::app-snap` boundary costs **~0.24–0.44 ms/capture** (noisy; sub-ms, ~2–3% of a 60 Hz frame — time is
+  NOT the blocker, the loupe already captures every frame). The binding constraint is **memory: 8.6 MB per
+  full-res frame** (W·H·4), so a scrub ring is memory-bound — 1 s @ 15 fps ≈ 129 MB, 2 s @ 30 fps ≈ 518 MB.
+  Surprising: **lowering `pixelRatio` does NOT cut capture time** (quarter-res measured 0.41–1.16 ms ≥
+  full) — a non-native ratio forces a re-raster that swamps the pixel savings; it only cuts *memory*
+  (quarter ≈ 0.54 MB/frame, so a 60-frame ring ≈ 32 MB) at a fidelity cost (252×561). **Verdict:** a frame
+  ring-buffer is time-feasible but memory-bound — viable only as a SHALLOW full-res ring (a handful of
+  frames) or a longer REDUCED-res ring (accepting fidelity loss). Not free continuous time-travel.
 - **RESOLVED (2026-07-04):** for anything you can *pick*, the source-map is invertible enough — the
   pick resolves widget → `.cljd file:line:col`, and `form-at` + the reader's position tracking locate
   the exact form and every child's span (literals included). So named-property edit-back is deterministic
