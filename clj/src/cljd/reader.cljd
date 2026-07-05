@@ -210,22 +210,28 @@
           ([^ReaderState {:flds [q stack] :as state} ^String s ^int from ^int to]
            (let [n-2 (- (.-length stack) 2)
                  ^List items (aget stack n-2)]
-             (loop [from (skip-space s from to)]
+             (loop [from from]
                (.addAll items q)
                (.clear q)
-               (cond
-                 (neg? from) from
-                 (< from to)
-                 (if (== closing-cu (.codeUnitAt s from))
-                   (do
-                     (.-length! stack n-2)
-                     (.add q (mk-coll items))
-                     (inc from))
-                   (let [from (read state s from to)]
-                     (if (neg? from)
-                       from
-                       (recur from))))
-                 :else -1)))))]
+               ;; Skip whitespace/commas before every closing-delimiter check, not
+               ;; just on entry. `read` leaves `from` immediately after an element
+               ;; (before any trailing space), so a collection whose closing delim
+               ;; sits after whitespace — e.g. `{:a 1\n}` — would otherwise dispatch
+               ;; on the delimiter as an unexpected token instead of closing here.
+               (let [from (skip-space s from to)]
+                 (cond
+                   (neg? from) from
+                   (< from to)
+                   (if (== closing-cu (.codeUnitAt s from))
+                     (do
+                       (.-length! stack n-2)
+                       (.add q (mk-coll items))
+                       (inc from))
+                     (let [from (read state s from to)]
+                       (if (neg? from)
+                         from
+                         (recur from))))
+                   :else -1))))))]
     (fn
       ([^ReaderState state] (throw (Exception "EOF encoutered, expecting closing delimiter.")))
       ([^ReaderState {:flds [q stack] :as state} ^String s ^int from ^int to]
