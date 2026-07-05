@@ -1436,11 +1436,21 @@
    (let [e {:phase (str phase) :message (str msg) :stack (str (or stack ""))}]
      ;; coalesce identical consecutive errors (same as the host store), so a reassemble burst
      ;; of one assertion becomes a single entry with a growing :count.
-     (swap! +cljd-errors-local+
-       (fn [es] (let [prev (peek es)]
-                  (if (and prev (= (:message prev) (:message e)))
-                    (conj (pop es) (update prev :count inc))
-                    (vec (take-last 25 (conj es (assoc e :count 1))))))))
+     ;;
+     ;; Defer the store update off the current frame. This handler runs from
+     ;; FlutterError.onError, which fires *during* build/layout for widget
+     ;; errors; +cljd-errors-local+ is watched by the on-device error panel, so
+     ;; a synchronous swap! would call setState mid-build (assertion) and turn a
+     ;; single error into a self-amplifying cascade. A microtask runs after the
+     ;; frame's synchronous work, so setState just schedules the next frame.
+     (dart:async/scheduleMicrotask
+       (fn []
+         (swap! +cljd-errors-local+
+           (fn [es] (let [prev (peek es)]
+                      (if (and prev (= (:message prev) (:message e)))
+                        (conj (pop es) (update prev :count inc))
+                        (vec (take-last 25 (conj es (assoc e :count 1))))))))
+         nil))
      (post-event! "cljd.error"
        {"phase" (convert/jsonEncode (:phase e))
         "message" (convert/jsonEncode (:message e))
