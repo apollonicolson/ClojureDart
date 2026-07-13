@@ -10,7 +10,8 @@
             [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vm]
             [cljd.repl.eval :as repl-eval]
-            [cljd.repl.errors :as errors])
+            [cljd.repl.errors :as errors]
+            [cljd.repl.dartlsp :as dartlsp])
   (:import [java.io PushbackReader StringReader]
            [java.util UUID]))
 
@@ -345,6 +346,17 @@
                            (line-column->offset text (:end-line m) (:end-column m))))))
       (read-source-forms file))))
 
+(defn- def-line
+  "1-based line of the top-level (def/defn/… NAME …) form in FILE, or nil — for go-to-def.
+   nses doesn't persist source location (compiler/do-def drops it), so the reader's form
+   metadata off the file is the source of truth. Same finder as def-source."
+  [file name-sym]
+  (some (fn [f]
+          (when (and (seq? f) (>= (count f) 2) (contains? def-heads (first f)) (= (second f) name-sym))
+            (:line (meta f))))
+        (read-source-forms file)))
+
+
 ;; ── Durable introspection state + the live connection cell ────────────────────
 ;; These are top-level `defonce` so `(require 'cljd.repl.nrepl :reload)` swaps the CODE below
 ;; (helpers, sinks, request dispatch — all reached through #'vars) while PRESERVING this state and
@@ -520,15 +532,31 @@
           (send! {:completions cands :status ["done"]}))
         ;; symbol info / doc — arglists + docstring from the def's stored :meta.
         ("info" "lookup")
-        (let [i (sym-info @compiler/nses @*current-ns (symbol (or (:symbol msg) (:sym msg) "")))]
+        (let [i    (sym-info @compiler/nses (or (some-> (:ns msg) symbol) @*current-ns) (symbol (or (:symbol msg) (:sym msg) "")))
+              ;; go-to-def: nses has no source loc, so resolve ns → file (source-dirs) → the
+              ;; def's line off the file (same path the `source` op uses). App/kora syms
+              ;; resolve; cljd.core syms live in the fork's src (outside source-dirs) → no jump.
+              path (some-> (:ns i) (str/replace "." "/") (str ".cljd"))
+              file (when path (resolve-source-file source-dirs path))
+              line (when (and file (:name i))
+                     (try (def-line file (symbol (:name i))) (catch Throwable _ nil)))]
           (if i
-            (send! {:name (:name i) :ns (:ns i)
-                    :arglists-str (if (:arglists i) (pr-str (:arglists i)) "")
-                    :doc (or (:doc i) "")
-                    :status ["done"]})
-            (send! {:status ["done" "no-info"]})))
+            (send! (cond-> {:name (:name i) :ns (:ns i)
+                            :arglists-str (if (:arglists i) (pr-str (:arglists i)) "")
+                            :doc (or (:doc i) "")
+                            :status ["done"]}
+                     file (assoc :file (.getCanonicalPath (java.io.File. ^String file)))
+                     line (assoc :line line)))
+            ;; not a cljd def → maybe a Dart INTEROP element: ask the analysis server
+            ;; (dart language-server) by name → its declaration in the Dart/Flutter source.
+            (if-let [d (dartlsp/find-element (System/getProperty "user.dir")
+                         (name (symbol (or (:symbol msg) (:sym msg) ""))))]
+              (send! {:name (:name d) :ns "dart" :file (:file d) :line (:line d)
+                      :arglists-str "" :doc (str "Dart element (kind " (:kind d) ")")
+                      :status ["done"]})
+              (send! {:status ["done" "no-info"]}))))
         "eldoc"
-        (let [i (sym-info @compiler/nses @*current-ns (symbol (or (:symbol msg) (:sym msg) "")))]
+        (let [i (sym-info @compiler/nses (or (some-> (:ns msg) symbol) @*current-ns) (symbol (or (:symbol msg) (:sym msg) "")))]
           (if (and i (:arglists i))
             (send! {:name (:name i) :ns (:ns i) :type "function"
                     :eldoc (mapv (fn [al] (mapv str al)) (:arglists i))
