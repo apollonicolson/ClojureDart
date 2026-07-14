@@ -32,6 +32,16 @@
 (defn- unwrap-quote [x]
   (if (and (seq? x) (= 'quote (first x))) (second x) x))
 
+(defn- msg-sym
+  "The target symbol string carried by an nREPL info/eldoc/complete message
+   (CIDER sends :symbol, some clients :sym); \"\" when absent."
+  [msg] (or (:symbol msg) (:sym msg) ""))
+
+(defn- msg-ns
+  "The message's namespace as a symbol (:ns from the client's buffer), else the
+   current-ns atom's value. CUR-NS is the atom, not its deref."
+  [msg cur-ns] (or (some-> (:ns msg) symbol) @cur-ns))
+
 (defn- ns-exists? [ns-sym]
   (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
 
@@ -45,7 +55,7 @@
         info (or (get-in nses [ns' nm]) (get-in nses ['cljd.core nm]))
         m    (:meta info)
         ;; :arglists is stored as the quoted form '(...); unwrap to the raw list of vectors.
-        al   (let [a (:arglists m)] (if (and (seq? a) (= 'quote (first a))) (second a) a))]
+        al   (unwrap-quote (:arglists m))]
     (when info
       {:ns (name (:ns info)) :name (name (:name info))
        :arglists al :doc (:doc m) :macro? (boolean (:macro m))})))
@@ -517,7 +527,7 @@
         ;; editor completion — answered host-side from @nses (current ns + cljd.core).
         "complete"
         (let [prefix (or (:prefix msg) (:symbol msg) "")
-              ns-sym (or (some-> (:ns msg) symbol) @*current-ns)
+              ns-sym (msg-ns msg *current-ns)
               nses   @compiler/nses
               ;; defs live as direct symbol keys of the ns map (see resolve-non-local-symbol);
               ;; :mappings holds referred/aliased names. Gather both, for the ns + cljd.core.
@@ -532,7 +542,8 @@
           (send! {:completions cands :status ["done"]}))
         ;; symbol info / doc — arglists + docstring from the def's stored :meta.
         ("info" "lookup")
-        (let [i    (sym-info @compiler/nses (or (some-> (:ns msg) symbol) @*current-ns) (symbol (or (:symbol msg) (:sym msg) "")))
+        (let [sym  (msg-sym msg)
+              i    (sym-info @compiler/nses (msg-ns msg *current-ns) (symbol sym))
               ;; go-to-def: nses has no source loc, so resolve ns → file (source-dirs) → the
               ;; def's line off the file (same path the `source` op uses). App/kora syms
               ;; resolve; cljd.core syms live in the fork's src (outside source-dirs) → no jump.
@@ -549,15 +560,14 @@
                      line (assoc :line line)))
             ;; not a cljd def → maybe a Dart INTEROP element: ask the analysis server
             ;; (dart language-server) by name → its declaration in the Dart/Flutter source.
-            (if-let [d (dartlsp/find-element (System/getProperty "user.dir")
-                         (name (symbol (or (:symbol msg) (:sym msg) ""))))]
+            (if-let [d (dartlsp/find-element (System/getProperty "user.dir") sym)]
               (send! {:name (:name d) :ns "dart" :file (:file d) :line (:line d)
                       :arglists-str ""
                       :doc (or (:doc d) (str "Dart element (kind " (:kind d) ")"))
                       :status ["done"]})
               (send! {:status ["done" "no-info"]}))))
         "eldoc"
-        (let [i (sym-info @compiler/nses (or (some-> (:ns msg) symbol) @*current-ns) (symbol (or (:symbol msg) (:sym msg) "")))]
+        (let [i (sym-info @compiler/nses (msg-ns msg *current-ns) (symbol (msg-sym msg)))]
           (if (and i (:arglists i))
             (send! {:name (:name i) :ns (:ns i) :type "function"
                     :eldoc (mapv (fn [al] (mapv str al)) (:arglists i))
