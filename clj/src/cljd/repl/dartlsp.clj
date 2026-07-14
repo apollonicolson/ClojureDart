@@ -7,7 +7,8 @@
    reused. One query at a time (the repl's info op is serial); a synchronous read skips
    interleaved notifications until the matching response id. Structured — no string-matching."
   (:require [clojure.data.json :as json]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.string :as str])
   (:import [java.lang ProcessBuilder]))
 
 (defonce ^:private state (atom nil))   ; {:proc :out :in :id (atom)} or nil
@@ -63,10 +64,27 @@
 
 (defn- uri->file [^String uri] (if (.startsWith uri "file://") (subs uri 7) uri))
 
+(defn- doc-comment
+  "A Dart element's analyzer code-range starts at its doc comment when one is present
+   (verified: workspace/symbol's range.start for a documented class points at the first
+   `///` line). Read the contiguous `///` block at FILE line LINE0 (0-based) → the doc
+   text with markers stripped, or nil. Deterministic; no second LSP round-trip."
+  [file line0]
+  (try
+    (with-open [r (io/reader file)]
+      (let [lines (vec (line-seq r))
+            block (when (< line0 (count lines))
+                    (->> (subvec lines line0)
+                         (take-while #(str/starts-with? (str/triml %) "///"))
+                         (map #(-> ^String % str/triml (subs 3) str/triml))))]
+        (when (seq block) (str/join "\n" block))))
+    (catch Throwable _ nil)))
+
 (defn find-element
   "Look up a Dart element by NAME in the analysis server; return the best-matching
-   declaration {:name :file :line :kind} (0-based LSP line +1), or nil. PROJECT-ROOT is the
-   dir the server indexes (has the Flutter/dart deps)."
+   declaration {:name :file :line :kind :doc} (0-based LSP line +1; :doc = the element's
+   Dart/Flutter doc-comment read from source at the declaration, or nil), or nil.
+   PROJECT-ROOT is the dir the server indexes (has the Flutter/dart deps)."
   [project-root name]
   (try
     (let [{:keys [out in id]} (ensure! project-root)]
@@ -77,10 +95,13 @@
         (let [exact (filter #(= (:name %) name) syms)
               best  (first (concat exact syms))]
           (when best
-            {:name (:name best)
-             :file (uri->file (get-in best [:location :uri]))
-             :line (inc (get-in best [:location :range :start :line] 0))
-             :kind (:kind best)}))))
+            (let [file (uri->file (get-in best [:location :uri]))
+                  line (get-in best [:location :range :start :line] 0)]
+              {:name (:name best)
+               :file file
+               :line (inc line)
+               :kind (:kind best)
+               :doc  (doc-comment file line)})))))
     (catch Throwable _ nil)))
 
 (defn stop! []

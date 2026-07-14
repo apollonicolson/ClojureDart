@@ -552,7 +552,8 @@
             (if-let [d (dartlsp/find-element (System/getProperty "user.dir")
                          (name (symbol (or (:symbol msg) (:sym msg) ""))))]
               (send! {:name (:name d) :ns "dart" :file (:file d) :line (:line d)
-                      :arglists-str "" :doc (str "Dart element (kind " (:kind d) ")")
+                      :arglists-str ""
+                      :doc (or (:doc d) (str "Dart element (kind " (:kind d) ")"))
                       :status ["done"]})
               (send! {:status ["done" "no-info"]}))))
         "eldoc"
