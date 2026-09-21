@@ -748,14 +748,21 @@
                     :status ["done"]})
             (send! {:status ["done" "no-eldoc"]})))
         "eval"
+        ;; nREPL semantics: a message :ns scopes this batch only; without it, in-ns persists in the session
+        (let [msg-ns (let [n (some-> (:ns msg) symbol)]
+                       ;; clients default to user (JVM's initial ns); cljd has none, so it means the session ns
+                       (when-not (and (= 'user n) (not (ns-exists? 'user))) n))
+              *batch-ns (atom (or msg-ns @*current-ns))]
+         (if (and msg-ns (not (ns-exists? msg-ns)))
+          (send! {:ns (name msg-ns) :status ["done" "error" "namespace-not-found"]})
         ;; one binding frame for the whole batch (in-ns set!s in it); use eval-form inside, not eval!
-        (repl-eval/with-compiler-context ctx @*current-ns
+        (repl-eval/with-compiler-context ctx @*batch-ns
           (reset! *eval-sink (fn [stream text]
                                (send! {(if (= stream "Stderr") :err :out)
                                        (.replaceAll text "(?m)^flutter: " "")})))
           (let [errored (volatile! false)
                 switch-ns! (fn [ns-sym]            ; keep atom + per-batch dynamic binding in sync
-                             (reset! *current-ns ns-sym)
+                             (reset! *batch-ns ns-sym)
                              (set! compiler/*current-ns* ns-sym))]
             (try
               (doseq [form (read-forms code)]
@@ -763,18 +770,18 @@
                       ;; deref per form: the isolate changes on hot restart
                       iso-id @*iso]
                   (if-some [cmd (when-some [cmd (get repl-commands head)] (when-not (user-def? head) cmd))]
-                    (let [r (cmd (assoc state :iso-id iso-id :switch-ns! switch-ns!) form)]
+                    (let [r (cmd (assoc state :iso-id iso-id :switch-ns! switch-ns! :*current-ns *batch-ns) form)]
                       (if (:err r)
                         (do (vreset! errored true) (send! r))
-                        (send! {:value (:value r) :ns (name @*current-ns)})))
+                        (send! {:value (:value r) :ns (name @*batch-ns)})))
                     (let [r (repl-eval/eval-form client iso-id form
-                                                 {:ns-lib-uri (ns->lib-uri @*current-ns)
+                                                 {:ns-lib-uri (ns->lib-uri @*batch-ns)
                                                   :trigger-reload trigger-reload
                                                   :await? await?
                                                   :remember? remember?})]
                       (case (:kind r)
                         :reload (do (when (= 'ns head) (switch-ns! (second form)))
-                                    (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*current-ns)}))
+                                    (send! {:value (str "#reloaded " (pr-str (:report r))) :ns (name @*batch-ns)}))
                         :eval   (if (:error r)
                                   (do (vreset! errored true)
                                       (let [msg (errors/format-runtime (:message r)
@@ -782,13 +789,15 @@
                                             phase (if (= "LanguageError" (:dart-kind r)) "compile" "runtime")]
                                         (remember-error! {:phase phase :message msg :stack nil})
                                         (send! {:err msg :ex "dart.runtime-exception"})))
-                                  (send! {:value (:value r) :ns (name @*current-ns)})))))))
+                                  (send! {:value (:value r) :ns (name @*batch-ns)})))))))
               (send! {:status (if @errored ["done" "error"] ["done"])})
               (catch Throwable e
                 (let [msg (errors/format-compile e)]
                   (remember-error! {:phase "compile" :message msg :stack nil})
                   (send! {:err msg :ex (str (class e)) :status ["done" "error"]})))
-              (finally (reset! *eval-sink nil)))))
+              (finally
+                (reset! *eval-sink nil)
+                (when-not msg-ns (reset! *current-ns @*batch-ns))))))))
         (send! {:status ["done" "error" "unknown-op"]}))))
 
 (defn make-handler
