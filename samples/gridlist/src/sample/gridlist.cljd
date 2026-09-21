@@ -12,8 +12,8 @@
       .home
       (m/Scaffold .appBar (m/AppBar .title (m/Text title)))
       .body
-      :get {{{:flds [headline3]} .-textTheme} m/Theme}
+      :get {{{:flds [displaySmall]} .-textTheme} m/Theme}
       (m/GridView.count .crossAxisCount 2)
       .children
       (for [i (range 100)]
-        (m/Center .child (m/Text (str "Item " i) .style headline3)))))))
+        (m/Center .child (m/Text (str "Item " i) .style displaySmall)))))))

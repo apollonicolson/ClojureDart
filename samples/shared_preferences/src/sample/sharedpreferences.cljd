@@ -1,0 +1,36 @@
+(ns sample.sharedpreferences
+  (:require
+   ["package:shared_preferences/shared_preferences.dart" :as sp]
+   ["package:flutter/material.dart" :as m]
+   [cljd.flutter :as f]))
+
+(def person (atom ""))
+
+(defn load-data-from-storage []
+  (let [prefs (await (sp/SharedPreferences.getInstance))
+        load (.getString prefs "MyKey")]
+    ; here needs to be check for nil
+    (when (not= load nil)                             ;
+      (reset! person (.getString prefs "MyKey")))))
+
+(defn save-data-to-storage []
+  (let [prefs (await (sp/SharedPreferences.getInstance))]
+    (await (.setString prefs "MyKey" "Loaded from Storage"))))
+
+(defn main []
+  (m/WidgetsFlutterBinding.ensureInitialized)
+  (load-data-from-storage)
+  (f/run
+   m/MaterialApp
+   .home
+   m/Scaffold
+   .body
+   m/Center
+   .child
+   :watch [current person]
+   m/Column
+   .children
+   [(m/ElevatedButton
+     :onPressed save-data-to-storage
+     :child (m/Text "Save to Storage"))
+    (m/Text current)]))

@@ -91,33 +91,77 @@
     s))
 
 (defn success []
-  (rand-nth
-    [(str (green "  All clear! ") "👌")
-     (str (green "  You rock! ") "🤘")
-     (str (green "  Bravissimo! ") "👏")
-     (str (green "  Easy peasy! ") "😎")
-     (str (green "  I like when a plan comes together! ") "👨‍🦳")]))
+  (str (green "Compilation succeeded") " - "
+    (rand-nth
+      ["All clear! 👌"
+       "You rock! 🤘"
+       "Bravissimo! 👏"
+       "Easy peasy! 😎"
+       "I like when a plan comes together! 👨‍🦳"])))
+
+(defn compilation-error-heading []
+  (str (red "Compilation error") " - "
+    (rand-nth
+      ["Oh noes! 😵"
+       "Something horrible happened! 😱"
+       "$expletives 💩"
+       "Keep calm and fix bugs! 👑"
+       "What doesn’t kill you, makes you stronger. 🤔"
+       "You’re gonna need a bigger boat! 🦈"])))
+
+(defn- exception-chain [e]
+  (take-while some? (iterate ex-cause e)))
+
+(defn- bounded-str [s]
+  (let [max-chars 2000]
+    (if (<= (count s) max-chars)
+      s
+      (str (subs s 0 (- max-chars 3)) "..."))))
+
+(defn- bounded-pr-str [form]
+  (bounded-str
+    (binding [*print-length* 20
+              *print-level* 6]
+      (pr-str form))))
+
+(defn- emit-exception [chain]
+  (some #(when (contains? (ex-data %) ::compiler/emit-stack) %) chain))
 
 (defn print-exception [e]
-  (println (rand-nth
-            [(str (red "Oh noes! ") "😵")
-             (str (red "Something horrible happened! ") "😱")
-             (str (red "$expletives ") "💩")
-             (str (red "Keep calm and fix bugs! ") "👑")
-             (str (red "What doesn’t kill you, makes you stronger. ") "🤔")
-             (str (red "You’re gonna need a bigger boat! ") "🦈")]))
-  (if-some [[form & parents] (seq (::compiler/emit-stack (ex-data e)))]
-    (let [toplevel (last (take-while #(not (and (seq? %) (= 'ns (first %)))) parents))]
-      (println (ex-message e))
-      (println "⛔️" (title (ex-message (ex-cause e))))
-      (if toplevel
-        (do
-          (println (title "Faulty subform and/or expansion") (pr-str form))
-          (println (title "While compiling") (pr-str toplevel)))
-        (println (title "Faulty form") (pr-str form))))
-    (do
-      (println "⛔️" (title (ex-message e)))
-      (st/print-stack-trace e))))
+  (let [chain (vec (exception-chain e))
+        emit-error (emit-exception chain)
+        root-error (peek chain)
+        context (when-not (identical? e emit-error) (ex-message e))]
+    (println (compilation-error-heading))
+    (when context
+      (println (bounded-str context)))
+    (if emit-error
+      (let [[form & parents] (::compiler/emit-stack (ex-data emit-error))
+            cause-message (or (some-> emit-error ex-cause ex-message)
+                            (ex-message emit-error))
+            toplevel (last (take-while #(not (and (seq? %) (= 'ns (first %)))) parents))]
+        (when cause-message
+          (println (title (bounded-str cause-message))))
+        (when form
+          (if toplevel
+            (do
+              (println (title "Faulty subform and/or expansion"))
+              (println " " (bounded-pr-str form))
+              (println (title "While compiling"))
+              (println " " (bounded-pr-str toplevel)))
+            (do
+              (println (title "Faulty form"))
+              (println " " (bounded-pr-str form))))))
+      (let [root-message (some-> root-error ex-message)
+            {:clojure.error/keys [line column]}
+            (some #(when (or (:clojure.error/line (ex-data %))
+                           (:clojure.error/column (ex-data %)))
+                     (ex-data %))
+              chain)]
+        (when (and root-message (not= root-message context))
+          (println (title (bounded-str root-message))))
+        (when line
+          (println (str "at line " line (when column (str ", column " column)))))))))
 
 (defn timestamp []
   (.format (java.text.SimpleDateFormat. "@HH:mm:ss" (java.util.Locale/getDefault)) (java.util.Date.)))
@@ -392,7 +436,7 @@
           (System/exit 1))))))
 
 (defn compile-cli
-  [& {:keys [watch namespaces flutter] :or {watch false}}]
+  [& {:keys [watch namespaces flutter offline] :or {watch false}}]
   (let [user-dir (System/getProperty "user.dir")
         analyzer-dir (ensure-cljd-analyzer!)]
     ;; JVM nREPL on the build process itself, so a Clojure REPL (e.g. clojure-mcp)
@@ -409,7 +453,9 @@
             "— (require 'cljd.compiler :reload) to hot-reload the compiler"))
         (catch Throwable e
           (println "[build-nrepl] failed to start:" (.getMessage e)))))
-    (exec {:in nil :out nil} (some-> *deps* :cljd/opts :kind name) "pub" "get")
+    (if offline
+      (println "Offline mode: No pub dependencies will be updated")
+      (exec {:in nil :out nil} (some-> *deps* :cljd/opts :kind name) "pub" "get"))
     (with-taps
       [(fn [x]
          (case (::compiler/msg-kind x)
@@ -458,8 +504,7 @@
                       true
                       (catch Exception e
                         (vreset! dirty-nses nses)
-                        (println e)
-                        #_(print-exception e)
+                        (print-exception e)
                         ;; surface the failure on the device too (if the REPL is connected)
                         (when-some [sink @*reload-error-sink]
                           (try (sink (errors/format-compile e)) (catch Throwable _ nil)))
@@ -918,35 +963,310 @@
         (println " " (bright cmd))
         (some->> doc (println "   "))))))
 
-(defn upgrade-cljd []
-  (let [hashes (with-open [rdr (-> "https://raw.githubusercontent.com/Tensegritics/ClojureDart/main/.hashes" java.net.URL. io/reader)]
-                 (into [] (comp (remove str/blank?) (map #(str \" % \"))) (line-seq rdr)))
-        latest (peek hashes)
-        pattern (re-pattern (str "(?<!#_)(?:" (str/join "|" hashes ) ")"))
-        versions-found (atom 0)
-        versions-replaced (atom 0)]
-    (when-not (seq hashes)
-      (throw (RuntimeException. "No past versions retrieved, can't update!")))
-    (-> "deps.edn"
-      slurp
-      (str/replace pattern (fn [v]
-                             (swap! versions-found inc)
-                             (str latest
-                               (when-not (= v latest)
-                                 (swap! versions-replaced inc)
-                                 (str " #_" v)))))
-      (->> (spit "deps.edn")))
-    (case @versions-replaced
-      0 (if (= @versions-found @versions-replaced)
-          (do
-            (println "No known recommended versions found in deps.edn, please update manually to the latest recommended (next time it will work!):")
-            (binding [*print-namespace-maps* false]
-              (prn {'tensegritics/clojuredart
-                    {:git/url "https://github.com/tensegritics/ClojureDart.git"
-                     :sha (re-find #"[^\"]+" latest)}})))
-          (println "Already up-to-date!"))
-      1 (println  "1 version upgraded to" latest)
-      (println  @versions-replaced "versions upgraded to" latest))))
+(def latest-deps-url
+  "https://github.com/Tensegritics/ClojureDart/releases/latest/download/deps.latest.edn")
+
+(def ^:private latest-deps-asset-name "deps.latest.edn")
+(def ^:private clojuredart-git-url
+  "https://github.com/tensegritics/ClojureDart.git")
+
+(defn- upgrade-failure [message & instructions]
+  (ex-info
+    (str message
+      (when (seq instructions)
+        (str "\n\n" (str/join "\n\n" instructions))))
+    {:cljd/upgrade-error true}))
+
+(defn- slurp-http [url]
+  (let [connection ^java.net.HttpURLConnection (.openConnection (java.net.URL. url))]
+    (try
+      (.setConnectTimeout connection 10000)
+      (.setReadTimeout connection 15000)
+      (.setInstanceFollowRedirects connection true)
+      (.setRequestProperty connection "Accept" "application/octet-stream")
+      (.setRequestProperty connection "User-Agent" "ClojureDart-upgrader")
+      (let [status (.getResponseCode connection)]
+        (if (<= 200 status 299)
+          (with-open [reader (io/reader (.getInputStream connection))]
+            (slurp reader))
+          (throw
+            (upgrade-failure
+              (if (= 404 status)
+                "No published ClojureDart release was found."
+                (str "GitHub returned HTTP " status " while downloading the latest ClojureDart release."))
+              "Check the published releases at:\n  https://github.com/Tensegritics/ClojureDart/releases"
+              "Retry when the release is available with:\n  clj -M:cljd upgrade"))))
+      (catch clojure.lang.ExceptionInfo e
+        (throw e))
+      (catch Exception e
+        (throw
+          (upgrade-failure
+            (str "Unable to download the latest ClojureDart release: " (ex-message e))
+            "Check your network connection and retry with:\n  clj -M:cljd upgrade"
+            (str "Release asset URL:\n  " url))))
+      (finally
+        (.disconnect connection)))))
+
+(def ^:dynamic *latest-deps-reader* #(slurp-http latest-deps-url))
+
+(defn- parse-release-version [tag]
+  (when (string? tag)
+    (when-some [[_ date suffix] (re-matches #"0\.9\.([0-9]{8})([a-z]?)" tag)]
+      (try
+        (let [day (java.time.LocalDate/parse date java.time.format.DateTimeFormatter/BASIC_ISO_DATE)
+              suffix-index (if (str/blank? suffix)
+                             0
+                             (inc (- (int (first suffix)) (int \a))))]
+          {:day day
+           :suffix-index suffix-index
+           :sort-key [(.toEpochDay day) suffix-index]})
+        (catch java.time.format.DateTimeParseException _ nil)))))
+
+(defn parse-latest-deps [text]
+  (let [eof (Object.)
+        data
+        (try
+          (with-open [reader (java.io.PushbackReader. (java.io.StringReader. text))]
+            (let [data (edn/read {:eof eof} reader)
+                  trailing (edn/read {:eof eof} reader)]
+              (when (or (identical? eof data) (not (identical? eof trailing)))
+                (throw (Exception. "Expected exactly one EDN form.")))
+              data))
+          (catch Exception e
+            (throw
+              (upgrade-failure
+                (str "The latest ClojureDart release contains an invalid " latest-deps-asset-name ": "
+                  (ex-message e))
+                "The local deps.edn was not modified."
+                "Please report the malformed release asset to the ClojureDart maintainers."))))
+        {:keys [git/url tag sha] :as coordinate}
+        (get-in data [:deps 'tensegritics/clojuredart])]
+    (when-not (and (= clojuredart-git-url url)
+                (parse-release-version tag)
+                (string? sha)
+                (re-matches #"[0-9a-f]{40}" sha))
+      (throw
+        (upgrade-failure
+          (str "The latest ClojureDart release has an invalid dependency coordinate: "
+            (pr-str coordinate))
+          "Expected a UTC-dated tag such as 0.9.20260822 or 0.9.20260822a and a full 40-character Git SHA."
+          "The local deps.edn was not modified.")))
+    {:tag tag :sha sha}))
+
+(defn- active-value-pattern [value]
+  (re-pattern
+    (str "(?<!#_)\"" (java.util.regex.Pattern/quote value) "\"")))
+
+(defn- replace-active-value-with [text old-value replacement label]
+  (let [pattern (active-value-pattern old-value)
+        matches (count (re-seq pattern text))]
+    (case matches
+      0 (throw
+          (upgrade-failure
+            (str "The active ClojureDart " label " was not found in deps.edn: " old-value)
+            "The dependency may be defined in another deps.edn file, alias, or command-line override."
+            "The local deps.edn was not modified; update the coordinate manually."))
+      1 (str/replace text pattern replacement)
+      (throw
+        (upgrade-failure
+          (str "The active ClojureDart " label " occurs " matches " times in deps.edn.")
+          "Automatic replacement would be ambiguous, so the local deps.edn was not modified."
+          "Keep one active ClojureDart coordinate or update the occurrences manually.")))))
+
+(defn- replace-active-value [text old-value new-value label]
+  (replace-active-value-with text old-value
+    (str \" new-value \" " #_" \" old-value \") label))
+
+(defn- project-cljd-coordinate [text]
+  (try
+    (get-in (edn/read-string text) [:deps 'tensegritics/clojuredart])
+    (catch Exception e
+      (throw
+        (upgrade-failure
+          (str "The current deps.edn is not valid EDN: " (ex-message e))
+          "The local deps.edn was not modified.")))))
+
+(defn upgrade-deps-text [text current-coordinate latest-coordinate]
+  (let [current-sha (or (:git/sha current-coordinate) (:sha current-coordinate))
+        current-tag (or (:git/tag current-coordinate) (:tag current-coordinate))
+        {:keys [tag sha]} latest-coordinate
+        project-coordinate (project-cljd-coordinate text)
+        project-url (:git/url project-coordinate)
+        project-sha (or (:git/sha project-coordinate) (:sha project-coordinate))
+        project-tag (or (:git/tag project-coordinate) (:tag project-coordinate))]
+    (when-not (and (string? current-sha) (re-matches #"[0-9a-f]{40}" current-sha))
+      (throw
+        (upgrade-failure
+          "The running ClojureDart dependency is not pinned to a full Git SHA."
+          (str "Resolved coordinate: " (pr-str current-coordinate))
+           "Projects using :local/root or custom Git coordinates must be updated manually.")))
+    (when (and project-url (not= clojuredart-git-url project-url))
+      (throw
+        (upgrade-failure
+          "The top-level ClojureDart dependency uses a custom Git URL."
+          (str "Project Git URL: " project-url)
+          "Automatic upgrading would retain that URL with an upstream commit that it may not contain."
+          "The local deps.edn was not modified; update the custom coordinate manually.")))
+    (when-not (= current-sha project-sha)
+      (throw
+        (upgrade-failure
+          "The top-level ClojureDart coordinate in deps.edn does not match the running dependency."
+          (str "Running SHA: " current-sha)
+          (str "Project coordinate: " (pr-str project-coordinate))
+          "The dependency may be supplied by an alias, override, or another configuration file."
+          "The local deps.edn was not modified; update the intended coordinate manually.")))
+    (when (and (parse-release-version current-tag)
+            (pos? (compare (:sort-key (parse-release-version current-tag))
+                    (:sort-key (parse-release-version tag)))))
+      (throw
+        (upgrade-failure
+          (str "Refusing to downgrade ClojureDart from " current-tag " to " tag ".")
+          "Check which GitHub Release is marked latest before changing deps.edn."
+          "The local deps.edn was not modified.")))
+    (let [sha-changed? (not= current-sha sha)
+          tag-changed? (not= project-tag tag)
+          text (if sha-changed?
+                 (replace-active-value text current-sha sha "SHA")
+                 text)
+          text (cond
+                 project-tag
+                 (if tag-changed?
+                   (replace-active-value text project-tag tag "tag")
+                   text)
+
+                 :else
+                 (let [tag-key (if (contains? project-coordinate :git/sha)
+                                 ":git/tag"
+                                 ":tag")]
+                   (replace-active-value-with text sha
+                     (str \" sha \" " " tag-key " " \" tag \") "SHA")))]
+      (if-not (or sha-changed? tag-changed?)
+        {:text text :changed? false :tag tag :sha sha}
+        (let [updated-coordinate (project-cljd-coordinate text)
+              updated-sha (or (:git/sha updated-coordinate) (:sha updated-coordinate))
+              updated-tag (or (:git/tag updated-coordinate) (:tag updated-coordinate))]
+          (when-not (and (= sha updated-sha) (= tag updated-tag))
+            (throw
+              (upgrade-failure
+                "The edited deps.edn did not update the top-level ClojureDart coordinate as expected."
+                (str "Resulting coordinate: " (pr-str updated-coordinate))
+                "The local deps.edn was not modified.")))
+          {:text text :changed? true :tag tag :sha sha})))))
+
+(defn- preserve-file-security-attributes! [source target]
+  (let [options (make-array java.nio.file.LinkOption 0)
+        source-posix (java.nio.file.Files/getFileAttributeView source
+                       java.nio.file.attribute.PosixFileAttributeView options)
+        target-posix (java.nio.file.Files/getFileAttributeView target
+                       java.nio.file.attribute.PosixFileAttributeView options)
+        source-acl (java.nio.file.Files/getFileAttributeView source
+                     java.nio.file.attribute.AclFileAttributeView options)
+        target-acl (java.nio.file.Files/getFileAttributeView target
+                     java.nio.file.attribute.AclFileAttributeView options)
+        source-dos (java.nio.file.Files/getFileAttributeView source
+                     java.nio.file.attribute.DosFileAttributeView options)
+        target-dos (java.nio.file.Files/getFileAttributeView target
+                     java.nio.file.attribute.DosFileAttributeView options)]
+    (if (and source-posix target-posix)
+      (let [attrs (.readAttributes ^java.nio.file.attribute.PosixFileAttributeView source-posix)]
+        (.setPermissions ^java.nio.file.attribute.PosixFileAttributeView target-posix (.permissions attrs))
+        (.setGroup ^java.nio.file.attribute.PosixFileAttributeView target-posix (.group attrs))
+        (.setOwner ^java.nio.file.attribute.PosixFileAttributeView target-posix (.owner attrs)))
+      (let [source-owner (java.nio.file.Files/getFileAttributeView source
+                           java.nio.file.attribute.FileOwnerAttributeView options)
+            target-owner (java.nio.file.Files/getFileAttributeView target
+                           java.nio.file.attribute.FileOwnerAttributeView options)]
+        (when (and source-owner target-owner)
+          (.setOwner ^java.nio.file.attribute.FileOwnerAttributeView target-owner
+            (.getOwner ^java.nio.file.attribute.FileOwnerAttributeView source-owner)))))
+    (when (and source-acl target-acl)
+      (.setAcl ^java.nio.file.attribute.AclFileAttributeView target-acl
+        (.getAcl ^java.nio.file.attribute.AclFileAttributeView source-acl)))
+    (when (and source-dos target-dos)
+      (let [attrs (.readAttributes ^java.nio.file.attribute.DosFileAttributeView source-dos)]
+        (.setArchive ^java.nio.file.attribute.DosFileAttributeView target-dos (.isArchive attrs))
+        (.setHidden ^java.nio.file.attribute.DosFileAttributeView target-dos (.isHidden attrs))
+        (.setReadOnly ^java.nio.file.attribute.DosFileAttributeView target-dos (.isReadOnly attrs))
+        (.setSystem ^java.nio.file.attribute.DosFileAttributeView target-dos (.isSystem attrs))))))
+
+(defn- atomic-spit [file expected-text text]
+  (let [file (.getCanonicalFile (io/file file))
+        source (.toPath file)
+        parent (.toPath (.getParentFile file))
+        temp (java.nio.file.Files/createTempFile parent ".deps.edn-" ".tmp"
+               (make-array java.nio.file.attribute.FileAttribute 0))]
+    (try
+      (java.nio.file.Files/write temp (.getBytes ^String text java.nio.charset.StandardCharsets/UTF_8)
+        (into-array java.nio.file.OpenOption
+          [java.nio.file.StandardOpenOption/WRITE
+           java.nio.file.StandardOpenOption/TRUNCATE_EXISTING]))
+      (preserve-file-security-attributes! source temp)
+      (when-not (= expected-text (slurp (.toFile source)))
+        (throw
+          (upgrade-failure
+            "deps.edn changed while the upgrade was being prepared."
+            "The concurrent edit was not overwritten. Review the file and run the upgrade again.")))
+      (java.nio.file.Files/move temp source
+        (into-array java.nio.file.CopyOption
+          [java.nio.file.StandardCopyOption/ATOMIC_MOVE
+           java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+      (finally
+        (java.nio.file.Files/deleteIfExists temp)))))
+
+(defn upgrade-cljd
+  ([] (upgrade-cljd (io/file "deps.edn")))
+  ([file]
+   (let [current-coordinate (get-in *deps* [:libs 'tensegritics/clojuredart])]
+     (when-not current-coordinate
+       (throw
+         (upgrade-failure
+           "The running basis does not contain the tensegritics/clojuredart dependency."
+           "Run upgrade from a project that already uses ClojureDart:\n  clj -M:cljd upgrade")))
+     (let [latest-coordinate (parse-latest-deps (*latest-deps-reader*))
+           file (io/file file)]
+       (when-not (.isFile file)
+         (throw
+           (upgrade-failure
+             "No deps.edn file was found in the current directory."
+             (str "Expected file: " (.getCanonicalPath file))
+             "Change to the project directory and run:\n  clj -M:cljd upgrade")))
+       (let [current-text
+             (try
+               (slurp file)
+               (catch Exception e
+                 (throw
+                   (upgrade-failure
+                     (str "Unable to read " (.getCanonicalPath file) ": " (ex-message e))
+                     "Check that the file exists and is readable."
+                     "The local deps.edn was not modified."))))
+             {:keys [text changed? tag sha]}
+             (upgrade-deps-text current-text current-coordinate latest-coordinate)]
+         (if changed?
+           (do
+             (try
+                (atomic-spit file current-text text)
+                (catch Exception e
+                  (if (:cljd/upgrade-error (ex-data e))
+                    (throw e)
+                    (throw
+                      (upgrade-failure
+                        (str "Unable to replace " (.getCanonicalPath file) ": " (ex-message e))
+                        "Check file permissions and available disk space, then retry."
+                        "The original deps.edn was left in place whenever the filesystem allowed it.")))))
+             (println (str "ClojureDart upgraded to " tag " (" (subs sha 0 7) ")."))
+             (println "The new version will be used on the next clj invocation."))
+           (println (str "ClojureDart is already up to date at " tag " (" (subs sha 0 7) ")."))))))))
+
+(defn- run-upgrade-cljd []
+  (try
+    (upgrade-cljd)
+    (catch clojure.lang.ExceptionInfo e
+      (if (:cljd/upgrade-error (ex-data e))
+        (do
+          (binding [*out* *err*]
+            (println "Upgrade aborted:" (ex-message e)))
+          (System/exit 1))
+        (throw e)))))
 
 (def help-spec {:short "-h" :long "--help" :doc "Print this help."})
 
@@ -963,12 +1283,14 @@
                      #_{:short "-p" :long "--path"
                       :doc "Path to the flutter or dart install."}]
            :defaults {:target "flutter"}}
-   "compile" {:doc "Compile the specified namespaces (or the main one by default) to dart."}
+   "compile" {:doc "Compile the specified namespaces (or the main one by default) to dart.\n    Use the --offline option to not fetch dependencies."
+              :options [help-spec {:long "--offline" :id :offline :value true}]}
    "clean" {:doc "When there's something wrong with compilation, erase all ClojureDart build artifacts.\nConsider running flutter clean too."}
    "help" {:doc (:doc help-spec)}
    "test" {:doc "Run specified test namespaces (or all by default)."}
    "upgrade" {:doc "Upgrade cljd to latest version."}
-   "watch" {:doc "Like compile but keep recompiling in response to file updates."}
+   "watch" {:doc "Like compile but keep recompiling in response to file updates.\n    Use the --offline option to not fetch dependencies."
+            :options [help-spec {:long "--offline" :id :offline :value true}]}
    "flutter" {:options false
               :doc "Like watch but hot reload the application in the simulator or device. All options are passed to flutter run."}})
 
@@ -1076,6 +1398,7 @@
           (do
             (ensure-no-existing!)
             (compile-cli
+             :offline (:offline cmd-opts)
              :namespaces (or (seq (map symbol args))
                            (some-> *deps* :cljd/opts :main list))
              :watch (= cmd "watch")))
@@ -1100,7 +1423,7 @@
                         :when (re-matches #"[^.].*\.clj[cd]" (.getName file))]
                     (compiler/peek-ns file))))))
           "upgrade"
-          (upgrade-cljd)
+          (run-upgrade-cljd)
           "flutter"
           (let [[args [delim & flutter-args]] (split-with (complement #{"--" "++"}) args)
                 flutter-args (if delim flutter-args args)
