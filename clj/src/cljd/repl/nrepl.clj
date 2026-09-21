@@ -423,6 +423,272 @@
              (refresh-iso!)
              (when @+cljd-recording?+ (replay-settle!))
              (catch Throwable _ nil))))))
+(def ^:private no-picker
+  {:err "picker unavailable (needs a debug build whose root went through f/run)" :ex "cljd.no-picker"})
+
+(defn- flutter-eval
+  "Evaluate FORM against cljd.flutter on the device."
+  ([c form] (flutter-eval c form {}))
+  ([{:keys [client iso-id]} form opts]
+   (repl-eval/eval-form client iso-id form (merge {:ns-lib-uri "cljd/flutter.dart"} opts))))
+
+(defn- read-state [c]
+  (let [v (:value (flutter-eval c '(cljd.flutter/read-state) {:await? true}))]
+    (try (read-string v) (catch Throwable _ {}))))
+
+(defn- value-or-err [r ex]
+  (if (:error r) {:err (:message r) :ex ex} {:value (:value r)}))
+
+;; (cmd c form) -> {:value string} | {:err string :ex string}; c is the request state plus :iso-id and :switch-ns!
+(def ^:private repl-commands
+  {'in-ns
+   (fn [{:keys [switch-ns!]} form]
+     (let [target (unwrap-quote (second form))]
+       (if (ns-exists? target)
+         (do (switch-ns! target) {:value (str target)})
+         {:err (str "No such namespace: " target " (only namespaces compiled into the app are available)")
+          :ex "cljd.no-such-ns"})))
+
+   'doc
+   (fn [{:keys [*current-ns]} form]
+     (let [sym (unwrap-quote (second form))]
+       {:value (or (format-doc (sym-info @compiler/nses @*current-ns sym)) (str "nothing known about " sym))}))
+
+   'dir
+   (fn [_ form]
+     (let [nsym (unwrap-quote (second form))]
+       (if (ns-exists? nsym)
+         {:value (str/join "\n" (ns-def-names @compiler/nses nsym))}
+         {:err (str "No such namespace: " nsym) :ex "cljd.no-such-ns"})))
+
+   'apropos
+   (fn [_ form]
+     (let [pat (str (unwrap-quote (second form)))
+           nses @compiler/nses]
+       {:value (pr-str (->> (keys nses) (filter symbol?)
+                            (mapcat (fn [n] (map #(str n "/" %) (ns-def-names nses n))))
+                            (filter #(.contains ^String % pat)) sort vec))}))
+
+   'find-doc
+   (fn [_ form]
+     (let [pat (str (unwrap-quote (second form)))
+           nses @compiler/nses]
+       {:value (str/join "\n" (for [n (filter symbol? (keys nses))
+                                    nm (filter symbol? (keys (get nses n)))
+                                    :let [i (sym-info nses n nm)]
+                                    :when (and i (or (.contains (str nm) pat)
+                                                     (and (:doc i) (.contains ^String (:doc i) pat))))]
+                                (format-doc i)))}))
+
+   'source
+   (fn [{:keys [*current-ns source-dirs]} form]
+     (let [sym (unwrap-quote (second form))
+           i (sym-info @compiler/nses @*current-ns sym)
+           path (some-> (:ns i) (str/replace "." "/") (str ".cljd"))
+           file (when path (resolve-source-file source-dirs path))
+           txt (when (and file (:name i))
+                 (try (def-source file (symbol (:name i))) (catch Throwable _ nil)))]
+       {:value (or txt (str "source not found for " sym))}))
+
+   'pick!
+   (fn [{:keys [pick?] :as c} form]
+     (if-not pick?
+       no-picker
+       {:value (:value (flutter-eval c (list 'cljd.flutter/arm! (if (>= (count form) 2) (not (false? (second form))) true))))}))
+
+   ;; report the active pick, switch to its ns, load its scope into *env
+   'picked
+   (fn [{:keys [switch-ns!] :as c} _]
+     (let [;; scope-loc first: the full pick's gensym env keys can defeat read-string
+           loc-v (:value (flutter-eval c '(:ns (:scope-loc (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))))))
+           target (try (read-string loc-v) (catch Throwable _ nil))
+           ;; omit env/:rect: not read-string-friendly
+           full-r (flutter-eval c '(let [p (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))]
+                                     {:scope-loc (:scope-loc p) :type (:type p)
+                                      :src (:src (:widget-loc p)) :cljd (:cljd p)
+                                      :env-keys (cljd.core/vec (cljd.core/keys (cljd.flutter/pick-env p)))}))]
+       (flutter-eval c focus-active-env-form)
+       (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
+       {:value (:value full-r)}))
+
+   'picks
+   (fn [{:keys [client iso-id]} _]
+     (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
+                  (catch Throwable e {:error (.getMessage e)}))]
+       {:value (pr-str (:picks r r))}))
+
+   ;; (edit-back! PROP VALUE) splices VALUE into the active pick's source form
+   'edit-back!
+   (fn [{:keys [source-dirs] :as c} form]
+     (let [prop (second form)
+           value-str (pr-str (nth form 2 nil))
+           cljd-v (:value (flutter-eval c '(:cljd (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+)))))
+           loc (try (read-string cljd-v) (catch Throwable _ nil))
+           [path ln col] (when (and (string? loc) (seq loc))
+                           (let [ps (.split ^String loc ":")]
+                             (when (= 3 (alength ps))
+                               (try [(aget ps 0) (Long/parseLong (aget ps 1)) (Long/parseLong (aget ps 2))]
+                                    (catch Throwable _ nil)))))
+           file (when path (resolve-source-file source-dirs path))]
+       (cond
+         (not (and (string? loc) (seq loc)))
+         {:err "no active pick with a resolved cljd loc — pick a cljd widget first" :ex "cljd.no-pick"}
+         (not file)
+         {:err (str "can't resolve source file for " path " under " (vec source-dirs)) :ex "cljd.no-file"}
+         :else
+         (let [text (slurp file)
+               wform (form-at (read-source-forms file) ln col)
+               span (and wform (prop-value-offsets text wform prop))]
+           (if-some [[s e] span]
+             (let [old (subs text s e)]
+               (spit file (str (subs text 0 s) value-str (subs text e)))
+               {:value (str path ":" ln "  " prop ": " old " → " value-str " (saved — watcher reloading)")})
+             {:err (str "no property " (pr-str prop) " found in the picked form at " path ":" ln)
+              :ex "cljd.no-prop"})))))
+
+   'errors
+   (fn [_ form]
+     (when (= :clear (second form))
+       (swap! +cljd-timeline+ (fn [tl] (vec (remove #(= :error (:kind %)) tl)))))
+     {:value (pr-str (errors-view @+cljd-timeline+))})
+
+   ;; (q FORM): eval FORM on the host with errors/timeline/txs/epochs/coverage bound
+   'q
+   (fn [_ form]
+     (let [data {'errors (errors-view @+cljd-timeline+)
+                 'timeline @+cljd-timeline+
+                 'txs @+cljd-tx-log+
+                 ;; each epoch as the state map at its cut-point
+                 'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+)) (epoch-indices @+cljd-tx-log+))
+                 'coverage @+cljd-coverage-snap+}]
+       {:value (pr-str (try (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data)) (second form)))
+                            (catch Throwable e {:q-error (.getMessage e)})))}))
+
+   ;; (picks-do FORM): run FORM with *env bound to each pick's env; returns a vector
+   'picks-do
+   (fn [{:keys [pick? remember?] :as c} form]
+     (if-not pick?
+       no-picker
+       ;; :remember? makes eval rewrite *env to its holder
+       (value-or-err (flutter-eval c (list 'cljd.core/mapv
+                                           (list 'cljd.core/fn ['p]
+                                                 (list 'set! 'cljd.core/+cljd-repl-env+ (list 'cljd.flutter/pick-env 'p))
+                                                 (second form))
+                                           '(cljd.core/deref cljd.flutter/+cljd-picks+))
+                                   {:remember? remember?})
+                     "cljd.eval-error")))
+
+   ;; (cljd-src "a/b.dart" 249) -> "a/b.cljd:78:12"
+   'cljd-src
+   (fn [_ form]
+     {:value (pr-str (or (resolve-wloc (:libs @compiler/nses) (str (second form) ":" (nth form 2))) "unresolved"))})
+
+   ;; host-side: cljd macros are compile-time
+   'macroexpand
+   (fn [_ form] {:value (pr-str (compiler/macroexpand {} (unwrap-quote (second form))))})
+
+   'macroexpand-1
+   (fn [_ form] {:value (pr-str (compiler/macroexpand-1 {} (unwrap-quote (second form))))})
+
+   ;; (dart-of '(...)): the Dart the compiler emits for a form
+   'dart-of
+   (fn [_ form]
+     {:value (try (compiler/form->dart-expr (unwrap-quote (second form)))
+                  (catch Throwable e (str "compile error: " (errors/format-compile e))))})
+
+   ;; (trace 'form): sub-expression values stream to (timeline :trace)
+   'trace
+   (fn [{:keys [client iso-id *current-ns trigger-reload]} form]
+     (let [f (unwrap-quote (second form))]
+       (value-or-err (repl-eval/eval-form client iso-id (try (instrument f) (catch Throwable _ f))
+                       {:ns-lib-uri (ns->lib-uri @*current-ns) :trigger-reload trigger-reload})
+                     "cljd.trace-error")))
+
+   'states
+   (fn [c _] {:value (:value (flutter-eval c '(cljd.flutter/read-state) {:await? true}))})
+
+   'epoch!
+   (fn [c _]
+     (let [state (read-state c)]
+       (swap! +cljd-tx-log+ conj {:tx (count @+cljd-tx-log+) :t (System/currentTimeMillis) :delta state :cause :epoch})
+       {:value (str "epoch " (dec (count (epoch-indices @+cljd-tx-log+))) " recorded (" (count state) " atoms → tx-log)")}))
+
+   'epochs
+   (fn [_ _] {:value (str (count (epoch-indices @+cljd-tx-log+)) " epochs (markers into the tx-log)")})
+
+   'restore-epoch!
+   (fn [_ form]
+     (let [i (second form)]
+       (if-some [idx (nth (epoch-indices @+cljd-tx-log+) i nil)]
+         {:value (str "directed device to epoch " i " (" (write-snap! (tx-snapshot (take (inc idx) @+cljd-tx-log+))) " atoms)")}
+         {:err (str "no epoch " i) :ex "cljd.no-epoch"})))
+
+   'record!
+   (fn [c form]
+     (if (if (>= (count form) 2) (not (false? (second form))) true)
+       (let [base (read-state c)]
+         (reset! +cljd-tx-log+ [{:tx 0 :t (System/currentTimeMillis) :delta base :cause :record/base}])
+         (reset! +cljd-recording?+ true)
+         (flutter-eval c '(cljd.flutter/arm-recording! true))
+         {:value (str "recording on (" (count base) " base atoms)")})
+       (do (reset! +cljd-recording?+ false)
+           (flutter-eval c '(cljd.flutter/arm-recording! false))
+           {:value "recording off"})))
+
+   'txs
+   (fn [_ _] {:value (str (count @+cljd-tx-log+) " transactions recorded")})
+
+   'seek!
+   (fn [_ form]
+     (let [n (second form)
+           snap (tx-snapshot (take (inc n) @+cljd-tx-log+))]
+       (if (seq snap)
+         {:value (str "sought to tx " n " (" (write-snap! snap) " atoms)")}
+         {:err (str "no transactions up to " n " (record! first?)") :ex "cljd.no-tx"})))
+
+   'replay!
+   (fn [_ _]
+     (if-some [res (replay!)]
+       {:value (str "replayed " (:atoms res) " atoms → " (:wrote res) " written")}
+       {:value "nothing to replay (record! first?)"}))
+
+   'restart!
+   (fn [{:keys [trigger-restart]} _]
+     (if trigger-restart
+       (do (trigger-restart)
+           {:value (if @+cljd-recording?+
+                     "hot restart requested (state will replay on re-mount)"
+                     "hot restart requested (recording off → clean slate)")})
+       {:err "no restart trigger wired (flutter not running?)" :ex "cljd.no-restart"}))
+
+   ;; (ran): cljd locs newly executed since the last (coverage) snapshot
+   'coverage
+   (fn [{:keys [client iso-id]} _]
+     (let [cov (cljd-coverage client iso-id)]
+       (reset! +cljd-coverage-snap+ cov)
+       {:value (str (count cov) " dart lines covered — snapshot taken; interact then (ran)")}))
+
+   'ran
+   (fn [{:keys [client iso-id]} _]
+     (let [now (cljd-coverage client iso-id)
+           fresh (remove @+cljd-coverage-snap+ now)]
+       (reset! +cljd-coverage-snap+ now)
+       {:value (pr-str (->> fresh (keep #(dart-uri->cljd (:libs @compiler/nses) %)) distinct sort vec))}))
+
+   'taps
+   (fn [_ _] {:value (pr-str (mapv :data (filter #(= :tap (:kind %)) @+cljd-timeline+)))})
+
+   'timeline
+   (fn [_ form]
+     (let [k (second form)]
+       {:value (pr-str (if k (filterv #(= k (:kind %)) @+cljd-timeline+) @+cljd-timeline+))}))})
+
+(defn- user-def?
+  "True when SYM resolves to a def outside the cljd.* namespaces; such a def wins over a REPL command of the same name."
+  [sym]
+  (let [[tag e] (try (compiler/resolve-symbol sym {}) (catch Throwable _ nil))]
+    (and (= :def tag) (some? (:ns e)) (not (str/starts-with? (name (:ns e)) "cljd.")))))
+
 (defn handle-request [state {:keys [op transport id session code] :as msg}]
   (let [{:keys [client *iso ctx *current-ns *eval-sink trigger-reload trigger-restart source-dirs ns-lib-uri await? pick? remember?]} state
         send! (fn [m] (transport/send transport (merge {:id id} (when session {:session session}) m)))]
@@ -491,294 +757,11 @@
                 (let [head (and (seq? form) (first form))
                       ;; deref per form: the isolate changes on hot restart
                       iso-id @*iso]
-                  (case head
-                    in-ns
-                    (let [target (unwrap-quote (second form))]
-                      (if (ns-exists? target)
-                        (do (switch-ns! target)
-                            (send! {:value (str target) :ns (name target)}))
-                        (do (vreset! errored true)
-                            (send! {:err (str "No such namespace: " target
-                                              " (only namespaces compiled into the app are available)")
-                                    :ex "cljd.no-such-ns"}))))
-
-                    doc
-                    (send! {:value (or (format-doc (sym-info @compiler/nses @*current-ns
-                                                     (unwrap-quote (second form))))
-                                       (str "nothing known about " (unwrap-quote (second form))))
-                            :ns (name @*current-ns)})
-
-                    dir
-                    (let [nsym (unwrap-quote (second form))]
-                      (if (ns-exists? nsym)
-                        (send! {:value (str/join "\n" (ns-def-names @compiler/nses nsym)) :ns (name @*current-ns)})
-                        (send! {:err (str "No such namespace: " nsym) :ex "cljd.no-such-ns"})))
-
-                    apropos
-                    (let [pat (str (unwrap-quote (second form)))
-                          nses @compiler/nses
-                          hits (->> (keys nses) (filter symbol?)
-                                    (mapcat (fn [n] (map #(str n "/" %) (ns-def-names nses n))))
-                                    (filter #(.contains ^String % pat)) sort vec)]
-                      (send! {:value (pr-str hits) :ns (name @*current-ns)}))
-
-                    find-doc
-                    (let [pat (str (unwrap-quote (second form)))
-                          nses @compiler/nses
-                          hits (for [n (filter symbol? (keys nses))
-                                     nm (filter symbol? (keys (get nses n)))
-                                     :let [i (sym-info nses n nm)]
-                                     :when (and i (or (.contains (str nm) pat)
-                                                      (and (:doc i) (.contains ^String (:doc i) pat))))]
-                                 (format-doc i))]
-                      (send! {:value (str/join "\n" hits) :ns (name @*current-ns)}))
-
-                    source
-                    (let [sym (unwrap-quote (second form))
-                          i (sym-info @compiler/nses @*current-ns sym)
-                          path (some-> (:ns i) (str/replace "." "/") (str ".cljd"))
-                          file (when path (resolve-source-file source-dirs path))
-                          txt (when (and file (:name i))
-                                (try (def-source file (symbol (:name i))) (catch Throwable _ nil)))]
-                      (send! {:value (or txt (str "source not found for " sym)) :ns (name @*current-ns)}))
-
-                    pick!
-                    (if-not pick?
-                      (do (vreset! errored true)
-                          (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
-                                  :ex "cljd.no-picker"}))
-                      (let [on? (if (>= (count form) 2) (not (false? (second form))) true)
-                            r (repl-eval/eval-form client iso-id
-                                (list 'cljd.flutter/arm! on?)
-                                {:ns-lib-uri "cljd/flutter.dart"})]
+                  (if-some [cmd (when-some [cmd (get repl-commands head)] (when-not (user-def? head) cmd))]
+                    (let [r (cmd (assoc state :iso-id iso-id :switch-ns! switch-ns!) form)]
+                      (if (:err r)
+                        (do (vreset! errored true) (send! r))
                         (send! {:value (:value r) :ns (name @*current-ns)})))
-
-                    ;; (picked): report the active pick, switch to its ns, load its scope into *env
-                    picked
-                    (let [;; scope-loc first: the full pick's gensym env keys can defeat read-string
-                          loc-r (repl-eval/eval-form client iso-id
-                                  '(:ns (:scope-loc (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))))
-                                  {:ns-lib-uri "cljd/flutter.dart"})
-                          target (try (read-string (:value loc-r)) (catch Throwable _ nil))
-                          ;; omit env/:rect: not read-string-friendly
-                          full-r (repl-eval/eval-form client iso-id
-                                   '(let [p (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+))]
-                                      {:scope-loc (:scope-loc p) :type (:type p)
-                                       :src (:src (:widget-loc p)) :cljd (:cljd p)
-                                       :env-keys (cljd.core/vec (cljd.core/keys (cljd.flutter/pick-env p)))})
-                                   {:ns-lib-uri "cljd/flutter.dart"})
-                          _ (repl-eval/eval-form client iso-id focus-active-env-form
-                              {:ns-lib-uri "cljd/flutter.dart"})]
-                      (when (and (symbol? target) (ns-exists? target)) (switch-ns! target))
-                      (send! {:value (:value full-r) :ns (name @*current-ns)}))
-                    picks
-                    (let [r (try (vm/call-ext client iso-id "ext.cljd.picks" {})
-                                 (catch Throwable e {:error (.getMessage e)}))]
-                      (send! {:value (pr-str (:picks r r)) :ns (name @*current-ns)}))
-
-                    ;; (edit-back! PROP VALUE) splices VALUE into the active pick's source form
-                    edit-back!
-                    (let [prop (second form)
-                          value-str (pr-str (nth form 2 nil))
-                          cljd-r (repl-eval/eval-form client iso-id
-                                   '(:cljd (cljd.core/peek (cljd.core/deref cljd.flutter/+cljd-picks+)))
-                                   {:ns-lib-uri "cljd/flutter.dart"})
-                          loc (try (read-string (:value cljd-r)) (catch Throwable _ nil))
-                          [path ln col] (when (and (string? loc) (seq loc))
-                                          (let [ps (.split ^String loc ":")]
-                                            (when (= 3 (alength ps))
-                                              (try [(aget ps 0) (Long/parseLong (aget ps 1))
-                                                    (Long/parseLong (aget ps 2))]
-                                                   (catch Throwable _ nil)))))
-                          file (when path (resolve-source-file source-dirs path))]
-                      (cond
-                        (not (and (string? loc) (seq loc)))
-                        (send! {:err "no active pick with a resolved cljd loc — pick a cljd widget first"
-                                :ex "cljd.no-pick"})
-                        (not file)
-                        (send! {:err (str "can't resolve source file for " path " under " (vec source-dirs))
-                                :ex "cljd.no-file"})
-                        :else
-                        (let [text (slurp file)
-                              wform (form-at (read-source-forms file) ln col)
-                              span (and wform (prop-value-offsets text wform prop))]
-                          (if span
-                            (let [[s e] span
-                                  old (subs text s e)]
-                              (spit file (str (subs text 0 s) value-str (subs text e)))
-                              (send! {:value (str path ":" ln "  " prop ": " old " → " value-str
-                                                " (saved — watcher reloading)")
-                                      :ns (name @*current-ns)}))
-                            (send! {:err (str "no property " (pr-str prop) " found in the picked form at "
-                                           path ":" ln)
-                                    :ex "cljd.no-prop"})))))
-
-                    errors
-                    (do (when (= :clear (second form))
-                          (swap! +cljd-timeline+ (fn [tl] (vec (remove #(= :error (:kind %)) tl)))))
-                        (send! {:value (pr-str (errors-view @+cljd-timeline+)) :ns (name @*current-ns)}))
-
-                    ;; (q FORM): eval FORM on the host with errors/timeline/txs/epochs/coverage bound
-                    q
-                    (let [data {'errors (errors-view @+cljd-timeline+)
-                                'timeline @+cljd-timeline+
-                                'txs @+cljd-tx-log+
-                                ;; each epoch as the state map at its cut-point
-                                'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+))
-                                              (epoch-indices @+cljd-tx-log+))
-                                'coverage @+cljd-coverage-snap+}
-                          r (try
-                              (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data))
-                                      (second form)))
-                              (catch Throwable e {:q-error (.getMessage e)}))]
-                      (send! {:value (pr-str r) :ns (name @*current-ns)}))
-
-                    ;; (picks-do FORM): run FORM with *env bound to each pick's env; returns a vector
-                    picks-do
-                    (if-not pick?
-                      (do (vreset! errored true)
-                          (send! {:err "picker unavailable (needs a debug build whose root went through f/run)"
-                                  :ex "cljd.no-picker"}))
-                      (let [user-form (second form)
-                            ;; :remember? makes eval rewrite *env to its holder
-                            wrapped (list 'cljd.core/mapv
-                                          (list 'cljd.core/fn ['p]
-                                                (list 'set! 'cljd.core/+cljd-repl-env+ (list 'cljd.flutter/pick-env 'p))
-                                                user-form)
-                                          '(cljd.core/deref cljd.flutter/+cljd-picks+))
-                            r (repl-eval/eval-form client iso-id wrapped
-                                {:ns-lib-uri "cljd/flutter.dart" :remember? remember?})]
-                        (if (:error r)
-                          (do (vreset! errored true) (send! {:err (:message r) :ex "cljd.eval-error"}))
-                          (send! {:value (:value r) :ns (name @*current-ns)}))))
-
-                    ;; (cljd-src "a/b.dart" 249) -> "a/b.cljd:78:12"
-                    cljd-src
-                    (let [path (str (second form))
-                          line (nth form 2)
-                          cljd (resolve-wloc (:libs @compiler/nses) (str path ":" line))]
-                      (send! {:value (pr-str (or cljd "unresolved")) :ns (name @*current-ns)}))
-
-                    ;; host-side: cljd macros are compile-time
-                    (macroexpand macroexpand-1)
-                    (let [f (unwrap-quote (second form))
-                          expanded ((if (= 'macroexpand-1 head)
-                                      compiler/macroexpand-1 compiler/macroexpand) {} f)]
-                      (send! {:value (pr-str expanded) :ns (name @*current-ns)}))
-
-                    ;; (dart-of '(...)): the Dart the compiler emits for a form
-                    dart-of
-                    (let [f (unwrap-quote (second form))
-                          dart (try (compiler/form->dart-expr f)
-                                    (catch Throwable e (str "compile error: " (errors/format-compile e))))]
-                      (send! {:value dart :ns (name @*current-ns)}))
-
-                    ;; (trace 'form): sub-expression values stream to (timeline :trace)
-                    trace
-                    (let [f (unwrap-quote (second form))
-                          instrumented (try (instrument f) (catch Throwable _ f))
-                          r (repl-eval/eval-form client iso-id instrumented
-                              {:ns-lib-uri (ns->lib-uri @*current-ns) :trigger-reload trigger-reload})]
-                      (if (:error r)
-                        (do (vreset! errored true) (send! {:err (:message r) :ex "cljd.trace-error"}))
-                        (send! {:value (:value r) :ns (name @*current-ns)})))
-
-                    states
-                    (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                              {:ns-lib-uri "cljd/flutter.dart" :await? true})]
-                      (send! {:value (:value r) :ns (name @*current-ns)}))
-
-                    epoch!
-                    (let [r (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                              {:ns-lib-uri "cljd/flutter.dart" :await? true})
-                          state (try (read-string (:value r)) (catch Throwable _ {}))]
-                      (swap! +cljd-tx-log+ conj {:tx (count @+cljd-tx-log+) :t (System/currentTimeMillis)
-                                                 :delta state :cause :epoch})
-                      (send! {:value (str "epoch " (dec (count (epoch-indices @+cljd-tx-log+))) " recorded ("
-                                       (count state) " atoms → tx-log)")
-                              :ns (name @*current-ns)}))
-
-                    epochs
-                    (send! {:value (str (count (epoch-indices @+cljd-tx-log+)) " epochs (markers into the tx-log)")
-                            :ns (name @*current-ns)})
-
-                    restore-epoch!
-                    (let [i (second form)
-                          idx (nth (epoch-indices @+cljd-tx-log+) i nil)]
-                      (if (some? idx)
-                        (let [wrote (write-snap! (tx-snapshot (take (inc idx) @+cljd-tx-log+)))]
-                          (send! {:value (str "directed device to epoch " i " (" wrote " atoms)")
-                                  :ns (name @*current-ns)}))
-                        (send! {:err (str "no epoch " i) :ex "cljd.no-epoch"})))
-
-                    record!
-                    (let [on? (if (>= (count form) 2) (not (false? (second form))) true)]
-                      (if on?
-                        (let [r0 (repl-eval/eval-form client iso-id '(cljd.flutter/read-state)
-                                   {:ns-lib-uri "cljd/flutter.dart" :await? true})
-                              base (try (read-string (:value r0)) (catch Throwable _ {}))]
-                          (reset! +cljd-tx-log+ [{:tx 0 :t (System/currentTimeMillis)
-                                                  :delta base :cause :record/base}])
-                          (reset! +cljd-recording?+ true)
-                          (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! true)
-                            {:ns-lib-uri "cljd/flutter.dart"})
-                          (send! {:value (str "recording on (" (count base) " base atoms)")
-                                  :ns (name @*current-ns)}))
-                        (do (reset! +cljd-recording?+ false)
-                            (repl-eval/eval-form client iso-id '(cljd.flutter/arm-recording! false)
-                              {:ns-lib-uri "cljd/flutter.dart"})
-                            (send! {:value "recording off" :ns (name @*current-ns)}))))
-
-                    txs
-                    (send! {:value (str (count @+cljd-tx-log+) " transactions recorded") :ns (name @*current-ns)})
-
-                    seek!
-                    (let [n (second form)
-                          snap (tx-snapshot (take (inc n) @+cljd-tx-log+))]
-                      (if (seq snap)
-                        (send! {:value (str "sought to tx " n " (" (write-snap! snap) " atoms)")
-                                :ns (name @*current-ns)})
-                        (send! {:err (str "no transactions up to " n " (record! first?)") :ex "cljd.no-tx"})))
-
-                    replay!
-                    (let [res (replay!)]
-                      (if res
-                        (send! {:value (str "replayed " (:atoms res) " atoms → " (:wrote res) " written")
-                                :ns (name @*current-ns)})
-                        (send! {:value "nothing to replay (record! first?)" :ns (name @*current-ns)})))
-
-                    restart!
-                    (if trigger-restart
-                      (do (trigger-restart)
-                          (send! {:value (if @+cljd-recording?+
-                                           "hot restart requested (state will replay on re-mount)"
-                                           "hot restart requested (recording off → clean slate)")
-                                  :ns (name @*current-ns)}))
-                      (send! {:err "no restart trigger wired (flutter not running?)" :ex "cljd.no-restart"}))
-
-                    ;; (ran): cljd locs newly executed since the last (coverage) snapshot
-                    coverage
-                    (let [cov (cljd-coverage client iso-id)]
-                      (reset! +cljd-coverage-snap+ cov)
-                      (send! {:value (str (count cov) " dart lines covered — snapshot taken; interact then (ran)")
-                              :ns (name @*current-ns)}))
-
-                    ran
-                    (let [now (cljd-coverage client iso-id)
-                          fresh (remove @+cljd-coverage-snap+ now)
-                          locs (->> fresh (keep #(dart-uri->cljd (:libs @compiler/nses) %)) distinct sort vec)]
-                      (reset! +cljd-coverage-snap+ now)
-                      (send! {:value (pr-str locs) :ns (name @*current-ns)}))
-
-                    taps
-                    (send! {:value (pr-str (mapv :data (filter #(= :tap (:kind %)) @+cljd-timeline+)))
-                            :ns (name @*current-ns)})
-
-                    timeline
-                    (let [k (second form)
-                          tl (if k (filterv #(= k (:kind %)) @+cljd-timeline+) @+cljd-timeline+)]
-                      (send! {:value (pr-str tl) :ns (name @*current-ns)}))
-
                     (let [r (repl-eval/eval-form client iso-id form
                                                  {:ns-lib-uri (ns->lib-uri @*current-ns)
                                                   :trigger-reload trigger-reload
