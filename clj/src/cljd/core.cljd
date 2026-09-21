@@ -2349,11 +2349,11 @@
   IPrint
   (-print [o sink]
     (doto ^StringSink sink
-      (.write "#object[cljd.core.Delay ")
-      (.write (if (nil? f)
-                {:status :ready :val val}
-                {:status :pending :val nil}))
-      (.write "]"))))
+      (.write "#object[cljd.core.Delay {:status ")
+      (.write (if (nil? f) ":ready" ":pending"))
+      (.write ", :val "))
+    (-print (when (nil? f) val) sink)
+    (.write ^StringSink sink "}]")))
 
 (defn delay?
   "returns true if x is a Delay created with delay"

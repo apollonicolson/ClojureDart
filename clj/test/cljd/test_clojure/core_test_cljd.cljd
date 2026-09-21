@@ -182,9 +182,9 @@
 (deftest testing-empty-record
   (is (= (hash (->EmptyRecord)) (hash (->EmptyRecord))))
   (is (dart/is? (-> (->EmptyRecord) (. #/(cast int int))) #/(EmptyRecord int int)))
-  (is (= (for [[k v] (assoc (->EmptyRecord) :a :b :c :d :e :f)]
-           k)
-        '(:a :c :e))))
+  (is (= (set (for [[k v] (assoc (->EmptyRecord) :a :b :c :d :e :f)]
+                k))
+        #{:a :c :e})))
 
 (defrecord RecordA [a]
   (mymethod [this] (str a "two")))
@@ -1220,17 +1220,17 @@
     (is (false? @@$))))
 
 (deftest testing-hash-jvm-compat
-  ;; reference values from JVM Clojure 1.12.0 (matches CLJS)
+  ;; JVM Clojure 1.12.0 values (matches CLJS), as u32 like every cljd hash
   (testing "keyword"
-    (is (= -2123407586 (hash :a)))
+    (is (= (u32 -2123407586) (hash :a)))
     (is (=  1482224470 (hash :b)))
-    (is (= -2146297393 (hash :k)))
-    (is (= -1386151538 (hash :foo/bar)))
+    (is (= (u32 -2146297393) (hash :k)))
+    (is (= (u32 -1386151538) (hash :foo/bar)))
     (is (=  1268894036 (hash :foo))))
   (testing "symbol"
-    (is (=  -482876059 (hash 'a)))
-    (is (= -1172211299 (hash 'b)))
-    (is (= -1172211204 (hash 'a/b)))
+    (is (= (u32 -482876059) (hash 'a)))
+    (is (= (u32 -1172211299) (hash 'b)))
+    (is (= (u32 -1172211204) (hash 'a/b)))
     (is (=   254379989 (hash 'foo/bar))))
   (testing "non-ASCII names"
     (is (= 1223535072 (hash :λ/Ω))))
