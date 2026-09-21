@@ -5225,7 +5225,11 @@
    and re-emit any lifted statements (e.g. `set!`'s temp), breaking the Dart.
    Requires `+cljd-repl-handle`/`+cljd-repl-fbox+` injected into cljd.core first."
   [form]
-  (dart-iife (list 'cljd.core/+cljd-repl-handle form)))
+  ;; Wrap FORM in a thunk so a user-written `await` inside it sits in a fn body — cljd
+  ;; auto-marks that fn async (has-await?), yielding a Future that +cljd-repl-handle
+  ;; schedules + polls. A form with no await compiles to a sync thunk whose value handle
+  ;; returns directly (no box poll), preserving the fast path. FORM still appears once.
+  (dart-iife (list 'cljd.core/+cljd-repl-handle (list (list 'fn [] form)))))
 
 (defn recompile-form
   [form recompile-count repltag]
