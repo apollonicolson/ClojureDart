@@ -710,8 +710,7 @@
                ~value ~(if accessor `(-> ~source ~accessor) source)
                ~binding ~value
                ~@packing-bindings
-               ~next-value ~new-val-sym
-               ~changed ]
+               ~next-value ~new-val-sym]
            (if (or (identical? (.-latest ~state) ~state)
                  (not= ~next-value (.-latest ~state)))
              (let [child# (-widget-cont ~(assoc env :key nil :closest-ctx true)
