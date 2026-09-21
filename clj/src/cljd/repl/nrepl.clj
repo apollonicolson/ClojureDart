@@ -50,9 +50,12 @@
                   (str/join "\n") str/trim)})))))
 
 (defn- sym-info
-  "Look up SYM in @nses relative to CUR-NS, falling back to cljd.core; nil if absent."
+  "Look up SYM in @nses relative to CUR-NS, following :refer and aliases, falling back to cljd.core; nil if absent."
   [nses cur-ns sym]
-  (let [ns'  (if-let [n (namespace sym)] (symbol n) cur-ns)
+  (let [sym  (get-in nses [cur-ns :mappings sym] sym)
+        ns'  (if-let [n (namespace sym)]
+               (or (some->> (get-in nses [cur-ns :clj-aliases n]) (get (:libs nses)) :ns) (symbol n))
+               cur-ns)
         nm   (symbol (name sym))
         info (or (get-in nses [ns' nm]) (get-in nses ['cljd.core nm]))
         m    (:meta info)
@@ -206,11 +209,13 @@
 (defn- read-source-forms
   "Top-level forms of FILE with :line/:column/:end-* meta."
   [^String file]
-  (with-open [r (clojure.lang.LineNumberingPushbackReader. (java.io.FileReader. file))]
-    (compiler/with-cljd-reader
-      (loop [acc []]
-        (let [f (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)]
-          (if (= f ::eof) acc (recur (conj acc f))))))))
+  ;; resolve the file's aliases in its own ns, not the REPL's
+  (binding [compiler/*current-ns* (or (compiler/peek-ns file) compiler/*current-ns*)]
+    (with-open [r (clojure.lang.LineNumberingPushbackReader. (java.io.FileReader. file))]
+      (compiler/with-cljd-reader
+        (loop [acc []]
+          (let [f (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)]
+            (if (= f ::eof) acc (recur (conj acc f)))))))))
 
 (defn- line-start-offset
   "0-based char offset of the start of 1-based LINE in TEXT."
