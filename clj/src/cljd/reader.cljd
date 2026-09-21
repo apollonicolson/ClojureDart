@@ -213,11 +213,7 @@
              (loop [from from]
                (.addAll items q)
                (.clear q)
-               ;; Skip whitespace/commas before every closing-delimiter check, not
-               ;; just on entry. `read` leaves `from` immediately after an element
-               ;; (before any trailing space), so a collection whose closing delim
-               ;; sits after whitespace — e.g. `{:a 1\n}` — would otherwise dispatch
-               ;; on the delimiter as an unexpected token instead of closing here.
+               ;; skip space before every closing check: `read` stops right after an element, e.g. `{:a 1\n}`
                (let [from (skip-space s from to)]
                  (cond
                    (neg? from) from

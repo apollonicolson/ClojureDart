@@ -390,9 +390,7 @@
   (throw (Exception. (apply print-str "DYNAMIC ERROR:" args))))
 
 (defn dynamic-member-hint
-  "Actionable tail for an unresolved-member diagnostic. The dominant cause is an
-  untyped (dynamic) receiver, which cljd can't resolve a member against — so say
-  so and point at the fix (a type hint) instead of leaving a bare warning."
+  "Fix hint appended to an unresolved-member warning."
   [member-name type!]
   (if (or (nil? type!) (= 'dc.dynamic (:canon-qname type!)))
     (str "— receiver type is dynamic; add a type hint so cljd can resolve `"
@@ -401,11 +399,7 @@
 
 (def ^:dynamic dynamic-warning on-dynamic-fail)
 
-;; defonce, NOT def: this atom IS the whole compiler symbol table (every compiled
-;; namespace's mappings, aliases, emitted defs). A plain def would re-init it to
-;; empty on `(require 'cljd.compiler :reload)`, wiping the accumulated state; with
-;; defonce, an in-process reload updates every function but preserves the table —
-;; the one piece of needful in-memory state, so the compiler can be hot-reloaded.
+;; defonce so (require 'cljd.compiler :reload) keeps the symbol table
 (defonce nses (atom {:libs {"dart:core" {:dart-alias "dc" :ns nil}
                         "dart:async" {:dart-alias "da" :ns nil}} ; dc can't clash with user aliases because they go through dart-global
                  ; map from dart aliases to libs
@@ -1736,12 +1730,7 @@
    (magicast dart-expr expected-type (:dart/type (infer-type dart-expr)) env))
   ([dart-expr expected-type actual-type env]
    (cond
-     ;; A void-typed expression (e.g. List.add, StringBuffer.write, postEvent)
-     ;; has no value, so Dart rejects it wherever a value is consumed — the #1
-     ;; cljd papercut ("void can't be used"). In Clojure such side-effecting
-     ;; forms yield nil, so honor that: run the call as a statement and yield
-     ;; null. Only fires when the value is actually consumed as non-void; a
-     ;; genuine void tail (expected void) is left untouched below.
+     ;; void value consumed as non-void: run it as a statement, yield nil
      (and expected-type
           (= 'void (:canon-qname actual-type))
           (not= 'void (:canon-qname expected-type)))
@@ -1910,9 +1899,7 @@
     (if (:fixed (meta x))
       (if-some [[item & more-items] (seq x)]
         (let [lsym (dart-local (with-meta 'fl {:tag list-tag}) env)
-              ;; magicast each element to dynamic so a void-typed element (e.g.
-              ;; a bare .add/.write) becomes a statement yielding null rather
-              ;; than an illegal `List.filled(n, voidExpr)`. No-op for non-void.
+              ;; a void element becomes a statement yielding null
               emit-item (fn [item] (magicast (emit quoted item env) dc-dynamic env))]
           (list 'dart/let
             (into
@@ -1945,10 +1932,8 @@
       (seq bindings) (list 'dart/let bindings))))
 
 (defn emit-dart-map-literal
-  "#dart {k v, …} → a native Dart Map, built as Map<K,V>.fromEntries([MapEntry …]).
-  Removes the jsonEncode→jsonDecode round-trip previously needed to hand a Dart
-  Map to interop (e.g. postEvent). Element types default to dynamic; a 2-vector
-  :tag on the literal (^{:tag [K V]}) sets the key/value types."
+  "#dart {k v, …} → Map<K,V>.fromEntries([MapEntry …]).
+  K and V default to dynamic; ^{:tag [K V]} on the literal sets them."
   [quoted x env]
   (let [t (:tag (meta x))
         [ktag vtag] (if (and (vector? t) (= 2 (count t)))
@@ -5174,61 +5159,30 @@
           (throw e))))))
 
 (defn dart-iife
-  "Compile BODY to a single-line self-invoking Dart closure `(() { … })()` — a single
-   expression suitable for VM-Service `evaluate`. See form->dart-expr for why the
-   parens and single-line collapse are required."
+  "Compiles BODY to a single-line self-invoking Dart closure `(() { … })()`,
+   one expression for VM-Service `evaluate`."
   [body]
   (binding [*locals-gen* {}]
+    ;; parens added by hand: cljd's (fn* …) emit lacks them and Dart rejects `(){…}()`
     (-> (str "(() {" (with-dart-str (write (emit body {}) return-locus {})) "})()")
+        ;; one line: VM-Service `evaluate` parses only the first line (emitted string literals escape \n)
         (.replace "\n" " "))))
 
 (defn form->dart-expr
-  "Compile a cljd FORM to a single Dart EXPRESSION string (an IIFE), suitable for
-   feeding to the Dart VM-Service `evaluate` against the current-ns library scope.
-
-   The form is wrapped `(fn* [] (cljd.core/pr-str FORM))` so the result is a flat
-   printable String (cljd's own printer) rather than an opaque object handle; the
-   closure also absorbs any statement-lifting, and `()`-calling it makes the whole
-   thing one expression.
-
-   MUST run in a bootstrapped compiler context — `nses` loaded (cljd.core compiled)
-   and `analyzer-info` bound — i.e. the same live context `recompile-form` runs in
-   (inside cljd.build). Returns the Dart string. Use for the EVAL half of the REPL;
-   def/new-code forms go through reloadSources instead."
+  "Compiles FORM to a Dart expression string (an IIFE) for VM-Service `evaluate`,
+   pr-str'ing the value unless pr-str? is false. Requires a bootstrapped compiler:
+   nses loaded; analyzer-info, *current-ns*, *dart-version* and *hosted* bound."
   ([form] (form->dart-expr form true))
   ([form pr-str?]
-   ;; VM-Service `evaluate` accepts a single Dart EXPRESSION, not a statement list.
-   ;; Many cljd forms (collection literals [1 2 3]/{:a 1}, let, do …) statement-LIFT:
-   ;; they emit `final t1 = …; … ; value` — a statement sequence `evaluate` rejects.
-   ;; Emit the value with `return-locus` (lifted statements, then `return value;`)
-   ;; and wrap the whole block in a self-invoking closure `(() { … })()`. The lifted
-   ;; statements are legal inside the block, and the parenthesised lambda makes the
-   ;; whole thing one expression — the exact shape proven to evaluate cleanly.
-   ;; (cljd's own `(fn* [] …)` emit lacks the wrapping parens — `(){…}()` — which
-   ;; Dart's expression parser rejects with "Can't find '}'"; hence the manual wrap.)
-   ;; Collapse to ONE LINE: the VM-Service expression evaluator parses only the first
-   ;; line of the string, so any newline truncates it ("Can't find '}'"). Statement
-   ;; separators become "; " (valid Dart); `\n` inside Dart string literals is the
-   ;; two-char escape, not a real newline, so it is unaffected by this replace.
-   ;; pr-str wrapping (inside the closure) yields a flat printable String.
-   ;; *locals-gen* is per-compile; the caller binds the runtime context
-   ;; (*current-ns*, analyzer-info, *dart-version*, *hosted*).
    (let [body (if pr-str? (list 'cljd.core/pr-str form) form)]
      (dart-iife body))))
 
 (defn form->dart-await-expr
-  "Like form->dart-expr, but Future-aware: hands FORM's value to the injected helper
-   `cljd.core/+cljd-repl-handle`, which — if the value is a Future — schedules its
-   resolution into an atom and returns the sentinel \"__cljd_future_pending__\" (the
-   caller polls the box), else returns the pr-str'd value. FORM appears exactly ONCE
-   (as the helper arg): referencing it multiple times would let cljd inline the local
-   and re-emit any lifted statements (e.g. `set!`'s temp), breaking the Dart.
-   Requires `+cljd-repl-handle`/`+cljd-repl-fbox+` injected into cljd.core first."
+  "Like form->dart-expr, but a Future value returns \"__cljd_future_pending__\"
+   and later resolves into +cljd-repl-fbox+. Requires +cljd-repl-handle and
+   +cljd-repl-fbox+ injected into cljd.core."
   [form]
-  ;; Wrap FORM in a thunk so a user-written `await` inside it sits in a fn body — cljd
-  ;; auto-marks that fn async (has-await?), yielding a Future that +cljd-repl-handle
-  ;; schedules + polls. A form with no await compiles to a sync thunk whose value handle
-  ;; returns directly (no box poll), preserving the fast path. FORM still appears once.
+  ;; thunk so a user `await` sits in a fn body (cljd marks it async); FORM must appear once or lifted statements re-emit
   (dart-iife (list 'cljd.core/+cljd-repl-handle (list (list 'fn [] form)))))
 
 (defn recompile-form
@@ -5242,9 +5196,7 @@
             (when-not (nses-before ns-name) ; new ns
               (binding [*host-eval* true] (emit-ns form {}))
               (binding [*host-eval* false] (emit-ns form {})))
-            ;; The VM-Service nREPL tracks *current-ns* host-side and reloads the
-            ;; recompiled lib via Flutter hot reload; no in-app runtime *ns* set or
-            ;; form-exec execution hook is needed (the old socket REPL needed both).
+            ;; the nREPL tracks *ns* host-side
             nil)
 
           ; regular form
@@ -5266,10 +5218,7 @@
             (binding [*recompile-count* recompile-count]
               (binding [*locals-gen* {}
                         *dart-out* *out*]
-                ;; Emit the form as ordinary top-level code; Flutter hot reload
-                ;; brings it into the live app. The old socket REPL wrapped this in
-                ;; form-exec/dispatch-to-repl! to re-execute and route output — the
-                ;; nREPL gets values via `evaluate` and output via VM-Service streams.
+                ;; plain top-level code; Flutter hot reload loads it
                 (emit form {}))
 
               ; Prior to recompilation of nses-to-recompile, remove them and

@@ -1,22 +1,18 @@
 (ns cljd.repl.vmservice
-  "Minimal Dart VM-Service client for the cljd REPL — JSON-RPC over a JDK WebSocket,
-   no extra runtime. Used to `evaluate` expressions in, and `reloadSources` into, the
-   running Flutter app's isolate. Connect to the ws:// URI flutter run prints
-   (\"A Dart VM Service ... available at: http://…\" -> ws://…/ws)."
+  "Minimal Dart VM-Service client (JSON-RPC over a JDK WebSocket) for the cljd REPL."
   (:require [clojure.data.json :as json])
   (:import [java.net URI]
            [java.net.http HttpClient WebSocket WebSocket$Listener]
            [java.util.concurrent.atomic AtomicLong]))
 
 (defn connect
-  "Open a VM-Service websocket. Returns a client map {:ws :pending :idgen :sink}.
-   `:sink` is an atom holding an optional fn (stream-id, text) called for each
-   Stdout/Stderr WriteEvent — used to forward app `println` output to the REPL."
+  "Open a VM-Service websocket at WS-URI. Returns {:ws :pending :idgen :sink :event-sink};
+   :sink / :event-sink are atoms holding optional handlers for stream output and Extension events."
   [ws-uri]
   (let [pending (atom {})                 ; request id -> promise
         idgen (AtomicLong. 0)
-        sink (atom nil)                   ; optional (fn [stream-id text]) for stream output
-        event-sink (atom nil)             ; optional (fn [extension-kind data-map]) for Extension events
+        sink (atom nil)                   ; (fn [stream-id text])
+        event-sink (atom nil)             ; (fn [extension-kind data-map])
         buf (StringBuilder.)
         decoder (java.util.Base64/getDecoder)
         listener
@@ -30,12 +26,10 @@
                 (try
                   (let [msg (json/read-str s :key-fn keyword)]
                     (cond
-                      ;; response to a request
                       (get @pending (:id msg))
                       (let [p (get @pending (:id msg))]
                         (swap! pending dissoc (:id msg))
                         (deliver p msg))
-                      ;; async stream notification (Stdout/Stderr WriteEvent)
                       (= "streamNotify" (:method msg))
                       (let [{:keys [streamId event]} (:params msg)]
                         (cond
@@ -44,7 +38,6 @@
                                (:bytes event))
                           (when-some [f @sink]
                             (f streamId (String. (.decode decoder ^String (:bytes event)) "UTF-8")))
-                          ;; structured device->host push: dart:developer postEvent(kind, data)
                           (and (= "Extension" streamId) (= "Extension" (:kind event)))
                           (when-some [g @event-sink]
                             (g (:extensionKind event) (:extensionData event)))))))
@@ -81,8 +74,8 @@
        (filter #(.endsWith ^String (:uri %) uri-suffix)) first :id))
 
 (defn evaluate
-  "Evaluate a Dart EXPRESSION string in `target-id`'s scope. Returns the response
-   map: {:type \"@Instance\" :kind :valueAsString …} or {:type \"@Error\" …}."
+  "Evaluate Dart EXPR in TARGET-ID's scope. Returns an @Instance or @Error response map;
+   valueAsString is capped at 128 code units (see get-string-full)."
   [client iso-id target-id expr]
   (rpc client "evaluate" {:isolateId iso-id :targetId target-id :expression expr}))
 
@@ -92,16 +85,12 @@
   (rpc client "reloadSources" {:isolateId iso-id}))
 
 (defn get-object
-  "Fetch a device object's FULL structure by id (no valueAsString truncation). For a
-   List/Map, :elements/:associations are refs you recurse into. `evaluate` returns such
-   an id in its :id — this is how you read a large device value without the 128-char cap."
+  "Fetch a device object's full structure by id, without valueAsString truncation."
   [client iso-id obj-id]
   (rpc client "getObject" {:isolateId iso-id :objectId obj-id}))
 
 (defn get-string-full
-  "The full value of a String instance (OBJ-ID), paged past `evaluate`'s 128-char
-   valueAsString cap. getObject on a String honours offset/count; reassemble up to LENGTH
-   code units. Used when an eval result's :valueAsStringIsTruncated is set."
+  "Full value of String OBJ-ID of LENGTH code units, paged via getObject offset/count."
   [client iso-id obj-id length]
   (if (or (nil? length) (<= length 0))
     ""
@@ -112,14 +101,12 @@
                      {:isolateId iso-id :objectId obj-id :offset off :count (- length off)})
               s (:valueAsString r)]
           (if (or (nil? s) (zero? (count s)))
-            (.toString sb)                    ; no progress → stop (avoid spin)
+            (.toString sb)                    ; no progress: stop
             (recur (+ off (count s)) (doto sb (.append ^String s)))))))))
 
 (defn call-ext
-  "Call a registered Dart service extension (method like \"ext.cljd.picks\", registered
-   device-side via dart:developer registerExtension). PARAMS values must be strings.
-   Returns the extension's ServiceExtensionResponse.result parsed as JSON — structured
-   data, no compilation, no truncation."
+  "Call a registered Dart service extension METHOD; PARAMS values must be strings.
+   Returns the extension's result parsed as JSON."
   [client iso-id method params]
   (rpc client method (merge {:isolateId iso-id} params)))
 
@@ -129,9 +116,7 @@
   (reset! event-sink f))
 
 (defn listen-streams!
-  "Subscribe to the isolate's Stdout/Stderr streams so WriteEvents reach `:sink`.
-   Flutter may already hold a subscription (error 103 \"Stream already subscribed\");
-   that is harmless and ignored."
+  "Subscribe to Stdout/Stderr/Extension streams; already-subscribed errors are ignored."
   [client]
   (doseq [stream ["Stdout" "Stderr" "Extension"]]
     (try (rpc client "streamListen" {:streamId stream})

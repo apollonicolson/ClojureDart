@@ -166,18 +166,10 @@
 (defn timestamp []
   (.format (java.text.SimpleDateFormat. "@HH:mm:ss" (java.util.Locale/getDefault)) (java.util.Date.)))
 
-;; ── hot-reload binding-shape legibility ──────────────────────────────────────
-;; :managed/:watch bindings and defonce vars are captured by an element the
-;; first time it mounts; hot reload runs the new code but keeps the old
-;; captures, so editing their shape silently leaves stale state (the lived
-;; "ISeqable for int" bug). We can't fix reload semantics, but we can *warn*:
-;; diff the fragile-binding signature of each changed file across reloads and
-;; tell the dev to hot-RESTART (R) when it changed.
+;; hot reload keeps stale :managed/:watch/defonce captures: warn to restart when their shape changes
 
 (defn- read-cljd-forms
-  "Best-effort read of every top-level form in a .cljd file with the cljd
-  reader. Returns nil on any failure — this is advisory only, never blocks a
-  build."
+  "Reads every top-level form of a .cljd file; nil on any failure."
   [^java.io.File f]
   (try
     (binding [compiler/*current-ns* (or (compiler/peek-ns f) 'cljd.core)]
@@ -191,9 +183,7 @@
     (catch Throwable _ nil)))
 
 (defn- binding-signature
-  "Set of shape-signatures for hot-reload-fragile constructs in `forms`: every
-  :managed/:watch binding vector and every defonce name. A change to this set
-  across a reload means a restart is needed to apply the edit."
+  "Set of :managed/:watch binding vectors and defonce names in forms."
   [forms]
   (let [acc (volatile! #{})]
     (letfn [(scan-pairs [xs]
@@ -222,8 +212,7 @@
   (some-> (read-cljd-forms f) binding-signature))
 
 (defn- warn-binding-shape-change!
-  "If f's fragile-binding signature changed vs `sigs` (an atom of path->sig),
-  print a restart-needed advisory. Updates `sigs`. Returns true iff it warned."
+  "Prints a restart advisory when f's signature changed in the sigs atom; true iff warned."
   [sigs ^java.io.File f]
   (let [path (.getCanonicalPath f)
         new-sig (binding-signature-of f)
@@ -439,12 +428,7 @@
   [& {:keys [watch namespaces flutter offline] :or {watch false}}]
   (let [user-dir (System/getProperty "user.dir")
         analyzer-dir (ensure-cljd-analyzer!)]
-    ;; JVM nREPL on the build process itself, so a Clojure REPL (e.g. clojure-mcp)
-    ;; can hot-reload the compiler in-process: (require 'cljd.compiler :reload)
-    ;; updates every function while preserving the symbol table (compiler/nses is
-    ;; defonce); then touch a .cljd file and the watcher recompiles with the new
-    ;; compiler + device hot-reloads. Skips the ~60s relaunch for compiler edits.
-    ;; Port written to .nrepl-port-jvm (kept separate from the device .nrepl-port).
+    ;; JVM nREPL for in-process compiler reload; port in .nrepl-port-jvm, not the device's .nrepl-port
     (when (or watch flutter)
       (try
         (let [port (:port ((requiring-resolve 'nrepl.server/start-server) :port 0))]
@@ -484,9 +468,7 @@
               dirty-nses (volatile! #{})
               *compiler-state (atom {:recompile-count 0
                                      :restart-count 0})
-              ;; set once the VM-Service REPL connects (below): a fn that pushes a reload/compile
-              ;; failure onto the DEVICE's error system, so a broken edit shows inline + turns the
-              ;; toolbar handle amber, instead of silently keeping the old code and hiding in build.log.
+              ;; set once the VM-Service REPL connects: reports compile failures on the device
               *reload-error-sink (atom nil)
               ;; path->fragile-binding-signature baseline, for restart-needed advisories
               binding-sigs (atom {})
@@ -510,8 +492,7 @@
                           (try (sink (errors/format-compile e)) (catch Throwable _ nil)))
                         false)))))
               compilation-success (compile-nses namespaces)]
-          ;; seed binding baselines from what's on disk at launch, so the first
-          ;; shape-changing edit (not the second) triggers the restart advisory.
+          ;; seed baselines so the first shape-changing edit warns
           (doseq [^java.io.File d dirs
                   ^java.io.File f (file-seq d)
                   :when (and (.isFile f) (.endsWith (.getName f) ".cljd"))]
@@ -559,17 +540,14 @@
                         trigger-reload (fn ([] (.put q {:kind :reload}))
                                          ([done] (.put q {:kind :reload :done done})))
                         vm-uri-p (promise)   ; resolves with the app's VM-Service ws URI
-                        ;; (restart!) op → write "R" to flutter (same as typing R at the console).
-                        ;; The nREPL server drives replay itself off the device's cljd.booted event.
+                        ;; (restart!) op: same as typing R; replay is driven by the device's cljd.booted event, not here
                         trigger-restart (fn [] (when flutter-stdin
                                                  (locking flutter-stdin
                                                    (doto flutter-stdin (.write "R") .flush))))]
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
                       (daemon
-                        ;; forwards terminal stdin (r/R/etc) to flutter. read-line
-                        ;; returns nil at EOF (non-interactive stdin, e.g. backgrounded
-                        ;; or socket-driven); writing nil NPE'd and killed this thread.
+                        ;; read-line is nil at EOF (non-interactive stdin); writing nil would NPE
                         (loop []
                           (when-some [s (read-line)]
                             (locking flutter-stdin
@@ -592,13 +570,7 @@
                             (recur)))
                         (.put q {:kind :eof}))
 
-                      ;; opt-in end-to-end self-test of the VM-Service eval path
-                      ;; (CLJD_VMREPL_SELFTEST=1). Runs in this bootstrapped compiler
-                      ;; process, so form->dart-expr resolves real symbols.
-                      ;; VM-Service REPL: with CLJD_VMREPL, start an nREPL front backed
-                      ;; by evaluate/reloadSources; with CLJD_VMREPL_SELFTEST, just eval a
-                      ;; couple forms and print. Capture the compiler context here — dynamic
-                      ;; bindings don't cross into the daemon/nrepl threads.
+                      ;; capture the compiler context here: dynamic bindings don't cross into daemon threads
                       (when (or (System/getenv "CLJD_VMREPL") (System/getenv "CLJD_VMREPL_SELFTEST"))
                         (let [analyzer compiler/analyzer-info
                               dartv compiler/*dart-version*]
@@ -649,24 +621,20 @@
                                         (ef "defn"    '(defn kora-self-test-sq [n] (* n n)))
                                         (raw "call-sq" "lcoc_core.kora_self_test_sq.$_invoke$1(7)")))
                                     (if (System/getenv "CLJD_VMREPL")
-                                      ;; inject Future helpers into cljd.core so the eval path can
-                                      ;; await Futures (box + dart/is? predicate). Gate :await? on it.
+                                      ;; inject Future helpers into cljd.core; gates :await?
                                       (let [await-ok
                                             (try
                                               (:success
                                                (repl-eval/eval-form client iso
                                                  '(do
                                                     (def +cljd-repl-fbox+ (atom nil))
-                                                    ;; *1/*2/*3 history holders (plain vars — dynamic
-                                                    ;; *1's set! can't persist across evaluates).
+                                                    ;; *1/*2/*3: plain vars, a dynamic's set! doesn't persist across evaluates
                                                     (def +cljd-repl-h1+ nil)
                                                     (def +cljd-repl-h2+ nil)
                                                     (def +cljd-repl-h3+ nil)
-                                                    ;; *e: the last thrown Dart error object (bound by
-                                                    ;; the eval wrapper's catch). Read via the *e rewrite.
+                                                    ;; *e: last error, set by the eval wrapper's catch
                                                     (def +cljd-repl-e+ nil)
-                                                    ;; *env: the picked widget's lexical scope map,
-                                                    ;; loaded by (picked). Read via the *env rewrite.
+                                                    ;; *env: picked widget's lexical scope, loaded by (picked)
                                                     (def +cljd-repl-env+ nil)
                                                     (defn +cljd-repl-remember [v]
                                                       (set! +cljd-repl-h3+ +cljd-repl-h2+)
@@ -683,19 +651,10 @@
                                                  {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
                                               (catch Throwable e
                                                 (println "[VMREPL] async init failed:" (.getMessage e)) false))
-                                            ;; inject the widget-picker helper into cljd.flutter (where the
-                                            ;; HUD machinery resolves). Only works in a debug build whose
-                                            ;; root went through f/run (repl-hud + repl-points present).
-                                            ;; Picker availability probe. The picker is now ONE store:
-                                            ;; the HUD's +cljd-picks+ vector + arm! (in cljd.flutter,
-                                            ;; present when the root went through f/run in a debug build).
-                                            ;; The REPL's (pick!)/(picked)/(picks-do) read that same store —
-                                            ;; no separate +cljd-repl-picked+/+cljd-repl-pick! system anymore.
+                                            ;; picker exists only in a debug build whose root went through f/run
                                             pick-ok
                                             (try
-                                              ;; arm! is an EXPRESSION → eval path returns {:value …}
-                                              ;; (no :success — that's only on the reload path). Picker
-                                              ;; is available iff the symbol resolves without error.
+                                              ;; expression eval returns {:value …}, not :success
                                               (let [r (binding [compiler/*current-ns* 'cljd.flutter]
                                                         (repl-eval/eval-form client iso
                                                           'cljd.flutter/arm!
@@ -713,12 +672,7 @@
                                                       :await? (boolean await-ok)
                                                       :pick? (boolean pick-ok)
                                                       :remember? (boolean await-ok)})]
-                                        ;; heartbeat: ping the device ~1/s so its toolbar shows a live
-                                        ;; connection dot; when this process dies or the VM detaches,
-                                        ;; pings stop and the device watchdog flips it to disconnected.
-                                        ;; Re-resolve the isolate each tick — a hot restart spins a NEW
-                                        ;; isolate, and pinging the dead launch-time one silently fails,
-                                        ;; falsely flipping the dot to disconnected even though eval works.
+                                        ;; heartbeat; re-resolve the isolate each tick, hot restart spawns a new one
                                         (daemon
                                           (loop []
                                             (try (when-some [i (vmservice/main-isolate-id client)]
@@ -726,9 +680,7 @@
                                                  (catch Throwable _ nil))
                                             (Thread/sleep 1000)
                                             (recur)))
-                                        ;; reload-legibility: a watch-compile failure now shows on the
-                                        ;; device (report-error! "reload") — inline + amber handle — via
-                                        ;; the still-running old code (the failed compile left it intact).
+                                        ;; report watch-compile failures on the device
                                         (let [rctx (repl-eval/context {:client client :iso-id iso
                                                                        :analyzer analyzer :dart-version dartv})]
                                           (reset! *reload-error-sink
@@ -755,8 +707,7 @@
                                   (doto flutter-stdin
                                     (.write "r")
                                     .flush))
-                                ;; keep pending-done armed: it is delivered when the
-                                ;; reload reports back as completed/failed below.
+                                ;; keep pending-done armed until the reload completes or fails
                                 (recur :idle false pending-done))
 
                               (= :restarting state)
@@ -767,12 +718,8 @@
                               :else
                               (let [{:keys [kind line done]} (.take q)
                                     line (some-> line smap-line)
-                                    ;; repl-hud prints "[* RDY)_" once the app root mounts;
-                                    ;; it marks the end of a hot restart (see :waiting-end-of-restart).
+                                    ;; repl-hud prints "[* RDY)_" once the root mounts: end of hot restart
                                     is-ready-message (some-> line (.contains "[* RDY)"))]
-                                ;; flutter's own stdout (build/reload messages, app println —
-                                ;; the latter also reaches the nREPL via VM-Service streams)
-                                ;; just echoes to the build console now; no socket routing.
                                 (when (and line
                                            (not= :reload-failed state)
                                            (not is-ready-message))
@@ -795,11 +742,7 @@
                                             state)
                                           :reloading
                                           (cond
-                                            ;; matches both "Reloaded N of M libraries in …"
-                                            ;; and the no-change "Reloaded 0 libraries in …".
-                                            ;; The old regex required "of M", so a no-change
-                                            ;; reload left the daemon stuck in :reloading and
-                                            ;; every later reload silently never fired.
+                                            ;; must also match the no-change "Reloaded 0 libraries in …"
                                             (re-matches #"Reloaded .+ libraries in .+." line) :idle
                                             (= "Unimplemented handling of missing static target" line) :reload-failed)
                                           :reload-failed
@@ -813,9 +756,7 @@
                                             :restarting)
                                           :waiting-end-of-restart
                                           (when is-ready-message :idle))
-                                        ;; signal the reload waiter (eval-form's promise):
-                                        ;; a reload completed when we leave a reload state
-                                        ;; for :idle; it failed when it went :reload-failed.
+                                        ;; signal eval-form's reload waiter
                                         reload-done? (and (not= state :idle)
                                                           (= (or state' state) :idle))
                                         reload-fail? (= state' :reload-failed)

@@ -3059,8 +3059,7 @@
   [x] (.& 0xFFFFFFFF x))
 
 (defn ^int i32
-  ;; Reinterpret the low 32 bits as a signed int32 (in 64-bit Dart int).
-  ;; Inverse of u32. Use for JVM-compatible signed-int32 arithmetic shifts.
+  ;; low 32 bits as a signed int32; inverse of u32
   {:inline (fn [n] `(let [n# ~n] (if (.>= n# 0x80000000) (.- n# 0x100000000) n#)))
    :inline-arities #{1}}
   [^int n] (if (>= n 0x80000000) (- n 0x100000000) n))
@@ -7724,8 +7723,7 @@
         :else ""))
 
 (defn- ^String -fmt-pad
-  "Attach sign, then pad body to width honoring '-' (left) and '0' (zero, kept
-  between sign and digits) flags."
+  "Prepends sign, then pads to width per the '-' and '0' flags."
   [^String sign ^String body ^String flags width]
   (let [s (str sign body)]
     (if (or (nil? width) (<= ^int width (.-length s)))
@@ -7739,21 +7737,9 @@
   #"%(?:(\d+)\$)?([-+ 0,#]*)(\d+)?(?:\.(\d+))?([a-zA-Z%])")
 
 (defn ^String format
-  "Formats args into a string using a java.util.Formatter-style pattern.
-  Output matches java.util.Formatter (what clojure.core/format delegates to)
-  for the supported conversions.
-
-  Supported conversions: %s %S %d %f %e %E %x %X %o %c %b %B %n %%
-  Flags: '-' left-justify, '0' zero-pad, '+' always show sign, ' ' leading
-  space for positives, ',' digit grouping (%d). Width and .precision are
-  honored (precision truncates %s and sets fraction digits for %f/%e).
-
-  Deliberate deviations from JVM (documented, not accidental):
-  - %d coerces real args by truncation; JVM throws IllegalFormatConversion.
-  - %c accepts any int (Dart has one int type); JVM %c rejects Long.
-  - %x/%o print a leading '-' for negatives; JVM prints two's complement.
-  - %g/%G, '(' flag and argument indexing (\"%2$s\") are unsupported and pass
-    through literally rather than being applied. Use str + explicit helpers."
+  "Formats args per a java.util.Formatter-style pattern: %s %S %d %f %e %E %x %X %o %c
+  %b %B %n %%, n$ indexing, flags - + space 0 , plus width and precision. Unlike the JVM it
+  never throws: %d/%x/%o truncate and read non-numbers as 0, %x/%o print '-' negatives, %g prints literally."
   [^String fmt & args]
   (let [args (vec args)
         ai (volatile! 0)]
@@ -7808,8 +7794,7 @@
                     (= lc "e")
                     (let [v (if (dart/is? arg num) (.toDouble ^num arg) 0.0)
                           neg? (< v 0)
-                          ;; Java pads the exponent to >= 2 digits (e+03); Dart
-                          ;; emits minimal digits (e+3) — pad to match Formatter.
+                          ;; Java pads the exponent to two digits (e+03), Dart doesn't
                           body (.replaceAllMapped
                                  (.toStringAsExponential (.abs ^double v) (or prec 6))
                                  #"e([+-])(\d)$"

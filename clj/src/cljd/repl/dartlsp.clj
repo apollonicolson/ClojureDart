@@ -1,11 +1,6 @@
 (ns cljd.repl.dartlsp
-  "A backend to the Dart Analysis Server (`dart language-server`, LSP over stdio), so the
-   repl's `info`/go-to-def can answer for Dart INTEROP symbols — the authority on Dart/Flutter
-   elements, which cljd's compile-time analyzer (type-only) and @nses (cljd defs only) can't.
-
-   Lazy: the server (a ~6s first-index subprocess) starts on the first `find-element` and is
-   reused. One query at a time (the repl's info op is serial); a synchronous read skips
-   interleaved notifications until the matching response id. Structured — no string-matching."
+  "Dart Analysis Server (LSP over stdio) lookups for Dart interop symbols.
+   Started lazily on first find-element and reused; one query at a time."
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.string :as str])
@@ -65,10 +60,7 @@
 (defn- uri->file [^String uri] (if (.startsWith uri "file://") (subs uri 7) uri))
 
 (defn- doc-comment
-  "A Dart element's analyzer code-range starts at its doc comment when one is present
-   (verified: workspace/symbol's range.start for a documented class points at the first
-   `///` line). Read the contiguous `///` block at FILE line LINE0 (0-based) → the doc
-   text with markers stripped, or nil. Deterministic; no second LSP round-trip."
+  "The `///` block at FILE line LINE0 (0-based; LSP ranges start at the doc comment), or nil."
   [file line0]
   (try
     (with-open [r (io/reader file)]
@@ -81,17 +73,15 @@
     (catch Throwable _ nil)))
 
 (defn find-element
-  "Look up a Dart element by NAME in the analysis server; return the best-matching
-   declaration {:name :file :line :kind :doc} (0-based LSP line +1; :doc = the element's
-   Dart/Flutter doc-comment read from source at the declaration, or nil), or nil.
-   PROJECT-ROOT is the dir the server indexes (has the Flutter/dart deps)."
+  "Look up Dart element NAME via the analysis server rooted at PROJECT-ROOT.
+   Returns {:name :file :line (1-based) :kind :doc} for the best match, or nil."
   [project-root name]
   (try
     (let [{:keys [out in id]} (ensure! project-root)]
       (send-msg out {:jsonrpc "2.0" :id (swap! id inc) :method "workspace/symbol"
                      :params {:query name}})
       (when-let [syms (:result (await-id in @id))]
-        ;; prefer an exact-name class/constructor over partial matches
+        ;; prefer an exact-name match
         (let [exact (filter #(= (:name %) name) syms)
               best  (first (concat exact syms))]
           (when best
