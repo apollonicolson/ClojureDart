@@ -571,7 +571,7 @@
                         (.put q {:kind :eof}))
 
                       ;; capture the compiler context here: dynamic bindings don't cross into daemon threads
-                      (when (or (System/getenv "CLJD_VMREPL") (System/getenv "CLJD_VMREPL_SELFTEST"))
+                      (when (System/getenv "CLJD_VMREPL")
                         (let [analyzer compiler/analyzer-info
                               dartv compiler/*dart-version*]
                           (daemon
@@ -587,113 +587,78 @@
                                   (let [client (vmservice/connect uri)
                                         iso (vmservice/main-isolate-id client)
                                         _ (vmservice/listen-streams! client)]
-                                    (when (System/getenv "CLJD_VMREPL_SELFTEST")
-                                      (println "\n[VMREPL self-test]" uri "isolate" iso)
-                                      (let [lib (vmservice/library-id client iso "cljd/core.dart")
-                                            try1 (fn [thunk] (try (thunk)
-                                                               (catch Throwable e
-                                                                 (println "    !!" (.getMessage e)
-                                                                   (pr-str (ex-data e))))))
-                                            raw (fn [label expr]
-                                                  (try1 #(let [r (vmservice/evaluate client iso lib expr)]
-                                                           (println "  RAW" label expr "=>"
-                                                             (:kind r) (:valueAsString r) (:message r)))))
-                                            ef  (fn [label form]
-                                                  (try1 #(do
-                                                           (println "  DART" label (pr-str form) "->"
-                                                             (compiler/form->dart-expr form))
-                                                           (println "  FORM" label "=>"
-                                                             (pr-str (repl-eval/eval-form client iso form
-                                                               {:ns-lib-uri "cljd/core.dart"
-                                                                :trigger-reload trigger-reload}))))))]
-                                        ;; (1) settle what `evaluate` accepts: arrow vs block IIFE
-                                        (raw "arrow" "(() => 1 + 2)()")
-                                        (raw "block" "(() { return 1 + 2; })()")
-                                        ;; (2) the keystone: form->dart-expr now wraps in an IIFE,
-                                        ;; so lifting literals (vec/map) should evaluate cleanly
-                                        (ef "expr"    '(+ 6 7))
-                                        (ef "fn-coll" '(pr-str (vec (range 3))))
-                                        (ef "vec-lit" [1 2 3])
-                                        (ef "map-lit" {:a 1 :b 2})
-                                        (ef "set-lit" #{:x :y})
-                                        (ef "nested"  {:nums [1 2 3] :pair {:a 1}})
-                                        ;; (3) reload path via Flutter's hot reload
-                                        (ef "defn"    '(defn kora-self-test-sq [n] (* n n)))
-                                        (raw "call-sq" "lcoc_core.kora_self_test_sq.$_invoke$1(7)")))
-                                    (if (System/getenv "CLJD_VMREPL")
-                                      ;; inject Future helpers into cljd.core; gates :await?
-                                      (let [await-ok
-                                            (try
-                                              (:success
-                                               (repl-eval/eval-form client iso
-                                                 '(do
-                                                    (def +cljd-repl-fbox+ (atom nil))
-                                                    ;; *1/*2/*3: plain vars, a dynamic's set! doesn't persist across evaluates
-                                                    (def +cljd-repl-h1+ nil)
-                                                    (def +cljd-repl-h2+ nil)
-                                                    (def +cljd-repl-h3+ nil)
-                                                    ;; *e: last error, set by the eval wrapper's catch
-                                                    (def +cljd-repl-e+ nil)
-                                                    ;; *env: picked widget's lexical scope, loaded by (picked)
-                                                    (def +cljd-repl-env+ nil)
-                                                    (defn +cljd-repl-remember [v]
-                                                      (set! +cljd-repl-h3+ +cljd-repl-h2+)
-                                                      (set! +cljd-repl-h2+ +cljd-repl-h1+)
-                                                      (set! +cljd-repl-h1+ v) v)
-                                                    (defn +cljd-repl-handle [v]
-                                                      (if (dart/is? v dart-async/Future)
-                                                        (do (reset! +cljd-repl-fbox+ nil)
-                                                            (-> v
-                                                                (.then (fn [x] (+cljd-repl-remember x) (reset! +cljd-repl-fbox+ (pr-str x))))
-                                                                (.catchError (fn [e] (set! +cljd-repl-e+ e) (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
-                                                            "__cljd_future_pending__")
-                                                        (do (+cljd-repl-remember v) (pr-str v)))))
-                                                 {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
-                                              (catch Throwable e
-                                                (println "[VMREPL] async init failed:" (.getMessage e)) false))
-                                            ;; picker exists only in a debug build whose root went through f/run
-                                            pick-ok
-                                            (try
-                                              ;; expression eval returns {:value …}, not :success
-                                              (let [r (binding [compiler/*current-ns* 'cljd.flutter]
-                                                        (repl-eval/eval-form client iso
-                                                          'cljd.flutter/arm!
-                                                          {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload}))]
-                                                (boolean (and r (not (:error r)))))
-                                              (catch Throwable e
-                                                (println "[VMREPL] pick probe failed:" (.getMessage e)) false))
-                                            server (repl-nrepl/start!
-                                                     {:client client :iso-id iso :analyzer analyzer
-                                                      :dart-version dartv :*current-ns (atom 'cljd.core)
-                                                      :ns-lib-uri "cljd/core.dart" :port 0
-                                                      :trigger-reload trigger-reload
-                                                      :trigger-restart trigger-restart
-                                                      :source-dirs dirs   ; for (edit-back): cljd loc → src file
-                                                      :await? (boolean await-ok)
-                                                      :pick? (boolean pick-ok)
-                                                      :remember? (boolean await-ok)})]
-                                        ;; heartbeat; re-resolve the isolate each tick, hot restart spawns a new one
-                                        (daemon
-                                          (loop []
-                                            (try (when-some [i (vmservice/main-isolate-id client)]
-                                                   (vmservice/call-ext client i "ext.cljd.ping" {}))
-                                                 (catch Throwable _ nil))
-                                            (Thread/sleep 1000)
-                                            (recur)))
-                                        ;; report watch-compile failures on the device
-                                        (let [rctx (repl-eval/context {:client client :iso-id iso
-                                                                       :analyzer analyzer :dart-version dartv})]
-                                          (reset! *reload-error-sink
-                                            (fn [msg]
-                                              (try (repl-eval/eval! rctx
-                                                     (list 'cljd.flutter/report-error! "reload" msg nil)
-                                                     {:ns 'cljd.flutter :ns-lib-uri "cljd/flutter.dart"})
-                                                   (catch Throwable _ nil)))))
-                                        (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
-                                          (str "(await " (if await-ok "on" "off")
-                                               ", pick " (if pick-ok "on" "off")
-                                               ", *1 " (if await-ok "on" "off") ")")))
-                                      (vmservice/close client)))
+                                    ;; inject Future helpers into cljd.core; gates :await?
+                                    (let [await-ok
+                                          (try
+                                            (:success
+                                             (repl-eval/eval-form client iso
+                                               '(do
+                                                  (def +cljd-repl-fbox+ (atom nil))
+                                                  ;; *1/*2/*3: plain vars, a dynamic's set! doesn't persist across evaluates
+                                                  (def +cljd-repl-h1+ nil)
+                                                  (def +cljd-repl-h2+ nil)
+                                                  (def +cljd-repl-h3+ nil)
+                                                  ;; *e: last error, set by the eval wrapper's catch
+                                                  (def +cljd-repl-e+ nil)
+                                                  ;; *env: picked widget's lexical scope, loaded by (picked)
+                                                  (def +cljd-repl-env+ nil)
+                                                  (defn +cljd-repl-remember [v]
+                                                    (set! +cljd-repl-h3+ +cljd-repl-h2+)
+                                                    (set! +cljd-repl-h2+ +cljd-repl-h1+)
+                                                    (set! +cljd-repl-h1+ v) v)
+                                                  (defn +cljd-repl-handle [v]
+                                                    (if (dart/is? v dart-async/Future)
+                                                      (do (reset! +cljd-repl-fbox+ nil)
+                                                          (-> v
+                                                              (.then (fn [x] (+cljd-repl-remember x) (reset! +cljd-repl-fbox+ (pr-str x))))
+                                                              (.catchError (fn [e] (set! +cljd-repl-e+ e) (reset! +cljd-repl-fbox+ (str "__CLJD_ERR__ " e)))))
+                                                          "__cljd_future_pending__")
+                                                      (do (+cljd-repl-remember v) (pr-str v)))))
+                                               {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
+                                            (catch Throwable e
+                                              (println "[VMREPL] async init failed:" (.getMessage e)) false))
+                                          ;; picker exists only in a debug build whose root went through f/run
+                                          pick-ok
+                                          (try
+                                            ;; expression eval returns {:value …}, not :success
+                                            (let [r (binding [compiler/*current-ns* 'cljd.flutter]
+                                                      (repl-eval/eval-form client iso
+                                                        'cljd.flutter/arm!
+                                                        {:ns-lib-uri "cljd/flutter.dart" :trigger-reload trigger-reload}))]
+                                              (boolean (and r (not (:error r)))))
+                                            (catch Throwable e
+                                              (println "[VMREPL] pick probe failed:" (.getMessage e)) false))
+                                          server (repl-nrepl/start!
+                                                   {:client client :iso-id iso :analyzer analyzer
+                                                    :dart-version dartv :*current-ns (atom 'cljd.core)
+                                                    :ns-lib-uri "cljd/core.dart" :port 0
+                                                    :trigger-reload trigger-reload
+                                                    :trigger-restart trigger-restart
+                                                    :source-dirs dirs   ; for (edit-back): cljd loc → src file
+                                                    :await? (boolean await-ok)
+                                                    :pick? (boolean pick-ok)
+                                                    :remember? (boolean await-ok)})]
+                                      ;; heartbeat; re-resolve the isolate each tick, hot restart spawns a new one
+                                      (daemon
+                                        (loop []
+                                          (try (when-some [i (vmservice/main-isolate-id client)]
+                                                 (vmservice/call-ext client i "ext.cljd.ping" {}))
+                                               (catch Throwable _ nil))
+                                          (Thread/sleep 1000)
+                                          (recur)))
+                                      ;; report watch-compile failures on the device
+                                      (let [rctx (repl-eval/context {:client client :iso-id iso
+                                                                     :analyzer analyzer :dart-version dartv})]
+                                        (reset! *reload-error-sink
+                                          (fn [msg]
+                                            (try (repl-eval/eval! rctx
+                                                   (list 'cljd.flutter/report-error! "reload" msg nil)
+                                                   {:ns 'cljd.flutter :ns-lib-uri "cljd/flutter.dart"})
+                                                 (catch Throwable _ nil)))))
+                                      (println (title "🔌 cljd VM-Service nREPL") "on port" (:port server)
+                                        (str "(await " (if await-ok "on" "off")
+                                             ", pick " (if pick-ok "on" "off")
+                                             ", *1 " (if await-ok "on" "off") ")"))))
                                   (catch Throwable e
                                     (println "[VMREPL] error:" (.getMessage e)))))))))
 

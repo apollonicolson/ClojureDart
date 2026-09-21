@@ -48,7 +48,7 @@
         st {:proc proc :out out :in in :id id}]
     (send-msg out {:jsonrpc "2.0" :id (swap! id inc) :method "initialize"
                    :params {:processId nil :rootUri root-uri :capabilities {}
-                            :workspaceFolders [{:uri root-uri :name "kora"}]}})
+                            :workspaceFolders [{:uri root-uri :name (.getName (io/file project-root))}]}})
     (await-id in 1)
     (send-msg out {:jsonrpc "2.0" :method "initialized" :params {}})
     (Thread/sleep 6000)   ; first-index settle

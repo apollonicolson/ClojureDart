@@ -1942,9 +1942,9 @@
         ktype (or (resolve-type ktag (:type-vars env)) dc-dynamic)
         vtype (or (resolve-type vtag (:type-vars env)) dc-dynamic)
         map-type (emit-type (vary-meta 'dart:core/Map assoc :type-params [ktag vtag]) env)
-        entry-type (emit-type (vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag]) env)
-        entry-list-tag (vary-meta 'dart:core/List assoc
-                         :type-params [(vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag])])
+        entry-tag (vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag])
+        entry-type (emit-type entry-tag env)
+        entry-list-tag (vary-meta 'dart:core/List assoc :type-params [entry-tag])
         ;; lift every key and value (typed) then re-pair into MapEntry(k, v)
         [bindings kvs] (lift-args
                          (mapcat (fn [[k v]] [[nil (emit quoted k env) ktype]

@@ -122,7 +122,7 @@
   "Set of 'package-uri:line' that executed, aggregated over our scripts one getSourceReport at a time."
   [client iso-id]
   (let [scripts (->> (:scripts (try (vm/rpc client "getScripts" {:isolateId iso-id}) (catch Throwable _ nil)))
-                     (filter (fn [s] (.contains ^String (str (:uri s)) "cljd-out/kora"))))]
+                     (filter (fn [s] (let [u (str (:uri s))] (and (str/includes? u "cljd-out/") (not (str/includes? u "cljd-out/cljd/")))))))]
     (into #{}
       (for [s scripts
             :let [rep (try (vm/rpc client "getSourceReport"
