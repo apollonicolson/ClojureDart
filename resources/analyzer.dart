@@ -469,6 +469,12 @@ Future<Map<String, dynamic>?> retrieveElement(
         res[":element-name"] = "\"${element}\"";
         res[":toplevel"] = true;
         res[":canon-qname-placeholder"] = true;
+        final unit = e.thisOrAncestorOfType<CompilationUnitElement>();
+        if (e.source != null) res[":file"] = jsonEncode(e.source!.fullName);
+        if (unit != null && e.nameOffset >= 0)
+          res[":line"] = unit.lineInfo.getLocation(e.nameOffset).lineNumber;
+        if (e.documentationComment != null)
+          res[":doc"] = jsonEncode(e.documentationComment);
         return res;
       }
     }

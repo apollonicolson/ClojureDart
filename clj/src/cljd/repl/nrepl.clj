@@ -7,8 +7,7 @@
             [cljd.compiler :as compiler]
             [cljd.repl.vmservice :as vm]
             [cljd.repl.eval :as repl-eval]
-            [cljd.repl.errors :as errors]
-            [cljd.repl.dartlsp :as dartlsp])
+            [cljd.repl.errors :as errors])
   (:import [java.io PushbackReader StringReader]
            [java.util UUID]))
 
@@ -37,6 +36,18 @@
 
 (defn- ns-exists? [ns-sym]
   (boolean (and (symbol? ns-sym) (get @compiler/nses ns-sym))))
+
+(defn- dart-info
+  "{:name :file :line :doc} for SYM when it resolves to a Dart element in NS, via the compiler's analyzer."
+  [ctx ns sym]
+  (repl-eval/with-compiler-context ctx ns
+    (let [[kind {:keys [lib element-name]}] (try (compiler/resolve-symbol sym {}) (catch Throwable _ nil))]
+      (when (and (= :dart kind) lib element-name)
+        (when-some [a (compiler/analyzer-info lib element-name)]
+          {:name element-name :file (:file a) :line (:line a)
+           :doc (some->> (:doc a) str/split-lines
+                  (map #(str/replace % #"^\s*(///?|/\*\*|\*/|\*) ?" ""))
+                  (str/join "\n") str/trim)})))))
 
 (defn- sym-info
   "Look up SYM in @nses relative to CUR-NS, falling back to cljd.core; nil if absent."
@@ -452,11 +463,11 @@
                             :status ["done"]}
                      file (assoc :file (.getCanonicalPath (java.io.File. ^String file)))
                      line (assoc :line line)))
-            (if-let [d (dartlsp/find-element (System/getProperty "user.dir") sym)]
-              (send! {:name (:name d) :ns "dart" :file (:file d) :line (:line d)
-                      :arglists-str ""
-                      :doc (or (:doc d) (str "Dart element (kind " (:kind d) ")"))
-                      :status ["done"]})
+            (if-let [d (dart-info ctx (msg-ns msg *current-ns) (symbol sym))]
+              (send! (cond-> {:name (:name d) :ns "dart" :arglists-str "" :doc (or (:doc d) "")
+                              :status ["done"]}
+                       (:file d) (assoc :file (:file d))
+                       (:line d) (assoc :line (:line d))))
               (send! {:status ["done" "no-info"]}))))
         "eldoc"
         (let [i (sym-info @compiler/nses (msg-ns msg *current-ns) (symbol (msg-sym msg)))]
