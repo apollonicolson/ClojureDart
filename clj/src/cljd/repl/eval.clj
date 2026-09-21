@@ -62,7 +62,6 @@
         expr (if (and remember? (not await?))
                (list 'cljd.core/+cljd-repl-remember expr)
                expr)
-        ;; capture *e on both sync and await paths (await? is on by default)
         expr (if remember? (capturing-e expr) expr)
         dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
         lib  (vm/library-id client iso-id ns-lib-uri)
@@ -103,8 +102,8 @@
     (emits-new-toplevel? form)
     (do
       (compiler/recompile-form form recompile-count repltag)
+      ;; under flutter, reloadSources can't take .dart: use flutter's hot reload, which delivers true/false to done
       (if trigger-reload
-        ;; Flutter needs its own hot reload (dart->kernel first); trigger-reload delivers true/false to done
         (let [done (promise)
               _    (trigger-reload done)
               ok   (deref done reload-timeout-ms ::timeout)]
@@ -116,7 +115,7 @@
     :else
     (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms remember?)))
 
-;; host->device crossings that compile must bind the compiler dynamic vars; a bare `future` doesn't inherit them.
+;; a bare `future` doesn't inherit the compiler dynamic vars; bind them via with-compiler-context
 
 (defn context
   "Bundle the vmservice client, isolate, analyzer, dart-version and default ns/lib from CFG.

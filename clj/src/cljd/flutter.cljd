@@ -1309,10 +1309,8 @@
             (reset! false))
           (reset! (:*active-state m) state))))))
 
-;; Approximate device screen corner radius (logical px) for clipping picker highlights.
 (def ^:private +screen-corner-radius+ 42.0)
 
-;; Suppresses debug-paint flags while painting the tools; restored post-frame so the app keeps its guides.
 (deftype ^:private NoDebugPaintRender []
   :extends (rendering/RenderProxyBox)
   (paint [this context offset]
@@ -1340,35 +1338,30 @@
   :extends (widgets/SingleChildRenderObjectWidget .child inner)
   (createRenderObject [_ _ctx] (NoDebugPaintRender)))
 
-;; (reset! cljd.flutter/+cljd-toolbar-hidden+ true) hides the dev toolbar.
 (defonce +cljd-toolbar-hidden+ (atom false))
 
-;; Picker armed flag, toggled by the toolbar pick button and the REPL.
 (defonce +cljd-armed+ (atom false))
 
-;; Picked widgets: a vector of pick maps, toggled by tap (dedup by rect).
 (defonce +cljd-picks+ (atom []))
 
-;; Host pings ext.cljd.ping ~1/s; a 3s watchdog resets this to false when pings stop.
 (defonce +cljd-connected+ (atom false))
 (defonce ^:private +cljd-conn-timer+ (atom nil))
 
-;; On-device error store; identical consecutive errors coalesce into one entry with :count.
 (defonce +cljd-errors-local+ (atom []))
-(defonce ^:private +cljd-error-expanded+ (atom nil))   ; index of the expanded error row, or nil
+(defonce ^:private +cljd-error-expanded+ (atom nil))
 
-;; Changes in one event-loop turn flush as one cljd.tx on a microtask (post-frame may never pump).
+;; flushed on a microtask, not post-frame: a post-frame callback may never pump
 (defonce ^:private +cljd-recording?+ (atom false))
-(defonce ^:private +cljd-tx-buffer+ (atom {}))            ; id → value, pending this turn
+(defonce ^:private +cljd-tx-buffer+ (atom {}))
 (defonce ^:private +cljd-tx-flush-scheduled+ (atom false))
-(defonce ^:private +cljd-replaying+ (atom false))         ; true while a host write-state applies (no echo)
-(defonce ^:private +cljd-tx-cause+ (atom nil))            ; optional label attached to the next tx
+(defonce ^:private +cljd-replaying+ (atom false))  ; true while a host write-state applies: suppresses the echo
+(defonce ^:private +cljd-tx-cause+ (atom nil))
 
 (def ^:private +pick-colors+
   [0xFF00E676 0xFF40C4FF 0xFFFFAB40 0xFFFF4081 0xFFB388FF 0xFFFFEB3B])
 (defn- pick-color [i] (widgets/Color (nth +pick-colors+ (mod i (count +pick-colors+)))))
-(def ^:private +go+ (widgets/Color 0xFF00E676))    ; primary green accent (repeated)
-(def ^:private +cyan+ (widgets/Color 0xFF40C4FF))  ; pick / hover accent (repeated)
+(def ^:private +go+ (widgets/Color 0xFF00E676))
+(def ^:private +cyan+ (widgets/Color 0xFF40C4FF))
 (defn- rect-key [^widgets/Rect r] [(.-left r) (.-top r) (.-right r) (.-bottom r)])
 
 (defn- device-metrics
@@ -1479,7 +1472,7 @@
   ([msg] (report-error! "runtime" msg nil))
   ([phase msg stack]
    (let [e {:phase (str phase) :message (str msg) :stack (str (or stack ""))}]
-     ;; deferred: called mid-build from FlutterError.onError, a sync swap! would setState during build
+     ;; deferred: called mid-build from FlutterError.onError; a sync swap! would setState during build
      (dart:async/scheduleMicrotask
        (fn []
          (swap! +cljd-errors-local+
@@ -1503,16 +1496,15 @@
       (fn [_method _params]
         (dart:async/Future.value
           (dev/ServiceExtensionResponse.result (picks->json)))))
-    ;; host pushes a resolved .cljd loc onto the pick matching "src" (its Dart wloc)
     (dev/registerExtension "ext.cljd.set-cljd"
       (fn [_method params]
         (let [src (get params "src") cljd (get params "cljd")
-              ^String tree (get params "tree")          ; "\n"-joined cljd locs, index-aligned to :ancestors
+              ^String tree (get params "tree")  ; index-aligned to :ancestors
               tcljds (when (and tree (seq tree)) (vec (.split tree "\n")))]
           (swap! +cljd-picks+
             (fn [ps] (mapv (fn [p]
                              (if (= (:src (:widget-loc p)) src)
-                               ;; :resolved? marks the round-trip done; :cljd nil = non-cljd Dart
+                               ;; :cljd nil = non-cljd Dart, still :resolved?
                                (assoc p :resolved? true :cljd (when (seq cljd) cljd)
                                       :ancestors (vec (map-indexed
                                                         (fn [i a]
@@ -1526,25 +1518,24 @@
       (fn [_method _params]
         (reset! +cljd-connected+ true)
         (when-some [^dart:async/Timer t @+cljd-conn-timer+] (.cancel t) nil)
+        ;; the host pings every 1s (build.clj heartbeat); this 3s watchdog must stay above that
         (reset! +cljd-conn-timer+
           (dart:async/Timer (Duration .seconds 3) (fn [] (reset! +cljd-connected+ false) nil)))
-        ;; re-arm so atoms of newly-mounted repl-points get watched
         (when @+cljd-recording?+ (arm-recording! true))
         (dart:async/Future.value (dev/ServiceExtensionResponse.result "{\"ok\":true}"))))
-    ;; chain onto FlutterError.onError, still calling the previous handler
     (let [prev foundation/FlutterError.onError]
       (set! foundation/FlutterError.onError
         (fn [^foundation/FlutterErrorDetails d]
           (report-error! "flutter" (str (.-exception d)) (str (.-stack d)))
           (when prev (prev d))
           nil)))
-    ;; uncaught async errors; false lets the platform default still run
+    ;; false lets the platform default handler still run
     (set! (.-onError dart:ui/PlatformDispatcher.instance)
       (fn [^Object e ^StackTrace s]
         (report-error! "async" (str e) (str s))
         false))
     (add-tap tap->host)
-    nil)                                ; registerExtension returns void
+    nil)
   nil)
 
 (defn- element-app-loc
@@ -1552,7 +1543,6 @@
   [^widgets/Element el]
   (try
     (when-some [^String j (inspector-node el false)]
-      ;; only EL's own node (before "children"), or a descendant's createdByLocalProject matches
       (let [ci (.indexOf j "\"children\"")
             own (if (neg? ci) j (subs j 0 ci))]
         (when-not (neg? (.indexOf own "\"createdByLocalProject\":true"))
@@ -1697,12 +1687,11 @@
         before (count @+cljd-picks+)
         after (swap! +cljd-picks+
                 (fn [ps] (if (some #(= (rect-key (:rect %)) k) ps)
-                           (vec (remove #(= (rect-key (:rect %)) k) ps))   ; toggle off
+                           (vec (remove #(= (rect-key (:rect %)) k) ps))
                            (conj ps pick))))]
     (when (> (count after) before) (notify-pick! (peek after)))
     nil))
 
-;; Tool toggles; debug-paint flags aren't reactive, so each reassembles. Each returns the new state.
 (defn- tools-reassemble! []
   ;; microtask: reassembling inside a pointer-event flush trips GestureBinding's assert(!locked)
   (dart:async/scheduleMicrotask
@@ -1812,7 +1801,6 @@
                  .style (widgets/TextStyle .color material/Colors.white38 .fontSize 11.0
                           .letterSpacing 0.6))]
           (if (seq rows)
-            ;; a row may carry an optional 3rd element = on-tap fn → the row becomes tappable
             (mapv (fn [[k v on-tap]]
                     (if on-tap
                       (widgets/GestureDetector .behavior widgets/HitTestBehavior.opaque
@@ -1821,7 +1809,6 @@
               rows)
             [(widgets/Text "  —" .style (widgets/TextStyle .color material/Colors.white24 .fontSize 12.0))]))))))
 
-;; ── Inspector: pick ──pick->sections──► data ──render-sections──► widgets ──
 
 (defn- prop-cljd-value
   "A property's value as cljd text: nil for defaults, strings quoted, else toString."
@@ -1852,15 +1839,15 @@
   "A pick as display data {:box :sections}: props as cljd named args, tree, scope."
   [p]
   (let [^widgets/Rect r (:rect p)
-        ctor (or (:name (:widget-loc p)) (:type p) "widget")           ; the widget, as a cljd constructor
-        props (mapv (fn [[n v]] [(str "." n) v])                 ; each prop as a cljd named arg
+        ctor (or (:name (:widget-loc p)) (:type p) "widget")
+        props (mapv (fn [[n v]] [(str "." n) v])
                     (some-> (:widget p) widget-props))]
     {:box (when r (str "▭ " (.round (.-width r)) "×" (.round (.-height r))
                        "  @ " (.round (.-left r)) "," (.round (.-top r))))
-     :sections [{:label (str "(" ctor)  :rows props}             ; cljd interop view of the widget
+     :sections [{:label (str "(" ctor)  :rows props}
                 {:label "TREE ↑ (tap→pick)"
                  :rows (mapv (fn [a] [(:type a) (or (:cljd a) (:src a))
-                                      ;; tap → pick it; guarded, the element may have unmounted
+                                      ;; guarded: the element may have unmounted
                                       (when-some [el (:el a)]
                                         (fn [] (try (pick-element! el) (catch Object _ nil)) nil))])
                              (:ancestors p))}
@@ -1906,7 +1893,6 @@
                           .decoration (widgets/BoxDecoration .color (pick-color i)
                                         .shape widgets/BoxShape.circle)))
                (widgets/SizedBox .width 8.0)
-               ;; tap the name/source to expand this pick's scope (env) below it
                (widgets/Expanded
                  .child
                  (widgets/GestureDetector
@@ -1989,7 +1975,6 @@
                             .color (widgets/Color 0x22FFFFFF))
                           (repl-hover-row hover)))))
 
-;; ── Errors tab — the SAME panel machinery pointed at the error store ─────────
 (def ^:private +phase-color+
   {"compile" 0xFFFFB300 "runtime" 0xFFFF5252 "flutter" 0xFFFF7043 "async" 0xFFAB47BC
    "reload" 0xFF29B6F6})
@@ -2073,7 +2058,6 @@
           (into []
             (remove nil?
               [(when (or (seq picks) (:type hover)) (repl-selections-column picks hover))
-               ;; divider only when both sections are present
                (when (and (seq errs) (or (seq picks) (:type hover)))
                  (widgets/Container .height 1.0 .margin (widgets/EdgeInsets.symmetric .vertical 8.0)
                    .color (widgets/Color 0x22FFFFFF)))
@@ -2083,7 +2067,7 @@
   "A draggable in-app debug toolbar (kDebugMode only). `*armed` is repl-hud's picker flag."
   [*armed]
   (letfn [(btn [k icon active? on-tap]
-            ;; keyed for ByValueKey tapping; on-tap fns reassemble themselves
+            ;; keyed for ByValueKey tapping
             (widgets/GestureDetector
               .key (widgets/ValueKey k)
               .onTap (fn [] (on-tap) nil)
@@ -2104,23 +2088,22 @@
               conn +cljd-connected+
               errs +cljd-errors-local+
               hidden +cljd-toolbar-hidden+]
-      ;; logical screen size (no MediaQuery above MaterialApp — read the FlutterView).
+      ;; no MediaQuery above MaterialApp: read the FlutterView
       :let [screen (let [m (device-metrics)] [(:w m) (:h m)])
             drag! (fn [^widgets/DragUpdateDetails d]
                     (swap! *pos (fn [^widgets/Offset o]
                                   (widgets/Offset (+ (.-dx o) (.-dx (.-delta d)))
                                                   (+ (.-dy o) (.-dy (.-delta d)))))))
-            ;; handle taps to collapse; its icon is the status light (link-down wins over errors)
             handle (widgets/GestureDetector
-                     .onTap (fn [] (swap! *collapsed not) nil)   ; :watch rebuilds; no reassemble
+                     .onTap (fn [] (swap! *collapsed not) nil)
                      .child (widgets/Padding
                               .padding (widgets/EdgeInsets.all 12.0)
                               .child (widgets/Icon
                                        (if collapsed material/Icons.developer_mode
                                            material/Icons.drag_indicator)
-                                       .color (cond (not conn) material/Colors.white54       ; link down
-                                                    (seq errs)  (widgets/Color 0xFFFFC107)    ; amber — errors
-                                                    :else       +go+)                          ; green — healthy
+                                       .color (cond (not conn) material/Colors.white54
+                                                    (seq errs)  (widgets/Color 0xFFFFC107)
+                                                    :else       +go+)
                                        .size 24.0)))
             ]
       (if hidden
@@ -2130,17 +2113,16 @@
          .child
          ;; Transform.translate, not EdgeInsets: EdgeInsets asserts non-negative insets
          (widgets/Transform.translate
-          ;; clamp at render so any :pos stays on-screen; -56 keeps the handle (44) + pad visible
           .offset (widgets/Offset
                     (.clamp (.-dx ^widgets/Offset pos) 12.0 (max 12.0 (- (nth screen 0) 56.0)))
                     (.clamp (.-dy ^widgets/Offset pos) 12.0 (max 12.0 (- (nth screen 1) 56.0))))
           .child
-          ;; above MaterialApp: own Directionality, Container+Icon (Material widgets need Theme)
+          ;; above MaterialApp: own Directionality; Material widgets need a Theme
           (NoDebugPaint
            (widgets/Directionality
             .textDirection widgets/TextDirection.ltr
             .child
-            ;; pan anywhere drags; the gesture arena still routes taps to buttons
+            ;; the gesture arena still routes taps to buttons
             (widgets/GestureDetector
              .onPanUpdate drag!
              .child
@@ -2158,15 +2140,12 @@
                     [(widgets/Row
                        .mainAxisSize widgets/MainAxisSize.min
                        .children
-                       ;; buttons project from data: handle (status light) + pick + +paint-tools+
                        (into [handle
                               (btn "cljd-tb-pick" material/Icons.highlight_alt @*armed
                                    (fn [] (arm! (not @*armed))))]
                          (mapv (fn [t] (btn (:key t) (:icon t) ((:active t)) (:toggle t))) +paint-tools+)))
-                     ;; self-watching → rebuilds on any pick change, no reassemble
                      (repl-panel)]))))))))))))
 
-;; Refine pick (tap+hold, scrub, release): nil | {:el :src :name :hit :finger}.
 (defonce ^:private +cljd-refine+ (atom nil))
 
 (defn- hit-element
@@ -2175,7 +2154,7 @@
   (let [result (rendering/BoxHitTestResult)]
     (-> ::app-root global-key ^widgets/Element (.-currentContext)
         ^rendering/RenderBox (.-renderObject) (.hitTest result .position pos))
-    (some (fn [^rendering/HitTestEntry {:flds [target]}]   ; :flds name = the field: .target
+    (some (fn [^rendering/HitTestEntry {:flds [target]}]  ; :flds name = the field: .target
             (when (instance? rendering/RenderObject target)
               (some-> ^rendering/RenderObject target ^widgets/DebugCreator (.-debugCreator) .-element)))
           (-> result .-path))))
@@ -2190,7 +2169,7 @@
         (fn [^widgets/Element a]
           (swap! seen inc)
           (if-some [loc (element-app-loc a)]
-            (do (reset! found (assoc loc :el a)) false)   ; stop at first app ancestor
+            (do (reset! found (assoc loc :el a)) false)  ; false stops the ancestor walk
             (< @seen 40))))
       @found)))
 
@@ -2237,7 +2216,7 @@
                                (.-style! widgets/PaintingStyle.stroke)
                                (.-strokeWidth! 2.5))))]
               (doseq [[i p] (map-indexed vector picks) :when (:rect p)]
-                (stroke (:rect p) (pick-color i)))   ; colour matches the inspector swatch
+                (stroke (:rect p) (pick-color i)))
               (when-some [^widgets/Rect hr hrect]
                 (stroke hr +cyan+)))
             nil)
@@ -2269,7 +2248,7 @@
                 (when-some [ro (.findRenderObject ^widgets/BuildContext ctx)]
                   (let [^rendering/RenderRepaintBoundary rb ro
                         img (.toImageSync rb .pixelRatio dpr)
-                        sh (* (/ rad mag) dpr)                 ; source half-size in image px
+                        sh (* (/ rad mag) dpr)
                         src (widgets/Rect.fromCenter .center (widgets/Offset (* fx dpr) (* fy dpr))
                                                      .width (* 2.0 sh) .height (* 2.0 sh))
                         dst (widgets/Rect.fromCircle .center (widgets/Offset cx cy) .radius rad)]
@@ -2278,13 +2257,11 @@
                     (.drawImageRect canvas img src dst (widgets/Paint))
                     (.restore canvas)
                     (.dispose img)
-                    ;; neutral hairline glass edge (not cyan → doesn't fight the highlights)
                     (.drawCircle canvas (widgets/Offset cx cy) rad
                       (doto (widgets/Paint)
                         (.-color! (widgets/Color 0x59FFFFFF))
                         (.-style! widgets/PaintingStyle.stroke)
                         (.-strokeWidth! 1.0)))
-                    ;; focal dot: white with a dark halo, marks the exact finger point
                     (.drawCircle canvas (widgets/Offset cx cy) 3.5
                       (doto (widgets/Paint) (.-color! (widgets/Color 0x99000000))))
                     (.drawCircle canvas (widgets/Offset cx cy) 2.0
@@ -2295,7 +2272,7 @@
 
 (defn repl-hud [child]
   (widget
-    ;; cljd.booted on every root mount, incl. hot restart; the host refreshes its isolate id off it
+    ;; on every root mount, incl. hot restart: the host refreshes its isolate id off it
     :managed [_ (do (register-cljd-devtools!) (post-event! "cljd.booted" {}) (println "[* RDY)_")) :dispose nil]
     :let [*armed +cljd-armed+]
     (widgets/Stack
@@ -2305,7 +2282,7 @@
       [(widget
          :bind {:cljd.flutter.repl-impl/armed *armed}
          :global-key ::app-root
-         ;; ::app-snap wraps app + highlights only; non-directional alignment (no Directionality here)
+         ;; non-directional alignment: no Directionality here
          (widgets/RepaintBoundary
            .key (global-key ::app-snap)
            .child
@@ -2316,7 +2293,7 @@
        (widget
          :watch [armed *armed]
          :when armed
-         ;; GestureDetector (not Listener) so the arena separates tap from long-press-drag
+         ;; GestureDetector, not Listener: the arena separates tap from long-press-drag
          (widgets/GestureDetector
            .behavior widgets/HitTestBehavior.opaque
            .onTapUp
@@ -2334,7 +2311,6 @@
            (fn [^widgets/LongPressMoveUpdateDetails d]
              (let [pos (.-globalPosition d)]
                (when-some [el (hit-element pos)]
-                 ;; the app widget (N inspector reads) is recomputed only when the hit changes
                  (if (identical? el (:hit @+cljd-refine+))
                    (swap! +cljd-refine+ assoc :finger pos)
                    (reset! +cljd-refine+ (assoc (or (nearest-app-widget el) {}) :hit el :finger pos)))))

@@ -76,7 +76,6 @@
   [^Throwable e]
   (let [data (ex-data e)]
     (if-some [verr (:error data)]
-      ; VM-Service rpc error: the Dart message is in :data :details
       (str "Dart eval error: "
            (-> (or (get-in verr [:data :details]) (:message verr) "unknown")
                (str/replace #"org-dartlang-debug:synthetic_debug_expression:\d+:\d+:\s*" "")

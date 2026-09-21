@@ -3059,7 +3059,6 @@
   [x] (.& 0xFFFFFFFF x))
 
 (defn ^int i32
-  ;; low 32 bits as a signed int32; inverse of u32
   {:inline (fn [n] `(let [n# ~n] (if (.>= n# 0x80000000) (.- n# 0x100000000) n#)))
    :inline-arities #{1}}
   [^int n] (if (>= n 0x80000000) (- n 0x100000000) n))
@@ -3179,7 +3178,7 @@
           (m3-hash-u32 hash)))
       0)))
 
-;; raw String.hashCode polynomial — matches Util/hash (no Murmur finalizer)
+;; must match JVM Util/hash: raw String.hashCode, no Murmur finalizer
 (defn- ^int string-hashcode* [^String s]
   (let [len (.-length s)]
     (if (pos? len)
@@ -7794,9 +7793,9 @@
                     (= lc "e")
                     (let [v (if (dart/is? arg num) (.toDouble ^num arg) 0.0)
                           neg? (< v 0)
-                          ;; Java pads the exponent to two digits (e+03), Dart doesn't
                           body (.replaceAllMapped
                                  (.toStringAsExponential (.abs ^double v) (or prec 6))
+                                 ;; JVM parity: Java pads the exponent to two digits (e+03), Dart doesn't
                                  #"e([+-])(\d)$"
                                  (fn ^String [^Match m] (str "e" (.group m 1) "0" (.group m 2))))]
                       (-fmt-pad (-fmt-sign neg? flags) body flags width))

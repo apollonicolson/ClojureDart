@@ -1730,7 +1730,6 @@
    (magicast dart-expr expected-type (:dart/type (infer-type dart-expr)) env))
   ([dart-expr expected-type actual-type env]
    (cond
-     ;; void value consumed as non-void: run it as a statement, yield nil
      (and expected-type
           (= 'void (:canon-qname actual-type))
           (not= 'void (:canon-qname expected-type)))
@@ -1899,7 +1898,6 @@
     (if (:fixed (meta x))
       (if-some [[item & more-items] (seq x)]
         (let [lsym (dart-local (with-meta 'fl {:tag list-tag}) env)
-              ;; a void element becomes a statement yielding null
               emit-item (fn [item] (magicast (emit quoted item env) dc-dynamic env))]
           (list 'dart/let
             (into
@@ -1945,7 +1943,6 @@
         entry-tag (vary-meta 'dart:core/MapEntry assoc :type-params [ktag vtag])
         entry-type (emit-type entry-tag env)
         entry-list-tag (vary-meta 'dart:core/List assoc :type-params [entry-tag])
-        ;; lift every key and value (typed) then re-pair into MapEntry(k, v)
         [bindings kvs] (lift-args
                          (mapcat (fn [[k v]] [[nil (emit quoted k env) ktype]
                                               [nil (emit quoted v env) vtype]])
@@ -5163,9 +5160,9 @@
    one expression for VM-Service `evaluate`."
   [body]
   (binding [*locals-gen* {}]
-    ;; parens added by hand: cljd's (fn* …) emit lacks them and Dart rejects `(){…}()`
+    ;; parens by hand: Dart rejects `(){…}()`
     (-> (str "(() {" (with-dart-str (write (emit body {}) return-locus {})) "})()")
-        ;; one line: VM-Service `evaluate` parses only the first line (emitted string literals escape \n)
+        ;; VM-Service `evaluate` parses only the first line
         (.replace "\n" " "))))
 
 (defn form->dart-expr
@@ -5182,7 +5179,7 @@
    and later resolves into +cljd-repl-fbox+. Requires +cljd-repl-handle and
    +cljd-repl-fbox+ injected into cljd.core."
   [form]
-  ;; thunk so a user `await` sits in a fn body (cljd marks it async); FORM must appear once or lifted statements re-emit
+  ;; thunk: `await` needs an async fn body; FORM must appear once or lifted statements re-emit
   (dart-iife (list 'cljd.core/+cljd-repl-handle (list (list 'fn [] form)))))
 
 (defn recompile-form
@@ -5196,7 +5193,6 @@
             (when-not (nses-before ns-name) ; new ns
               (binding [*host-eval* true] (emit-ns form {}))
               (binding [*host-eval* false] (emit-ns form {})))
-            ;; the nREPL tracks *ns* host-side
             nil)
 
           ; regular form
@@ -5218,7 +5214,6 @@
             (binding [*recompile-count* recompile-count]
               (binding [*locals-gen* {}
                         *dart-out* *out*]
-                ;; plain top-level code; Flutter hot reload loads it
                 (emit form {}))
 
               ; Prior to recompilation of nses-to-recompile, remove them and

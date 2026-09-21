@@ -9,10 +9,10 @@
   "Open a VM-Service websocket at WS-URI. Returns {:ws :pending :idgen :sink :event-sink};
    :sink / :event-sink are atoms holding optional handlers for stream output and Extension events."
   [ws-uri]
-  (let [pending (atom {})                 ; request id -> promise
+  (let [pending (atom {})
         idgen (AtomicLong. 0)
-        sink (atom nil)                   ; (fn [stream-id text])
-        event-sink (atom nil)             ; (fn [extension-kind data-map])
+        sink (atom nil)
+        event-sink (atom nil)
         buf (StringBuilder.)
         decoder (java.util.Base64/getDecoder)
         listener
@@ -41,7 +41,7 @@
                           (and (= "Extension" streamId) (= "Extension" (:kind event)))
                           (when-some [g @event-sink]
                             (g (:extensionKind event) (:extensionData event)))))))
-                  (catch Exception _ nil))))   ; ignore unparsable frames
+                  (catch Exception _ nil))))
             (.request ws 1)
             nil)
           (onError [_ _ err] (binding [*out* *err*] (println "[vmservice]" (.getMessage err)))))]
@@ -120,7 +120,7 @@
   [client]
   (doseq [stream ["Stdout" "Stderr" "Extension"]]
     (try (rpc client "streamListen" {:streamId stream})
-         (catch Exception _ nil))))   ; 103 already-subscribed, etc.
+         (catch Exception _ nil))))
 
 (defn set-sink!
   "Set (or clear, with nil) the output sink fn (stream-id, text) on CLIENT."

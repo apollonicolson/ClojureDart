@@ -166,7 +166,6 @@
 (defn timestamp []
   (.format (java.text.SimpleDateFormat. "@HH:mm:ss" (java.util.Locale/getDefault)) (java.util.Date.)))
 
-;; hot reload keeps stale :managed/:watch/defonce captures: warn to restart when their shape changes
 
 (defn- read-cljd-forms
   "Reads every top-level form of a .cljd file; nil on any failure."
@@ -428,7 +427,6 @@
   [& {:keys [watch namespaces flutter offline] :or {watch false}}]
   (let [user-dir (System/getProperty "user.dir")
         analyzer-dir (ensure-cljd-analyzer!)]
-    ;; JVM nREPL for in-process compiler reload; port in .nrepl-port-jvm, not the device's .nrepl-port
     (when (or watch flutter)
       (try
         (let [port (:port ((requiring-resolve 'nrepl.server/start-server) :port 0))]
@@ -468,9 +466,7 @@
               dirty-nses (volatile! #{})
               *compiler-state (atom {:recompile-count 0
                                      :restart-count 0})
-              ;; set once the VM-Service REPL connects: reports compile failures on the device
               *reload-error-sink (atom nil)
-              ;; path->fragile-binding-signature baseline, for restart-needed advisories
               binding-sigs (atom {})
               compile-nses
               (fn [nses]
@@ -487,12 +483,10 @@
                       (catch Exception e
                         (vreset! dirty-nses nses)
                         (print-exception e)
-                        ;; surface the failure on the device too (if the REPL is connected)
                         (when-some [sink @*reload-error-sink]
                           (try (sink (errors/format-compile e)) (catch Throwable _ nil)))
                         false)))))
               compilation-success (compile-nses namespaces)]
-          ;; seed baselines so the first shape-changing edit warns
           (doseq [^java.io.File d dirs
                   ^java.io.File f (file-seq d)
                   :when (and (.isFile f) (.endsWith (.getName f) ".cljd"))]
@@ -539,15 +533,14 @@
                         true-out *out*
                         trigger-reload (fn ([] (.put q {:kind :reload}))
                                          ([done] (.put q {:kind :reload :done done})))
-                        vm-uri-p (promise)   ; resolves with the app's VM-Service ws URI
-                        ;; (restart!) op: same as typing R; replay is driven by the device's cljd.booted event, not here
+                        vm-uri-p (promise)
                         trigger-restart (fn [] (when flutter-stdin
                                                  (locking flutter-stdin
                                                    (doto flutter-stdin (.write "R") .flush))))]
                     ; Unimplemented handling of missing static target
                     (when (and flutter-stdin flutter-stdout)
                       (daemon
-                        ;; read-line is nil at EOF (non-interactive stdin); writing nil would NPE
+                        ;; read-line is nil at EOF
                         (loop []
                           (when-some [s (read-line)]
                             (locking flutter-stdin
@@ -559,7 +552,6 @@
                       (daemon
                         (loop []
                           (when-some [line (some-> (.readLine flutter-stdout) smap-line)]
-                            ;; capture the app's VM-Service URI for the vmservice REPL path
                             (when (and (not (realized? vm-uri-p))
                                     (re-find #"Dart VM Service.*available at:" line))
                               (when-some [[_ http] (re-find #"available at:\s*(http://\S+)" line)]
@@ -570,13 +562,13 @@
                             (recur)))
                         (.put q {:kind :eof}))
 
-                      ;; capture the compiler context here: dynamic bindings don't cross into daemon threads
+                      ;; dynamic bindings don't cross into daemon threads: capture them here
                       (when (System/getenv "CLJD_VMREPL")
                         (let [analyzer compiler/analyzer-info
                               dartv compiler/*dart-version*]
                           (daemon
                             (when-some [uri (deref vm-uri-p 180000 nil)]
-                              (Thread/sleep 8000)   ; let the app render a frame / settle
+                              (Thread/sleep 8000)
                               (binding [*out* true-out
                                         compiler/*hosted* true
                                         compiler/*dart-version* dartv
@@ -587,20 +579,17 @@
                                   (let [client (vmservice/connect uri)
                                         iso (vmservice/main-isolate-id client)
                                         _ (vmservice/listen-streams! client)]
-                                    ;; inject Future helpers into cljd.core; gates :await?
                                     (let [await-ok
                                           (try
                                             (:success
                                              (repl-eval/eval-form client iso
                                                '(do
                                                   (def +cljd-repl-fbox+ (atom nil))
-                                                  ;; *1/*2/*3: plain vars, a dynamic's set! doesn't persist across evaluates
+                                                  ;; plain vars: a dynamic's set! doesn't persist across evaluates
                                                   (def +cljd-repl-h1+ nil)
                                                   (def +cljd-repl-h2+ nil)
                                                   (def +cljd-repl-h3+ nil)
-                                                  ;; *e: last error, set by the eval wrapper's catch
                                                   (def +cljd-repl-e+ nil)
-                                                  ;; *env: picked widget's lexical scope, loaded by (picked)
                                                   (def +cljd-repl-env+ nil)
                                                   (defn +cljd-repl-remember [v]
                                                     (set! +cljd-repl-h3+ +cljd-repl-h2+)
@@ -617,7 +606,6 @@
                                                {:ns-lib-uri "cljd/core.dart" :trigger-reload trigger-reload}))
                                             (catch Throwable e
                                               (println "[VMREPL] async init failed:" (.getMessage e)) false))
-                                          ;; picker exists only in a debug build whose root went through f/run
                                           pick-ok
                                           (try
                                             ;; expression eval returns {:value …}, not :success
@@ -634,11 +622,11 @@
                                                     :ns-lib-uri "cljd/core.dart" :port 0
                                                     :trigger-reload trigger-reload
                                                     :trigger-restart trigger-restart
-                                                    :source-dirs dirs   ; for (edit-back): cljd loc → src file
+                                                    :source-dirs dirs
                                                     :await? (boolean await-ok)
                                                     :pick? (boolean pick-ok)
                                                     :remember? (boolean await-ok)})]
-                                      ;; heartbeat; re-resolve the isolate each tick, hot restart spawns a new one
+                                      ;; hot restart spawns a new isolate: re-resolve it each tick
                                       (daemon
                                         (loop []
                                           (try (when-some [i (vmservice/main-isolate-id client)]
@@ -646,7 +634,6 @@
                                                (catch Throwable _ nil))
                                           (Thread/sleep 1000)
                                           (recur)))
-                                      ;; report watch-compile failures on the device
                                       (let [rctx (repl-eval/context {:client client :iso-id iso
                                                                      :analyzer analyzer :dart-version dartv})]
                                         (reset! *reload-error-sink
@@ -707,7 +694,7 @@
                                             state)
                                           :reloading
                                           (cond
-                                            ;; must also match the no-change "Reloaded 0 libraries in …"
+                                            ;; .+ also matches the no-op "Reloaded 0 libraries", else the reload waiter hangs
                                             (re-matches #"Reloaded .+ libraries in .+." line) :idle
                                             (= "Unimplemented handling of missing static target" line) :reload-failed)
                                           :reload-failed
@@ -721,7 +708,6 @@
                                             :restarting)
                                           :waiting-end-of-restart
                                           (when is-ready-message :idle))
-                                        ;; signal eval-form's reload waiter
                                         reload-done? (and (not= state :idle)
                                                           (= (or state' state) :idle))
                                         reload-fail? (= state' :reload-failed)

@@ -245,7 +245,7 @@
   [^String form-text]
   (with-open [r (clojure.lang.LineNumberingPushbackReader. (java.io.StringReader. form-text))]
     (compiler/with-cljd-reader
-      (.read r)                                    ; consume the opening delimiter
+      (.read r)
       (loop [acc []]
         (let [start-line (.getLineNumber r) start-column (.getColumnNumber r)
               form (try (compiler/read {:eof ::eof :read-cond :allow :features #{:cljd}} r)
@@ -315,17 +315,17 @@
 
 ;; defonce: this state and the live connection survive (require 'cljd.repl.nrepl :reload).
 (defonce ^:private +cljd-tx-log+ (atom []))         ; :cause :epoch txs are keyframes
-(defonce ^:private +cljd-recording?+ (atom false))  ; gates auto-replay after restart
+(defonce ^:private +cljd-recording?+ (atom false))
 (defonce ^:private +cljd-coverage-snap+ (atom #{}))
 (defonce ^:private +cljd-timeline+ (atom []))
-(defonce ^:private +state+ (atom nil))              ; per-connection context, set by make-handler
+(defonce ^:private +state+ (atom nil))
 
 (defn- record-tl! [kind data]
   (swap! +cljd-timeline+
     (fn [tl] (vec (take-last 500 (conj tl {:kind kind :t (System/currentTimeMillis) :data data}))))))
 
-;; Coalesces a consecutive same phase+message into :count; returns nil when it did.
 (defn- remember-error! [e]
+  ;; nil when coalesced into the previous entry's :count: callers skip re-forwarding on nil
   (let [prev (peek @+cljd-timeline+)
         dupe? (and (= :error (:kind prev))
                    (= (:phase (:data prev)) (:phase e))
@@ -444,7 +444,6 @@
 (defn- value-or-err [r ex]
   (if (:error r) {:err (:message r) :ex ex} {:value (:value r)}))
 
-;; (cmd c form) -> {:value string} | {:err string :ex string}; c is the request state plus :iso-id and :switch-ns!
 (def ^:private repl-commands
   {'in-ns
    (fn [{:keys [switch-ns!]} form]
@@ -501,7 +500,6 @@
        no-picker
        {:value (:value (flutter-eval c (list 'cljd.flutter/arm! (if (>= (count form) 2) (not (false? (second form))) true))))}))
 
-   ;; report the active pick, switch to its ns, load its scope into *env
    'picked
    (fn [{:keys [switch-ns!] :as c} _]
      (let [;; scope-loc first: the full pick's gensym env keys can defeat read-string
@@ -522,7 +520,6 @@
                   (catch Throwable e {:error (.getMessage e)}))]
        {:value (pr-str (:picks r r))}))
 
-   ;; (edit-back! PROP VALUE) splices VALUE into the active pick's source form
    'edit-back!
    (fn [{:keys [source-dirs] :as c} form]
      (let [prop (second form)
@@ -557,24 +554,20 @@
        (swap! +cljd-timeline+ (fn [tl] (vec (remove #(= :error (:kind %)) tl)))))
      {:value (pr-str (errors-view @+cljd-timeline+))})
 
-   ;; (q FORM): eval FORM on the host with errors/timeline/txs/epochs/coverage bound
    'q
    (fn [_ form]
      (let [data {'errors (errors-view @+cljd-timeline+)
                  'timeline @+cljd-timeline+
                  'txs @+cljd-tx-log+
-                 ;; each epoch as the state map at its cut-point
                  'epochs (mapv #(tx-snapshot (take (inc %) @+cljd-tx-log+)) (epoch-indices @+cljd-tx-log+))
                  'coverage @+cljd-coverage-snap+}]
        {:value (pr-str (try (eval (list 'let (vec (mapcat (fn [[k v]] [k (list 'quote v)]) data)) (second form)))
                             (catch Throwable e {:q-error (.getMessage e)})))}))
 
-   ;; (picks-do FORM): run FORM with *env bound to each pick's env; returns a vector
    'picks-do
    (fn [{:keys [pick? remember?] :as c} form]
      (if-not pick?
        no-picker
-       ;; :remember? makes eval rewrite *env to its holder
        (value-or-err (flutter-eval c (list 'cljd.core/mapv
                                            (list 'cljd.core/fn ['p]
                                                  (list 'set! 'cljd.core/+cljd-repl-env+ (list 'cljd.flutter/pick-env 'p))
@@ -583,7 +576,6 @@
                                    {:remember? remember?})
                      "cljd.eval-error")))
 
-   ;; (cljd-src "a/b.dart" 249) -> "a/b.cljd:78:12"
    'cljd-src
    (fn [_ form]
      {:value (pr-str (or (resolve-wloc (:libs @compiler/nses) (str (second form) ":" (nth form 2))) "unresolved"))})
@@ -595,13 +587,11 @@
    'macroexpand-1
    (fn [_ form] {:value (pr-str (compiler/macroexpand-1 {} (unwrap-quote (second form))))})
 
-   ;; (dart-of '(...)): the Dart the compiler emits for a form
    'dart-of
    (fn [_ form]
      {:value (try (compiler/form->dart-expr (unwrap-quote (second form)))
                   (catch Throwable e (str "compile error: " (errors/format-compile e))))})
 
-   ;; (trace 'form): sub-expression values stream to (timeline :trace)
    'trace
    (fn [{:keys [client iso-id *current-ns trigger-reload]} form]
      (let [f (unwrap-quote (second form))]
@@ -666,7 +656,6 @@
                      "hot restart requested (recording off → clean slate)")})
        {:err "no restart trigger wired (flutter not running?)" :ex "cljd.no-restart"}))
 
-   ;; (ran): cljd locs newly executed since the last (coverage) snapshot
    'coverage
    (fn [{:keys [client iso-id]} _]
      (let [cov (cljd-coverage client iso-id)]
@@ -805,7 +794,7 @@
   [{:keys [client iso-id analyzer dart-version *current-ns ns-lib-uri trigger-reload trigger-restart source-dirs await? pick? remember?]
     :or {ns-lib-uri "cljd/core.dart"}
     :as cfg}]
-  (let [;; current main isolate id; changes on hot restart (see refresh-iso!)
+  (let [
         *iso (atom iso-id)
         ctx (repl-eval/context (assoc cfg :*iso *iso :default-ns 'cljd.core))
         *eval-sink (atom nil)
