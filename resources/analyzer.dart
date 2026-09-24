@@ -171,7 +171,8 @@ Map<String, dynamic> emitTypeArgument(
 }
 
 Map<String, dynamic> emitParameter(LibraryElement rootLib, ParameterElement p) {
-  final name = p.displayName;
+  var name = p.displayName;
+  if (p.isNamed && name.startsWith('_')) name = name.substring(1);
   return {
     ":name": name.isEmpty ? null : name,
     ":kind": p.isNamed ? ':named' : ':positional',
