@@ -37,10 +37,21 @@
             (symbol? op) (contains? toplevel-ops (symbol (name op)))
             :else        false)))))
 
+(defn- without-ns-effects
+  "Call F, which compiles a form for `evaluate`, and restore compiler/nses afterwards. An evaluated
+   expression runs inside an existing Dart library and cannot add imports or definitions to it, so
+   any namespace change made while compiling it is phantom state; left in place, a lib alias it
+   registered makes the current ns look like a dependant of that lib, and the next hot-reload
+   recompile tears the ns down and recompiles others against it."
+  [f]
+  (let [before @compiler/nses]
+    (try (f) (finally (reset! compiler/nses before)))))
+
 (defn- poll-future
   "Poll +cljd-repl-fbox+ every 100ms until it holds a value or \"__CLJD_ERR__ …\", or timeout."
   [client iso-id lib timeout-ms]
-  (let [deref-dart (compiler/form->dart-expr '(cljd.core/deref cljd.core/+cljd-repl-fbox+) false)
+  (let [deref-dart (without-ns-effects
+                     #(compiler/form->dart-expr '(cljd.core/deref cljd.core/+cljd-repl-fbox+) false))
         deadline   (+ (System/currentTimeMillis) timeout-ms)]
     (loop []
       (let [r (vm/evaluate client iso-id lib deref-dart)
@@ -63,7 +74,8 @@
                (list 'cljd.core/+cljd-repl-remember expr)
                expr)
         expr (if remember? (capturing-e expr) expr)
-        dart (if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr))
+        dart (without-ns-effects
+               #(if await? (compiler/form->dart-await-expr expr) (compiler/form->dart-expr expr)))
         lib  (vm/library-id client iso-id ns-lib-uri)
         r    (vm/evaluate client iso-id lib dart)]
     (cond
@@ -78,6 +90,46 @@
                 (vm/get-string-full client iso-id (:id r) (:length r))
                 (:valueAsString r))
        :ref r})))
+
+(defn- ns->lib-uri [ns-sym] (str (.replace (name ns-sym) "." "/") ".dart"))
+
+(defn- unimported-ns
+  "The namespace behind the Dart alias in an \"Undefined name 'alias'\" evaluate error, when it is
+   a loaded namespace other than the current one: the form referenced a namespace whose library the
+   evaluation library does not import."
+  [message]
+  (when-some [[_ alias] (some->> message (re-find #"Undefined name '([A-Za-z0-9_$]+)'"))]
+    (let [{:keys [libs] :as nses} @compiler/nses
+          ns-sym (some (fn [[_ {:keys [dart-alias ns]}]] (when (= alias dart-alias) ns)) libs)]
+      (when (and ns-sym (not= ns-sym compiler/*current-ns*) (get nses ns-sym))
+        ns-sym))))
+
+(defn- eval-in-referenced-ns
+  "Evaluate an expression; if it failed only because it named a namespace the evaluation library
+   cannot see, retry once in that namespace's library. The failure arrives either as an @Error
+   result or, when Dart rejects the expression at compile time, as a thrown RPC error. A failed
+   retry keeps the first failure, with a hint naming the namespace."
+  [client iso-id form ns-lib-uri await? await-timeout-ms remember?]
+  (let [attempt #(try (eval-expression client iso-id form % await? await-timeout-ms remember?)
+                      (catch clojure.lang.ExceptionInfo e e))
+        message (fn [r] (if (instance? Throwable r)
+                          (let [verr (:error (ex-data r))]
+                            (or (get-in verr [:data :details]) (:message verr)))
+                          (when (:error r) (:message r))))
+        rethrow (fn [r] (if (instance? Throwable r) (throw r) r))
+        r       (attempt ns-lib-uri)]
+    (if-some [ns-sym (unimported-ns (message r))]
+      (let [r2 (binding [compiler/*current-ns* ns-sym] (attempt (ns->lib-uri ns-sym)))]
+        (if (message r2)
+          (let [hint (str "\n(" ns-sym " is not visible from " compiler/*current-ns*
+                          "'s library, and evaluating in " ns-sym " failed too: " (message r2)
+                          ". Evaluate with :ns " ns-sym ", or (in-ns '" ns-sym ").)")]
+            (if (instance? Throwable r)
+              (throw (ex-info (str (ex-message r) hint)
+                              (assoc-in (ex-data r) [:error :data :details] (str (message r) hint)) r))
+              (update r :message str hint)))
+          (rethrow r2)))
+      (rethrow r))))
 
 (defn- existing-def?
   "True if NAME already resolves to a :def in the current ns."
@@ -113,7 +165,7 @@
           {:kind :reload :success (boolean (:success report)) :report report})))
 
     :else
-    (eval-expression client iso-id form ns-lib-uri await? await-timeout-ms remember?)))
+    (eval-in-referenced-ns client iso-id form ns-lib-uri await? await-timeout-ms remember?)))
 
 ;; a bare `future` doesn't inherit the compiler dynamic vars; bind them via with-compiler-context
 
